@@ -14,8 +14,8 @@
     {
       "binding": "DB",
       "database_name": "inventory-system",
-      // プレースホルダ。`wrangler d1 create inventory-system` の出力 ID に差し替える (README 手順参照)
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // 2026-10-24 に API 経由で作成済み (database_id は識別子であり秘密情報ではない)
+      "database_id": "d38d01ca-ab70-48a6-88cf-b9601133ec58",
       "migrations_dir": "migrations"
     }
   ],
