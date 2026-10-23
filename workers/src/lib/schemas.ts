@@ -17,6 +17,8 @@ export const createProductSchema = z.object({
   safetyStock: z.number().int().min(0).optional(),
   requiresExpiry: z.boolean().optional(),
   expiryAlertDays: z.number().int().min(0).optional(),
+  /** 単価 (円)。在庫評価額の算出に使う */
+  unitCost: z.number().int().min(0).optional(),
 });
 
 export const createWarehouseSchema = z.object({
@@ -78,6 +80,55 @@ export const updateProductSchema = z.object({
   safetyStock: z.number().int().min(0).optional(),
   requiresExpiry: z.boolean().optional(),
   expiryAlertDays: z.number().int().min(0).nullable().optional(),
+  unitCost: z.number().int().min(0).nullable().optional(),
+});
+
+/** 仕入先マスタ */
+export const createSupplierSchema = z.object({
+  name: z.string().min(1),
+  contact: z.string().optional(),
+  email: z.string().optional(),
+  phone: z.string().optional(),
+  note: z.string().optional(),
+});
+
+export const updateSupplierSchema = z.object({
+  name: z.string().min(1).optional(),
+  contact: z.string().nullable().optional(),
+  email: z.string().nullable().optional(),
+  phone: z.string().nullable().optional(),
+  note: z.string().nullable().optional(),
+});
+
+/** 発注書の作成 (作成時は下書き draft。発注確定は status を ordered へ進める運用) */
+export const createPurchaseOrderSchema = z.object({
+  supplierId: idValue,
+  expectedDate: dateString.optional(),
+  note: z.string().optional(),
+  lines: z
+    .array(
+      z.object({
+        productId: idValue,
+        quantity: z.number().int().min(1),
+        unitCost: z.number().int().min(0).optional(),
+      }),
+    )
+    .min(1),
+});
+
+/** 発注書の入荷登録 (行ごとに入荷数とロットを指定する) */
+export const receivePurchaseOrderSchema = z.object({
+  locationId: idValue,
+  lines: z
+    .array(
+      z.object({
+        lineId: idValue,
+        quantity: z.number().int().min(1),
+        lotCode: z.string().min(1),
+        expiryDate: dateString.optional(),
+      }),
+    )
+    .min(1),
 });
 
 export const updateWarehouseSchema = z.object({

@@ -63,6 +63,8 @@ export const Permission = {
   NEGATIVE_REQUEST: 'negative.request',
   NEGATIVE_DECIDE: 'negative.decide',
   STOCKTAKES_MANAGE: 'stocktakes.manage',
+  PURCHASES_READ: 'purchases.read',
+  PURCHASES_WRITE: 'purchases.write',
   ADMIN_USERS: 'admin.users',
   ADMIN_PERMISSIONS: 'admin.permissions',
 } as const;
@@ -75,7 +77,7 @@ export interface PermissionDef {
   description: string;
 }
 
-/** 権限カタログ (migrations/0003_permissions.sql / 0005 の seed と一致させること) */
+/** 権限カタログ (migrations/0003_permissions.sql / 0005 / 0007 の seed と一致させること) */
 export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.STOCKS_READ, label: '在庫参照', description: '在庫一覧・詳細の参照' },
   { key: Permission.ALERTS_READ, label: 'アラート参照', description: '期限・不足・マイナス在庫アラートの参照' },
@@ -87,6 +89,8 @@ export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.NEGATIVE_REQUEST, label: 'マイナス在庫申請', description: 'マイナス在庫の例外申請の作成' },
   { key: Permission.NEGATIVE_DECIDE, label: 'マイナス在庫承認', description: 'マイナス在庫申請の承認・却下' },
   { key: Permission.STOCKTAKES_MANAGE, label: '棚卸し管理', description: '棚卸しの開始・終了' },
+  { key: Permission.PURCHASES_READ, label: '発注参照', description: '発注書・発注提案の参照' },
+  { key: Permission.PURCHASES_WRITE, label: '発注登録', description: '発注書の作成と入荷登録' },
   { key: Permission.ADMIN_USERS, label: 'ユーザー管理', description: 'ユーザー一覧の参照とロール付与の変更' },
   { key: Permission.ADMIN_PERMISSIONS, label: '権限管理', description: 'ロール×権限マトリクスの変更' },
 ];
@@ -121,6 +125,8 @@ export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<RoleCode, readonly Permis
     Permission.NEGATIVE_REQUEST,
     Permission.NEGATIVE_DECIDE,
     Permission.STOCKTAKES_MANAGE,
+    Permission.PURCHASES_READ,
+    Permission.PURCHASES_WRITE,
   ],
   [RoleCode.INVENTORY_STAFF]: [
     Permission.STOCKS_READ,
@@ -130,6 +136,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<RoleCode, readonly Permis
     Permission.MOVEMENTS_TRANSFER,
     Permission.MASTER_READ,
     Permission.NEGATIVE_REQUEST,
+    Permission.PURCHASES_READ,
   ],
   [RoleCode.VIEWER]: [Permission.STOCKS_READ, Permission.ALERTS_READ, Permission.MASTER_READ],
   [RoleCode.AUDITOR]: [Permission.STOCKS_READ, Permission.ALERTS_READ, Permission.MASTER_READ],

@@ -49,18 +49,23 @@ import {
   createLocationSchema,
   createLotSchema,
   createProductSchema,
+  createPurchaseOrderSchema,
+  createSupplierSchema,
   createWarehouseSchema,
   decideApprovalSchema,
   decideStocktakeSchema,
   formatDateOnly,
   inboundSchema,
   parseDateOnly,
+  receivePurchaseOrderSchema,
   transferSchema,
   updateLocationSchema,
   updateLotSchema,
   updateProductSchema,
+  updateSupplierSchema,
   updateWarehouseSchema,
 } from './lib/schemas';
+import { FEATURE_CATALOG, FEATURE_KEYS, getFeatures, isFeatureEnabled } from './lib/features';
 import { parseCsv, toCsv } from './lib/csv';
 
 export { InventoryCoordinator };
@@ -228,6 +233,10 @@ td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
 <div class="table-wrap"><div id="matrix"><div class="skl skl-row"></div><div class="skl skl-row"></div><div class="skl skl-row"></div></div></div>
 <button id="saveMatrix" class="btn" style="margin-top: 0.75rem;">マトリクスを保存</button>
 
+<h2>機能のオン/オフ</h2>
+<p class="small muted">オフにした機能は、権限があっても API が 403 (FEATURE_DISABLED) を返し、アプリの画面からも消えます。変更は即時反映され、監査ログに記録されます。</p>
+<div id="features"><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
+
 <h2>ユーザーとロール付与</h2>
 <div id="users"><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
 </main>
@@ -273,6 +282,43 @@ function renderMatrix() {
   }
   html += '</tbody></table>';
   el.innerHTML = html;
+}
+
+let featureList = [];
+
+function renderFeatures() {
+  const el = document.getElementById('features');
+  if (featureList.length === 0) { el.textContent = '機能がありません。'; return; }
+  let html = '<div class="group">';
+  for (const f of featureList) {
+    html += '<div class="group-row"><span class="row-label">' + f.label + ' <small class="muted">' + f.key + '</small></span>' +
+      '<label class="switch"><input type="checkbox" data-feature="' + f.key + '"' + (f.enabled ? ' checked' : '') + '><span class="track"></span></label></div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+  el.querySelectorAll('input[type=checkbox][data-feature]').forEach((box) => {
+    box.onchange = () => toggleFeature(box.dataset.feature, box.checked, box);
+  });
+}
+
+async function toggleFeature(key, enabled, box) {
+  setError(''); setStatus('保存中…');
+  box.disabled = true;
+  try {
+    await api('/api/v1/admin/features/' + encodeURIComponent(key), {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    });
+    const f = featureList.find((x) => x.key === key);
+    if (f) f.enabled = enabled;
+    setStatus('機能「' + key + '」を' + (enabled ? 'オン' : 'オフ') + 'にしました。');
+  } catch (e) {
+    box.checked = !enabled;
+    setStatus('');
+    setError(String(e && e.message ? e.message : e));
+  } finally {
+    box.disabled = false;
+  }
 }
 
 async function saveMatrix() {
@@ -379,6 +425,13 @@ async function loadAll() {
     document.getElementById('matrix').textContent = '';
     setError(String(e && e.message ? e.message : e));
     return;
+  }
+  try {
+    const fdata = await api('/api/v1/admin/features');
+    featureList = fdata.features;
+    renderFeatures();
+  } catch (e) {
+    document.getElementById('features').textContent = '機能一覧を読み込めませんでした。';
   }
   try {
     userList = await api('/api/v1/admin/users');
@@ -542,6 +595,26 @@ async function requirePermission(
   return rp;
 }
 
+/**
+ * 機能フラグのサーバー側強制。管理者がオフにした機能は、権限があっても
+ * 403 FEATURE_DISABLED で止める (画面の出し分けだけに頼らない)。
+ */
+async function requireFeature(c: AppContext, key: string): Promise<void> {
+  if (!(await isFeatureEnabled(c.env.DB, key))) {
+    throw new ApiError(403, 'FEATURE_DISABLED', `Feature is disabled: ${key}`);
+  }
+}
+
+/** テーブルに列が存在するか (マイグレーション未適用環境との後方互換用) */
+async function hasColumn(c: AppContext, table: string, column: string): Promise<boolean> {
+  try {
+    const { results } = await c.env.DB.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+    return results.some((r) => r.name === column);
+  } catch {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------ ユーティリティ
 
 async function parseJson(c: AppContext): Promise<unknown> {
@@ -638,7 +711,51 @@ app.get('/api/v1/me', async (c) => {
     displayName: me.displayName,
     assignments: me.assignments,
     permissions: [...permissionsOf(me.assignments, rp)].sort(),
+    features: await getFeatures(c.env.DB),
   });
+});
+
+// ------------------------------------------------------------ 機能フラグ
+
+/** 解決済みの機能フラグ (認証済み全員)。/app の出し分けと管理画面の初期表示用 */
+app.get('/api/v1/features', async (c) => {
+  assertHasAssignments(user(c));
+  return c.json({ features: await getFeatures(c.env.DB) });
+});
+
+app.get('/api/v1/admin/features', async (c) => {
+  await requirePermission(c, Permission.ADMIN_PERMISSIONS);
+  const features = await getFeatures(c.env.DB);
+  return c.json({
+    features: FEATURE_CATALOG.map((f) => ({ key: f.key, label: f.label, enabled: features[f.key] === true })),
+  });
+});
+
+const featureFlagBodySchema = z.object({ enabled: z.boolean() });
+
+app.put('/api/v1/admin/features/:key', async (c) => {
+  await requirePermission(c, Permission.ADMIN_PERMISSIONS);
+  const key = c.req.param('key');
+  if (!FEATURE_KEYS.has(key)) {
+    throw new ApiError(422, 'UNKNOWN_FEATURE', `Unknown feature key: ${key}`);
+  }
+  const dto = parseWith(featureFlagBodySchema, await parseJson(c));
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `INSERT INTO feature_flags (key, enabled, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(key) DO UPDATE SET enabled = excluded.enabled, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      )
+      .bind(key, dto.enabled ? 1 : 0, user(c).userId, now),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
+         VALUES (?1, 'feature_flag.update', 'feature_flag', ?2, ?3, ?4)`,
+      )
+      .bind(user(c).userId, key, JSON.stringify({ enabled: dto.enabled }), now),
+  ]);
+  return c.json({ key, enabled: dto.enabled });
 });
 
 /** ログアウト: Cookie セッションを破棄し、Cookie 自体も失効させる */
@@ -704,6 +821,8 @@ interface ProductRow {
   safety_stock: number;
   requires_expiry: number;
   expiry_alert_days: number | null;
+  /** 0007 で追加。未適用環境では undefined になるため null に寄せる */
+  unit_cost?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -718,6 +837,7 @@ function productJson(r: ProductRow): Record<string, unknown> {
     safetyStock: r.safety_stock,
     requiresExpiry: r.requires_expiry === 1,
     expiryAlertDays: r.expiry_alert_days,
+    unitCost: r.unit_cost ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -739,13 +859,21 @@ async function createProduct(c: AppContext): Promise<Response> {
   await requirePermission(c, Permission.MASTER_WRITE);
   const dto = parseWith(createProductSchema, await parseJson(c));
   const now = Date.now();
+  // unit_cost 列は 0007 で追加される。未適用環境では列なし INSERT に落とす
+  const withCost = await hasColumn(c, 'products', 'unit_cost');
+  const sql = withCost
+    ? `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, unit_cost, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`
+    : `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)`;
+  const binds: (string | number | null)[] = [
+    dto.sku, dto.name, dto.unit, dto.barcode ?? null, dto.safetyStock ?? 0,
+    dto.requiresExpiry ? 1 : 0, dto.expiryAlertDays ?? null,
+  ];
+  if (withCost) binds.push(dto.unitCost ?? null);
+  binds.push(now);
   try {
-    const res = await c.env.DB.prepare(
-      `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)`,
-    )
-      .bind(dto.sku, dto.name, dto.unit, dto.barcode ?? null, dto.safetyStock ?? 0, dto.requiresExpiry ? 1 : 0, dto.expiryAlertDays ?? null, now)
-      .run();
+    const res = await c.env.DB.prepare(sql).bind(...binds).run();
     return c.json({ id: Number(res.meta.last_row_id), ...dto }, 201);
   } catch {
     throw new ApiError(409, 'DUPLICATE', 'Product with this sku already exists');
@@ -911,6 +1039,10 @@ async function updateProduct(c: AppContext): Promise<Response> {
   if (dto.safetyStock !== undefined) { sets.push('safety_stock = ?'); params.push(dto.safetyStock); }
   if (dto.requiresExpiry !== undefined) { sets.push('requires_expiry = ?'); params.push(dto.requiresExpiry ? 1 : 0); }
   if (dto.expiryAlertDays !== undefined) { sets.push('expiry_alert_days = ?'); params.push(dto.expiryAlertDays); }
+  if (dto.unitCost !== undefined && (await hasColumn(c, 'products', 'unit_cost'))) {
+    sets.push('unit_cost = ?');
+    params.push(dto.unitCost);
+  }
   if (sets.length > 0) {
     const now = Date.now();
     await c.env.DB.prepare(
@@ -1099,6 +1231,99 @@ async function deleteLot(c: AppContext): Promise<Response> {
   return c.json({ id, deleted: true });
 }
 
+// ------------------------------------------------------- 仕入先マスタ
+// 他のマスタと同じ流儀 (master.read/write、論理削除)。発注書の宛先になる。
+
+interface SupplierRow {
+  id: number;
+  name: string;
+  contact: string | null;
+  email: string | null;
+  phone: string | null;
+  note: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function supplierJson(r: SupplierRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    name: r.name,
+    contact: r.contact,
+    email: r.email,
+    phone: r.phone,
+    note: r.note,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+async function listSuppliers(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_READ);
+  await requireFeature(c, 'purchase_orders');
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM suppliers WHERE deleted_at IS NULL ORDER BY id ASC LIMIT 200',
+  ).all<SupplierRow>();
+  return c.json(results.map(supplierJson));
+}
+
+async function createSupplier(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const dto = parseWith(createSupplierSchema, await parseJson(c));
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO suppliers (name, contact, email, phone, note, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)`,
+  )
+    .bind(dto.name, dto.contact ?? null, dto.email ?? null, dto.phone ?? null, dto.note ?? null, now)
+    .run();
+  return c.json({ id: Number(res.meta.last_row_id), ...dto }, 201);
+}
+
+async function updateSupplier(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateSupplierSchema, await parseJson(c));
+  const row = await c.env.DB.prepare('SELECT * FROM suppliers WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(id)
+    .first<SupplierRow>();
+  if (!row) throw notFound('Supplier not found');
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (dto.contact !== undefined) { sets.push('contact = ?'); params.push(dto.contact); }
+  if (dto.email !== undefined) { sets.push('email = ?'); params.push(dto.email); }
+  if (dto.phone !== undefined) { sets.push('phone = ?'); params.push(dto.phone); }
+  if (dto.note !== undefined) { sets.push('note = ?'); params.push(dto.note); }
+  if (sets.length > 0) {
+    await c.env.DB.prepare(
+      `UPDATE suppliers SET ${sets.join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+    )
+      .bind(...params, Date.now(), id)
+      .run();
+  }
+  const updated = await c.env.DB.prepare('SELECT * FROM suppliers WHERE id = ?1')
+    .bind(id)
+    .first<SupplierRow>();
+  return c.json(supplierJson(updated as SupplierRow));
+}
+
+async function deleteSupplier(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const id = Number(c.req.param('id'));
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE suppliers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(now, id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Supplier not found');
+  return c.json({ id, deleted: true });
+}
+
 // ------------------------------------------------------- 商品 CSV インポート
 // CSV (sku,name,unit,requires_expiry) を multipart の file フィールド、
 // または text/csv などの生ボディで受け取り、商品を一括登録する。
@@ -1106,6 +1331,7 @@ async function deleteLot(c: AppContext): Promise<Response> {
 
 async function importProducts(c: AppContext): Promise<Response> {
   await requirePermission(c, Permission.MASTER_WRITE);
+  await requireFeature(c, 'csv');
   const contentType = c.req.header('content-type') ?? '';
   let text: string;
   if (contentType.includes('multipart/form-data')) {
@@ -1135,7 +1361,10 @@ async function importProducts(c: AppContext): Promise<Response> {
     name: header.indexOf('name'),
     unit: header.indexOf('unit'),
     requiresExpiry: header.indexOf('requires_expiry'),
+    unitCost: header.indexOf('unit_cost'),
   };
+  // unit_cost 列 (0007) がある環境でのみ CSV の unit_cost を取り込む
+  const withCost = col.unitCost >= 0 && (await hasColumn(c, 'products', 'unit_cost'));
   if (col.sku < 0 || col.name < 0 || col.unit < 0) {
     throw badRequest('CSV header must include sku, name, unit');
   }
@@ -1169,13 +1398,30 @@ async function importProducts(c: AppContext): Promise<Response> {
     }
     const expiryRaw = col.requiresExpiry >= 0 ? (record[col.requiresExpiry] ?? '').trim().toLowerCase() : '';
     const requiresExpiry = ['true', '1', 'yes'].includes(expiryRaw) ? 1 : 0;
+    let unitCost: number | null = null;
+    if (withCost) {
+      const rawCost = (record[col.unitCost] ?? '').trim();
+      if (rawCost !== '') {
+        const parsed = Number(rawCost);
+        unitCost = Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+      }
+    }
     try {
-      await c.env.DB.prepare(
-        `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
-         VALUES (?1, ?2, ?3, NULL, 0, ?4, NULL, ?5, ?5)`,
-      )
-        .bind(sku, name, unit, requiresExpiry, now)
-        .run();
+      if (withCost) {
+        await c.env.DB.prepare(
+          `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, unit_cost, created_at, updated_at)
+           VALUES (?1, ?2, ?3, NULL, 0, ?4, NULL, ?5, ?6, ?6)`,
+        )
+          .bind(sku, name, unit, requiresExpiry, unitCost, now)
+          .run();
+      } else {
+        await c.env.DB.prepare(
+          `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
+           VALUES (?1, ?2, ?3, NULL, 0, ?4, NULL, ?5, ?5)`,
+        )
+          .bind(sku, name, unit, requiresExpiry, now)
+          .run();
+      }
       knownSkus.add(sku);
       created += 1;
     } catch {
@@ -1203,6 +1449,10 @@ for (const base of ['/api/v1/master', '/api/v1'] as const) {
   app.post(`${base}/lots`, createLot);
   app.put(`${base}/lots/:id`, updateLot);
   app.delete(`${base}/lots/:id`, deleteLot);
+  app.get(`${base}/suppliers`, listSuppliers);
+  app.post(`${base}/suppliers`, createSupplier);
+  app.put(`${base}/suppliers/:id`, updateSupplier);
+  app.delete(`${base}/suppliers/:id`, deleteSupplier);
 }
 
 // ---------------------------------------------------------------- 在庫参照
@@ -1290,6 +1540,7 @@ app.get('/api/v1/stocks/:id', async (c) => {
 /** 在庫一覧の CSV エクスポート (stocks.read、倉庫スコープ適用) */
 app.get('/api/v1/stocks.csv', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
+  await requireFeature(c, 'csv');
   const reachable = reachableWarehouseIds(user(c).assignments);
   let sql = `SELECT p.sku, p.name AS product_name, w.name AS warehouse_name,
                     loc.name AS location_name, loc.code AS location_code,
@@ -1401,6 +1652,7 @@ app.post('/api/v1/movements/consumption', async (c) => {
 
 app.post('/api/v1/movements/transfer', async (c) => {
   const rp = await requirePermission(c, Permission.MOVEMENTS_TRANSFER);
+  await requireFeature(c, 'transfers');
   const raw = (await parseJson(c)) as Record<string, unknown>;
   const dto = parseWith(transferSchema, raw);
   // 移動元・移動先の両方の倉庫に到達できることが必要
@@ -1430,6 +1682,7 @@ app.post('/api/v1/movements/transfer', async (c) => {
 
 app.post('/api/v1/negative-approvals', async (c) => {
   const rp = await requirePermission(c, Permission.NEGATIVE_REQUEST);
+  await requireFeature(c, 'negative_stock');
   const dto = parseWith(createApprovalSchema, await parseJson(c));
   const warehouseId = await warehouseIdOfStock(c, dto.stockId);
   if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.NEGATIVE_REQUEST)) {
@@ -1470,6 +1723,7 @@ app.get('/api/v1/negative-approvals', async (c) => {
 
 app.post('/api/v1/negative-approvals/:id/decide', async (c) => {
   const rp = await requirePermission(c, Permission.NEGATIVE_DECIDE);
+  await requireFeature(c, 'negative_stock');
   const id = Number(c.req.param('id'));
   const dto = parseWith(decideApprovalSchema, await parseJson(c));
   const approval = await approvalRow(c, id);
@@ -1524,6 +1778,7 @@ async function approvalRow(c: AppContext, id: number): Promise<ApprovalDbRow> {
 
 app.post('/api/v1/stocktakes', async (c) => {
   await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  await requireFeature(c, 'stocktakes');
   const envelope = await coordinator(c).startStocktake({ actorId: user(c).userId });
   return respond(c, envelope);
 });
@@ -1539,6 +1794,7 @@ app.get('/api/v1/stocktakes', async (c) => {
 
 app.post('/api/v1/stocktakes/:id/finish', async (c) => {
   await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  await requireFeature(c, 'stocktakes');
   const envelope = await coordinator(c).finishStocktake({
     actorId: user(c).userId,
     stocktakeId: Number(c.req.param('id')),
@@ -1634,6 +1890,7 @@ app.put('/api/v1/stocktakes/:id/lines/:lineId', async (c) => {
 /** 棚卸しの差異承認/差し戻し (pending_approval のときのみ Coordinator が処理する) */
 app.post('/api/v1/stocktakes/:id/decide', async (c) => {
   await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  await requireFeature(c, 'stocktakes');
   const dto = parseWith(decideStocktakeSchema, await parseJson(c));
   const envelope = await coordinator(c).decideStocktake({
     actorId: user(c).userId,
@@ -1652,6 +1909,7 @@ interface AlertRow extends StockViewRow {
 
 app.get('/api/v1/alerts', async (c) => {
   await requirePermission(c, Permission.ALERTS_READ);
+  await requireFeature(c, 'alerts');
   const reachable = reachableWarehouseIds(user(c).assignments);
   if (reachable !== null && reachable.length === 0) return c.json([]);
   let sql = `SELECT s.id, s.location_id, s.lot_id, s.quantity, s.version,
@@ -1691,6 +1949,438 @@ app.get('/api/v1/alerts', async (c) => {
     if (r.quantity >= 0 && r.quantity <= r.safety_stock) alerts.push({ type: 'LOW_STOCK', ...base });
   }
   return c.json(alerts);
+});
+
+// ---------------------------------------------------------------- 発注 (発注書・入荷・提案)
+
+/** idempotency_keys の保存済みレスポンスを引く (Coordinator と同じセマンティクス) */
+async function findStoredIdempotentResponse(
+  c: AppContext,
+  key: string,
+  requestHash: string,
+): Promise<{ status: number; body: unknown } | null> {
+  const row = await c.env.DB.prepare(
+    'SELECT request_hash, response_status, response_body FROM idempotency_keys WHERE key = ?1 AND user_id = ?2',
+  )
+    .bind(key, user(c).userId)
+    .first<{ request_hash: string; response_status: number | null; response_body: string | null }>();
+  if (!row || row.response_status === null || row.response_body === null) return null;
+  if (row.request_hash !== requestHash) {
+    throw new ApiError(422, 'IDEMPOTENCY_KEY_REUSED', 'Idempotency-Key was already used with a different request body');
+  }
+  return { status: row.response_status, body: JSON.parse(row.response_body) as unknown };
+}
+
+interface PurchaseOrderDbRow {
+  id: number;
+  supplier_id: number;
+  supplier_name: string | null;
+  status: string;
+  expected_date: string | null;
+  note: string | null;
+  created_by: number;
+  created_at: number;
+  updated_at: number;
+}
+
+interface PurchaseOrderLineDbRow {
+  id: number;
+  po_id: number;
+  product_id: number;
+  quantity: number;
+  received_quantity: number;
+  unit_cost: number | null;
+}
+
+const PO_SELECT = `SELECT po.id, po.supplier_id, sup.name AS supplier_name, po.status,
+                          po.expected_date, po.note, po.created_by, po.created_at, po.updated_at
+                     FROM purchase_orders po
+                     LEFT JOIN suppliers sup ON sup.id = po.supplier_id`;
+
+function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow[]): Record<string, unknown> {
+  return {
+    id: po.id,
+    supplierId: po.supplier_id,
+    supplierName: po.supplier_name,
+    status: po.status,
+    expectedDate: po.expected_date,
+    note: po.note,
+    createdBy: po.created_by,
+    createdAt: po.created_at,
+    updatedAt: po.updated_at,
+    lines: lines.map((l) => ({
+      id: l.id,
+      productId: l.product_id,
+      quantity: l.quantity,
+      receivedQuantity: l.received_quantity,
+      unitCost: l.unit_cost,
+    })),
+  };
+}
+
+async function loadPurchaseOrder(c: AppContext, id: number): Promise<Record<string, unknown>> {
+  const po = await c.env.DB.prepare(`${PO_SELECT} WHERE po.id = ?1`).bind(id).first<PurchaseOrderDbRow>();
+  if (!po) throw notFound('Purchase order not found');
+  const { results: lines } = await c.env.DB.prepare(
+    'SELECT * FROM purchase_order_lines WHERE po_id = ?1 ORDER BY id ASC',
+  )
+    .bind(id)
+    .all<PurchaseOrderLineDbRow>();
+  return purchaseOrderJson(po, lines);
+}
+
+app.get('/api/v1/purchase-orders', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_READ);
+  await requireFeature(c, 'purchase_orders');
+  const { results: orders } = await c.env.DB.prepare(`${PO_SELECT} ORDER BY po.id DESC LIMIT 100`).all<PurchaseOrderDbRow>();
+  const out: Record<string, unknown>[] = [];
+  for (const po of orders) {
+    const { results: lines } = await c.env.DB.prepare(
+      'SELECT * FROM purchase_order_lines WHERE po_id = ?1 ORDER BY id ASC',
+    )
+      .bind(po.id)
+      .all<PurchaseOrderLineDbRow>();
+    out.push(purchaseOrderJson(po, lines));
+  }
+  return c.json(out);
+});
+
+/**
+ * 発注提案: 安全在庫を下回った商品について、不足分と提案数量を返す。
+ * 提案数量は「安全在庫の 2 倍まで補充する」ルール (safety*2 - 現在庫)。
+ */
+app.get('/api/v1/purchase-orders/suggestions', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_READ);
+  await requireFeature(c, 'purchase_orders');
+  const reachable = reachableWarehouseIds(user(c).assignments);
+  if (reachable !== null && reachable.length === 0) return c.json([]);
+  const scopeJoin =
+    reachable === null
+      ? ''
+      : ` AND sloc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
+  const sql = `SELECT p.id AS productId, p.sku, p.name, p.safety_stock AS safetyStock,
+                      COALESCE((SELECT SUM(s.quantity)
+                                  FROM stocks s
+                                  JOIN lots sl ON sl.id = s.lot_id
+                                  JOIN locations sloc ON sloc.id = s.location_id
+                                 WHERE sl.product_id = p.id${scopeJoin}), 0) AS totalQuantity
+                 FROM products p
+                WHERE p.deleted_at IS NULL AND p.safety_stock > 0
+                ORDER BY p.id ASC`;
+  const { results } = await c.env.DB.prepare(sql)
+    .bind(...(reachable ?? []))
+    .all<{ productId: number; sku: string; name: string; safetyStock: number; totalQuantity: number }>();
+  const suggestions = results
+    .filter((r) => r.safetyStock - r.totalQuantity > 0)
+    .map((r) => ({
+      productId: r.productId,
+      sku: r.sku,
+      name: r.name,
+      safetyStock: r.safetyStock,
+      totalQuantity: r.totalQuantity,
+      shortage: r.safetyStock - r.totalQuantity,
+      suggestedQuantity: r.safetyStock * 2 - r.totalQuantity,
+    }));
+  return c.json(suggestions);
+});
+
+app.post('/api/v1/purchase-orders', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const key = requireIdempotencyKey(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(createPurchaseOrderSchema, raw);
+  const requestHash = await sha256Hex(JSON.stringify(raw));
+  const stored = await findStoredIdempotentResponse(c, key, requestHash);
+  if (stored) return c.json(stored.body as Record<string, unknown>, stored.status as 201);
+
+  const supplier = await c.env.DB.prepare('SELECT id FROM suppliers WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(dto.supplierId)
+    .first<{ id: number }>();
+  if (!supplier) throw notFound('Supplier not found');
+  for (const line of dto.lines) {
+    const product = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?1 AND deleted_at IS NULL')
+      .bind(line.productId)
+      .first<{ id: number }>();
+    if (!product) throw notFound(`Product not found: ${line.productId}`);
+  }
+
+  const now = Date.now();
+  const poRes = await c.env.DB.prepare(
+    `INSERT INTO purchase_orders (supplier_id, status, expected_date, note, created_by, created_at, updated_at)
+     VALUES (?1, 'draft', ?2, ?3, ?4, ?5, ?5)`,
+  )
+    .bind(dto.supplierId, dto.expectedDate ?? null, dto.note ?? null, user(c).userId, now)
+    .run();
+  const poId = Number(poRes.meta.last_row_id);
+  const stmts: D1PreparedStatement[] = dto.lines.map((line) =>
+    c.env.DB
+      .prepare(
+        `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost)
+         VALUES (?1, ?2, ?3, 0, ?4)`,
+      )
+      .bind(poId, line.productId, line.quantity, line.unitCost ?? null),
+  );
+  // 作成した発注書の完全な形は lines 挿入後に組み立てるため、冪等レコードと監査は後段で入れる
+  await c.env.DB.batch(stmts);
+  const created = await loadPurchaseOrder(c, poId);
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash, response_status, response_body, created_at)
+         VALUES (?1, ?2, 'POST /api/v1/purchase-orders', ?3, 201, ?4, ?5)`,
+      )
+      .bind(key, user(c).userId, requestHash, JSON.stringify(created), now),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
+         VALUES (?1, 'purchase_order.create', 'purchase_order', ?2, ?3, ?4)`,
+      )
+      .bind(
+        user(c).userId,
+        String(poId),
+        JSON.stringify({ supplierId: dto.supplierId, lines: dto.lines.length }),
+        now,
+      ),
+  ]);
+  return c.json(created, 201);
+});
+
+/**
+ * 入荷登録: 発注明細ごとに Coordinator の inbound を再利用して在庫へ入れる。
+ * 行単位の冪等キー (親キー + lineId) で再送時の二重入庫を防ぎ、入荷済み数量を
+ * 超える登録は 422。棚卸しロック中は inbound の 423 をそのまま返す。
+ * 全行が揃ったら received、途中なら ordered に進める。
+ */
+app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
+  const rp = await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const poId = Number(c.req.param('id'));
+  const key = requireIdempotencyKey(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(receivePurchaseOrderSchema, raw);
+
+  const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
+  if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.PURCHASES_WRITE)) {
+    throw forbidden('Out of warehouse scope');
+  }
+
+  const po = await c.env.DB.prepare('SELECT * FROM purchase_orders WHERE id = ?1')
+    .bind(poId)
+    .first<{ id: number; status: string }>();
+  if (!po) throw notFound('Purchase order not found');
+  if (po.status === 'received' || po.status === 'cancelled') {
+    throw new ApiError(409, 'PO_NOT_RECEIVABLE', `Purchase order is ${po.status} and cannot receive items`);
+  }
+
+  const { results: lineRows } = await c.env.DB.prepare(
+    'SELECT * FROM purchase_order_lines WHERE po_id = ?1',
+  )
+    .bind(poId)
+    .all<PurchaseOrderLineDbRow>();
+  const lineById = new Map(lineRows.map((l) => [l.id, l]));
+  const seen = new Set<number>();
+  for (const line of dto.lines) {
+    if (seen.has(line.lineId)) throw badRequest('duplicate lineId in lines');
+    seen.add(line.lineId);
+    const target = lineById.get(line.lineId);
+    if (!target) throw badRequest(`lineId ${line.lineId} does not belong to this purchase order`);
+    if (target.received_quantity + line.quantity > target.quantity) {
+      throw new ApiError(
+        422,
+        'OVER_RECEIVE',
+        `Receiving ${line.quantity} exceeds the remaining quantity for line ${line.lineId}`,
+      );
+    }
+  }
+
+  for (const line of dto.lines) {
+    const target = lineById.get(line.lineId) as PurchaseOrderLineDbRow;
+    let expiryDateMs: number | null = null;
+    if (line.expiryDate !== undefined) {
+      expiryDateMs = parseDateOnly(line.expiryDate);
+      if (expiryDateMs === null) throw badRequest('expiryDate must be a valid YYYY-MM-DD date');
+    }
+    const lineKey = `${key}:${line.lineId}`;
+    const lineHash = await sha256Hex(
+      JSON.stringify({
+        poId,
+        lineId: line.lineId,
+        locationId: dto.locationId,
+        quantity: line.quantity,
+        lotCode: line.lotCode,
+        expiryDate: line.expiryDate ?? null,
+      }),
+    );
+    const prior = await findStoredIdempotentResponse(c, lineKey, lineHash);
+    if (!prior) {
+      const envelope = await coordinator(c).inbound({
+        actorId: user(c).userId,
+        endpoint: 'POST /api/v1/purchase-orders/:id/receive',
+        idempotencyKey: lineKey,
+        requestHash: lineHash,
+        locationId: dto.locationId,
+        productId: target.product_id,
+        lotCode: line.lotCode,
+        expiryDateMs,
+        quantity: line.quantity,
+      });
+      if (envelope.status !== 201) return respond(c, envelope);
+      await c.env.DB.prepare(
+        'UPDATE purchase_order_lines SET received_quantity = received_quantity + ?1 WHERE id = ?2',
+      )
+        .bind(line.quantity, line.lineId)
+        .run();
+      target.received_quantity += line.quantity;
+    }
+  }
+
+  const { results: afterLines } = await c.env.DB.prepare(
+    'SELECT * FROM purchase_order_lines WHERE po_id = ?1',
+  )
+    .bind(poId)
+    .all<PurchaseOrderLineDbRow>();
+  const complete = afterLines.every((l) => l.received_quantity >= l.quantity);
+  const nextStatus = complete ? 'received' : 'ordered';
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare('UPDATE purchase_orders SET status = ?1, updated_at = ?2 WHERE id = ?3')
+      .bind(nextStatus, now, poId),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
+         VALUES (?1, 'purchase_order.receive', 'purchase_order', ?2, ?3, ?4)`,
+      )
+      .bind(
+        user(c).userId,
+        String(poId),
+        JSON.stringify({ locationId: dto.locationId, lines: dto.lines, status: nextStatus }),
+        now,
+      ),
+  ]);
+  return c.json(await loadPurchaseOrder(c, poId));
+});
+
+// ---------------------------------------------------------------- 分析レポート
+
+/**
+ * 分析レポート (stocks.read):
+ * - monthly: 直近 6 ヶ月 (当月含む) の月別入庫/消費合計。IN 側は IN + TRANSFER_IN、
+ *   OUT 側は OUT + TRANSFER_OUT の数量合計 (ADJUST / CANCEL は含めない)
+ * - valuation: 在庫評価額 Σ(数量 × 商品単価) と単価設定済み商品のカバー率
+ * - deadStock: 在庫があるのに最終移動から 90 日超 (または移動履歴なし) の商品
+ * - topConsumed: 直近 90 日の消費 (OUT) 数量上位
+ */
+app.get('/api/v1/analytics', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  await requireFeature(c, 'analytics');
+  const reachable = reachableWarehouseIds(user(c).assignments);
+  const now = Date.now();
+  const DAY = 86_400_000;
+
+  // 月別集計 (UTC の YYYY-MM でバケットする)
+  const monthKeys: string[] = [];
+  const base = new Date(now);
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() - i, 1));
+    monthKeys.push(
+      `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`,
+    );
+  }
+  const sixMonthsAgo = Date.UTC(base.getUTCFullYear(), base.getUTCMonth() - 5, 1);
+  const { results: movementRows } = await c.env.DB.prepare(
+    `SELECT mv.type, mv.quantity_change AS quantityChange, mv.created_at AS createdAt
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN locations loc ON loc.id = s.location_id
+      WHERE mv.created_at >= ?1${reachable !== null && reachable.length > 0 ? ` AND loc.warehouse_id IN (${reachable.map(() => '?').join(',')})` : ''}${reachable !== null && reachable.length === 0 ? ' AND 1 = 0' : ''}`,
+  )
+    .bind(sixMonthsAgo, ...(reachable !== null && reachable.length > 0 ? reachable : []))
+    .all<{ type: string; quantityChange: number; createdAt: number }>();
+  const byMonth = new Map(monthKeys.map((k) => [k, { month: k, in: 0, out: 0 }]));
+  for (const r of movementRows) {
+    const d = new Date(r.createdAt);
+    const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    const bucket = byMonth.get(key);
+    if (!bucket) continue;
+    if (r.type === 'IN' || r.type === 'TRANSFER_IN') bucket.in += r.quantityChange;
+    else if (r.type === 'OUT' || r.type === 'TRANSFER_OUT') bucket.out += -r.quantityChange;
+  }
+
+  // 在庫評価額とカバー率
+  const valuationRow = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(s.quantity * COALESCE(p.unit_cost, 0)), 0) AS totalValue
+       FROM stocks s
+       JOIN lots l ON l.id = s.lot_id
+       JOIN products p ON p.id = l.product_id`,
+  ).first<{ totalValue: number }>();
+  const productCounts = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN unit_cost IS NOT NULL THEN 1 ELSE 0 END), 0) AS priced
+       FROM products WHERE deleted_at IS NULL`,
+  ).first<{ total: number; priced: number }>();
+  const totalProducts = productCounts?.total ?? 0;
+  const pricedProducts = productCounts?.priced ?? 0;
+
+  const scopeCondition =
+    reachable === null
+      ? ''
+      : reachable.length === 0
+        ? ' AND 1 = 0'
+        : ` AND loc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
+  const scopeParams = reachable !== null && reachable.length > 0 ? reachable : [];
+
+  // 滞留在庫
+  const { results: deadRows } = await c.env.DB.prepare(
+    `SELECT p.id AS productId, p.sku, p.name,
+            SUM(s.quantity) AS totalQuantity, MAX(mv.created_at) AS lastMovementAt
+       FROM products p
+       JOIN lots l ON l.product_id = p.id
+       JOIN stocks s ON s.lot_id = l.id
+       JOIN locations loc ON loc.id = s.location_id
+       LEFT JOIN stock_movements mv ON mv.stock_id = s.id
+      WHERE p.deleted_at IS NULL${scopeCondition}
+      GROUP BY p.id
+     HAVING totalQuantity > 0 AND (lastMovementAt IS NULL OR lastMovementAt < ?)
+      ORDER BY (lastMovementAt IS NULL) DESC, lastMovementAt ASC
+      LIMIT 20`,
+  )
+    .bind(...scopeParams, now - 90 * DAY)
+    .all<{ productId: number; sku: string; name: string; totalQuantity: number; lastMovementAt: number | null }>();
+
+  // 消費上位 (直近 90 日)
+  const { results: topRows } = await c.env.DB.prepare(
+    `SELECT p.id AS productId, p.sku, p.name, SUM(-mv.quantity_change) AS quantity
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN locations loc ON loc.id = s.location_id
+       JOIN lots l ON l.id = s.lot_id
+       JOIN products p ON p.id = l.product_id
+      WHERE mv.type = 'OUT' AND mv.created_at >= ?1${scopeCondition}
+      GROUP BY p.id
+      ORDER BY quantity DESC
+      LIMIT 10`,
+  )
+    .bind(now - 90 * DAY, ...scopeParams)
+    .all<{ productId: number; sku: string; name: string; quantity: number }>();
+
+  return c.json({
+    monthly: monthKeys.map((k) => byMonth.get(k)),
+    valuation: {
+      totalValue: valuationRow?.totalValue ?? 0,
+      pricedProducts,
+      totalProducts,
+      coverageRate: totalProducts === 0 ? 0 : pricedProducts / totalProducts,
+    },
+    deadStock: deadRows.map((r) => ({
+      productId: r.productId,
+      sku: r.sku,
+      name: r.name,
+      totalQuantity: r.totalQuantity,
+      lastMovementAt: r.lastMovementAt,
+    })),
+    topConsumed: topRows,
+  });
 });
 
 // ---------------------------------------------------------------- 管理 (権限・ユーザー)

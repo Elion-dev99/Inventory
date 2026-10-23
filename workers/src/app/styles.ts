@@ -358,4 +358,37 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .modal { background: var(--surface); color: var(--fg); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 1.4rem 1.5rem; width: 100%; max-width: 540px; }
 .modal h3 { margin-top: 0; }
 .modal form.grid { border: none; padding: 0; background: transparent; box-shadow: none; }
+
+/* ---- iOS 風トグルスイッチ (機能フラグのオン/オフ) ---- */
+.switch { position: relative; display: inline-block; flex: none; width: 51px; height: 31px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 980px;
+  background: var(--control);
+  transition: background 0.2s ease;
+  pointer-events: none;
+}
+.switch .track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  transition: transform 0.2s ease;
+}
+.switch input:checked + .track { background: #34c759; }
+.switch input:checked + .track::after { transform: translateX(20px); }
+.switch input:disabled + .track { opacity: 0.5; }
+.switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---- 分析レポートの SVG 棒グラフ ---- */
+.chart-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; overflow-x: auto; }
+.chart-legend { display: flex; gap: 1.25rem; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
+.chart-legend .sw { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 3px; margin-right: 0.35rem; vertical-align: -0.08rem; }
 `;
