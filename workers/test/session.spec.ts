@@ -5,6 +5,10 @@ import initSql from '../migrations/0001_init.sql?raw';
 import seedSql from '../migrations/0002_seed_roles.sql?raw';
 import permissionsSql from '../migrations/0003_permissions.sql?raw';
 import sessionsSql from '../migrations/0004_sessions.sql?raw';
+import businessSql from '../migrations/0005_business_completion.sql?raw';
+import featuresSql from '../migrations/0006_feature_flags.sql?raw';
+import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 import { createSession, hashSessionToken } from '../src/lib/session';
 
 /**
@@ -109,6 +113,10 @@ beforeAll(async () => {
     ...statementsOf(seedSql),
     ...statementsOf(permissionsSql),
     ...statementsOf(sessionsSql),
+    ...statementsOf(businessSql),
+    ...statementsOf(featuresSql),
+    ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }

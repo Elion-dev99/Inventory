@@ -3,6 +3,12 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import type { Envelope } from '../src/coordinator';
 import initSql from '../migrations/0001_init.sql?raw';
 import seedSql from '../migrations/0002_seed_roles.sql?raw';
+import permissionsSql from '../migrations/0003_permissions.sql?raw';
+import sessionsSql from '../migrations/0004_sessions.sql?raw';
+import businessSql from '../migrations/0005_business_completion.sql?raw';
+import featuresSql from '../migrations/0006_feature_flags.sql?raw';
+import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 
 /**
  * Coordinator の結合テスト: 実 D1 (miniflare) に対してマイグレーションを適用し、
@@ -20,8 +26,8 @@ const testEnv = env as unknown as TestEnv;
 interface CoordinatorStub {
   inbound: (input: Record<string, unknown>) => Promise<Envelope>;
   consume: (input: Record<string, unknown>) => Promise<Envelope>;
-  startStocktake: (input: { actorId: number }) => Promise<Envelope>;
-  finishStocktake: (input: { actorId: number; stocktakeId: number }) => Promise<Envelope>;
+  startStocktake: (input: { actorId: number; storeId: number }) => Promise<Envelope>;
+  finishStocktake: (input: { actorId: number; stocktakeId: number; storeId: number }) => Promise<Envelope>;
 }
 
 function stub(): CoordinatorStub {
@@ -32,7 +38,7 @@ function stub(): CoordinatorStub {
 let seq = 0;
 function ctx(endpoint: string): Record<string, unknown> {
   seq += 1;
-  return { actorId: 1, endpoint, idempotencyKey: `key-${seq}`, requestHash: `hash-${seq}` };
+  return { actorId: 1, endpoint, idempotencyKey: `key-${seq}`, requestHash: `hash-${seq}`, storeId: 1 };
 }
 
 async function stockQuantity(stockId: number): Promise<number> {
@@ -54,7 +60,14 @@ function statementsOf(sql: string): string[] {
 }
 
 beforeAll(async () => {
-  for (const stmt of [...statementsOf(initSql), ...statementsOf(seedSql)]) {
+  for (const stmt of [...statementsOf(initSql),
+    ...statementsOf(seedSql),
+    ...statementsOf(permissionsSql),
+    ...statementsOf(sessionsSql),
+    ...statementsOf(businessSql),
+    ...statementsOf(featuresSql),
+    ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),]) {
     await testEnv.DB.prepare(stmt).run();
   }
   const now = Date.now();
@@ -185,7 +198,7 @@ describe('InventoryCoordinator (D1 結合)', () => {
 
   it('棚卸し実施中は入庫が 423 で止まり、終了後は再開できる', async () => {
     const s = stub();
-    const started = await s.startStocktake({ actorId: 2 });
+    const started = await s.startStocktake({ actorId: 2, storeId: 1 });
     expect(started.status).toBe(201);
     const stocktakeId = (started.body as { id: number }).id;
 
@@ -199,7 +212,7 @@ describe('InventoryCoordinator (D1 結合)', () => {
     });
     expect(blocked.status).toBe(423);
 
-    const finished = await s.finishStocktake({ actorId: 2, stocktakeId });
+    const finished = await s.finishStocktake({ actorId: 2, stocktakeId, storeId: 1 });
     expect(finished.status).toBe(200);
 
     const after = await s.inbound({

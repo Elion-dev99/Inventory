@@ -19,8 +19,11 @@ describe('resolveRolePermissions', () => {
   it('行が空なら既定マトリクスを使う', () => {
     const map = resolveRolePermissions([]);
     for (const def of PERMISSION_CATALOG) {
+      // platform.admin は全体管理専用で、店舗ロールの解決には含まれない
+      if (def.key === Permission.PLATFORM_ADMIN) continue;
       expect(map.get(RoleCode.SYSTEM_ADMIN)?.has(def.key)).toBe(true);
     }
+    expect(map.get(RoleCode.SYSTEM_ADMIN)?.has(Permission.PLATFORM_ADMIN)).toBe(false);
     expect(map.get(RoleCode.VIEWER)?.has(Permission.STOCKS_READ)).toBe(true);
     expect(map.get(RoleCode.VIEWER)?.has(Permission.MOVEMENTS_INBOUND)).toBe(false);
     expect(map.get(RoleCode.INVENTORY_STAFF)?.has(Permission.MOVEMENTS_INBOUND)).toBe(true);
@@ -53,15 +56,15 @@ describe('resolveRolePermissions', () => {
 
 describe('権限判定 (権限 AND 倉庫スコープ)', () => {
   const map = resolveRolePermissions([]);
-  const staffAllWarehouses: RoleAssignment[] = [{ roleCode: RoleCode.INVENTORY_STAFF, warehouseId: null }];
-  const staffWarehouse1: RoleAssignment[] = [{ roleCode: RoleCode.INVENTORY_STAFF, warehouseId: 1 }];
+  const staffAllWarehouses: RoleAssignment[] = [{ roleCode: RoleCode.INVENTORY_STAFF, warehouseId: null, storeId: 1 }];
+  const staffWarehouse1: RoleAssignment[] = [{ roleCode: RoleCode.INVENTORY_STAFF, warehouseId: 1, storeId: 1 }];
 
   it('hasPermission はロールの和集合で判定する', () => {
     expect(hasPermission(staffWarehouse1, map, Permission.MOVEMENTS_INBOUND)).toBe(true);
     expect(hasPermission(staffWarehouse1, map, Permission.MASTER_WRITE)).toBe(false);
     const mixed: RoleAssignment[] = [
-      { roleCode: RoleCode.VIEWER, warehouseId: null },
-      { roleCode: RoleCode.INVENTORY_MANAGER, warehouseId: 2 },
+      { roleCode: RoleCode.VIEWER, warehouseId: null, storeId: 1 },
+      { roleCode: RoleCode.INVENTORY_MANAGER, warehouseId: 2, storeId: 1 },
     ];
     expect(hasPermission(mixed, map, Permission.NEGATIVE_DECIDE)).toBe(true);
     expect(permissionsOf(mixed, map).has(Permission.STOCKTAKES_MANAGE)).toBe(true);

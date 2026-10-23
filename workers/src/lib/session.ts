@@ -34,11 +34,48 @@ export async function createSession(db: D1Database, userId: number): Promise<str
   crypto.getRandomValues(bytes);
   const token = base64Url(bytes);
   const now = Date.now();
+  const tokenHash = await hashSessionToken(token);
   await db
     .prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)')
-    .bind(await hashSessionToken(token), userId, now + SESSION_TTL_MS, now)
+    .bind(tokenHash, userId, now + SESSION_TTL_MS, now)
     .run();
+  // 入れる店舗が 1 つだけなら、その店舗を選択済みにして発行する
+  // (複数店舗に所属する場合は未選択のままにし、/app が選択画面を出す)
+  try {
+    const { results } = await db
+      .prepare('SELECT role_code, store_id FROM user_roles WHERE user_id = ?1')
+      .bind(userId)
+      .all<{ role_code: string; store_id: number | null }>();
+    const platform = results.some((r) => r.role_code === 'SYSTEM_ADMIN' && r.store_id === null);
+    let storeIds: number[];
+    if (platform) {
+      const { results: stores } = await db.prepare('SELECT id FROM stores ORDER BY id ASC').all<{ id: number }>();
+      storeIds = stores.map((s) => s.id);
+    } else {
+      storeIds = [
+        ...new Set(results.map((r) => r.store_id).filter((id): id is number => id !== null)),
+      ];
+    }
+    if (storeIds.length === 1) {
+      await db
+        .prepare('UPDATE sessions SET store_id = ?1 WHERE token_hash = ?2')
+        .bind(storeIds[0], tokenHash)
+        .run();
+    }
+  } catch {
+    // stores / store_id 未適用の環境では自動選択を諦める (解決時に動的判定する)
+  }
   return token;
+}
+
+/** セッションに「現在店舗」を保存する。対象セッションが無ければ何もしない */
+export async function setSessionStore(db: D1Database, request: Request, storeId: number): Promise<void> {
+  const token = readSessionToken(request);
+  if (!token) return;
+  await db
+    .prepare('UPDATE sessions SET store_id = ?1 WHERE token_hash = ?2')
+    .bind(storeId, await hashSessionToken(token))
+    .run();
 }
 
 export function sessionCookieHeader(token: string): string {
@@ -69,6 +106,7 @@ interface SessionUserRow {
 interface AssignmentRow {
   role_code: string;
   warehouse_id: number | null;
+  store_id: number | null;
 }
 
 /**
@@ -82,12 +120,13 @@ export async function resolveSessionUser(db: D1Database, request: Request): Prom
   const tokenHash = await hashSessionToken(token);
   const row = await db
     .prepare(
-      `SELECT u.id, u.external_id, u.email, u.display_name, u.status, s.expires_at AS expires_at
+      `SELECT u.id, u.external_id, u.email, u.display_name, u.status,
+              s.expires_at AS expires_at, s.store_id AS session_store_id
          FROM sessions s JOIN users u ON u.id = s.user_id
         WHERE s.token_hash = ?1`,
     )
     .bind(tokenHash)
-    .first<SessionUserRow & { expires_at: number }>();
+    .first<SessionUserRow & { expires_at: number; session_store_id: number | null }>();
   if (!row) return null;
   if (row.expires_at <= Date.now()) {
     await db.prepare('DELETE FROM sessions WHERE token_hash = ?1').bind(tokenHash).run();
@@ -96,7 +135,7 @@ export async function resolveSessionUser(db: D1Database, request: Request): Prom
   if (row.status !== 'active') return null;
 
   const { results } = await db
-    .prepare('SELECT role_code, warehouse_id FROM user_roles WHERE user_id = ?1')
+    .prepare('SELECT role_code, warehouse_id, store_id FROM user_roles WHERE user_id = ?1')
     .bind(row.id)
     .all<AssignmentRow>();
 
@@ -108,7 +147,10 @@ export async function resolveSessionUser(db: D1Database, request: Request): Prom
     assignments: results.map((r) => ({
       roleCode: r.role_code as RoleCode,
       warehouseId: r.warehouse_id,
+      storeId: r.store_id,
     })),
+    sessionStoreId: row.session_store_id,
+    viaSession: true,
   };
 }
 

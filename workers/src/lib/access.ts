@@ -14,10 +14,15 @@ export const RoleCode = {
 
 export type RoleCode = (typeof RoleCode)[keyof typeof RoleCode];
 
-/** user_roles の1割当 (ロール + 倉庫スコープ)。warehouseId = null は全倉庫 */
+/**
+ * user_roles の1割当 (ロール + 倉庫スコープ + 店舗スコープ)。
+ * warehouseId = null は全倉庫。storeId = null は全体 (プラットフォーム) 割当で、
+ * SYSTEM_ADMIN との組み合わせでのみ意味を持つ (全体管理者)。
+ */
 export interface RoleAssignment {
   roleCode: RoleCode;
   warehouseId: number | null;
+  storeId: number | null;
 }
 
 export function hasRole(assignments: readonly RoleAssignment[], ...roles: RoleCode[]): boolean {
@@ -67,6 +72,7 @@ export const Permission = {
   PURCHASES_WRITE: 'purchases.write',
   ADMIN_USERS: 'admin.users',
   ADMIN_PERMISSIONS: 'admin.permissions',
+  PLATFORM_ADMIN: 'platform.admin',
 } as const;
 
 export type PermissionKey = (typeof Permission)[keyof typeof Permission];
@@ -93,6 +99,7 @@ export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.PURCHASES_WRITE, label: '発注登録', description: '発注書の作成と入荷登録' },
   { key: Permission.ADMIN_USERS, label: 'ユーザー管理', description: 'ユーザー一覧の参照とロール付与の変更' },
   { key: Permission.ADMIN_PERMISSIONS, label: '権限管理', description: 'ロール×権限マトリクスの変更' },
+  { key: Permission.PLATFORM_ADMIN, label: '全体管理', description: 'システム全体 (全店舗) の管理。店舗ロールの権限解決には含めず、全体管理者かどうかは割当 (SYSTEM_ADMIN かつ store_id NULL) で判定する' },
 ];
 
 export const PERMISSION_KEYS: ReadonlySet<string> = new Set(PERMISSION_CATALOG.map((p) => p.key));
@@ -105,7 +112,13 @@ export const ALL_ROLE_CODES: readonly RoleCode[] = [
   RoleCode.AUDITOR,
 ];
 
-const ALL_PERMISSIONS = PERMISSION_CATALOG.map((p) => p.key);
+/**
+ * 店舗ロールに解決される権限の全体集合。platform.admin は全体管理専用で、
+ * 店舗ロールの権限解決には混ぜないため、ここでは明示的に除外する。
+ */
+const ALL_PERMISSIONS = PERMISSION_CATALOG.map((p) => p.key).filter(
+  (key) => key !== Permission.PLATFORM_ADMIN,
+);
 
 /**
  * 既定のロール×権限マトリクス。権限キー導入前の各エンドポイントの許可ロールを
@@ -167,6 +180,8 @@ export function resolveRolePermissions(rows: readonly RolePermissionRow[]): Role
   for (const row of rows) {
     if (!ALL_ROLE_CODES.includes(row.role_code as RoleCode)) continue;
     if (!PERMISSION_KEYS.has(row.permission_key)) continue;
+    // platform.admin は店舗ロールの解決に混ぜない (全体 API は割当で判定する)
+    if (row.permission_key === Permission.PLATFORM_ADMIN) continue;
     map.get(row.role_code as RoleCode)?.add(row.permission_key as PermissionKey);
   }
   return map;
@@ -206,4 +221,30 @@ export function canPerformPermission(
       rolePermissions.get(a.roleCode)?.has(permission) === true &&
       (a.warehouseId === null || a.warehouseId === warehouseId),
   );
+}
+
+// ---------------------------------------------------------------- 店舗 (テナント)
+// 店舗はデータ分離の単位。割当の storeId が店舗への所属を表し、
+// storeId = null の SYSTEM_ADMIN 割当が全体管理者 (プラットフォーム管理者)。
+
+/** 全体管理者か: SYSTEM_ADMIN かつ store_id IS NULL の割当を持つ */
+export function isPlatformAdmin(assignments: readonly RoleAssignment[]): boolean {
+  return assignments.some((a) => a.roleCode === RoleCode.SYSTEM_ADMIN && a.storeId === null);
+}
+
+/** 指定店舗に対する割当だけを抜き出す */
+export function storeAssignments(
+  assignments: readonly RoleAssignment[],
+  storeId: number,
+): RoleAssignment[] {
+  return assignments.filter((a) => a.storeId === storeId);
+}
+
+/** 割当から入れる店舗 ID の一覧 (全体割当は含まない) */
+export function assignedStoreIds(assignments: readonly RoleAssignment[]): number[] {
+  return [
+    ...new Set(
+      assignments.map((a) => a.storeId).filter((id): id is number => id !== null),
+    ),
+  ];
 }

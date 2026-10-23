@@ -5,6 +5,10 @@ import initSql from '../migrations/0001_init.sql?raw';
 import seedSql from '../migrations/0002_seed_roles.sql?raw';
 import permissionsSql from '../migrations/0003_permissions.sql?raw';
 import businessSql from '../migrations/0005_business_completion.sql?raw';
+import sessionsSql from '../migrations/0004_sessions.sql?raw';
+import featuresSql from '../migrations/0006_feature_flags.sql?raw';
+import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 
 /**
  * 同時実行・二重送信・整合性プロパティの結合テスト (要件で必須とされた観点)。
@@ -135,7 +139,11 @@ beforeAll(async () => {
     ...statementsOf(initSql),
     ...statementsOf(seedSql),
     ...statementsOf(permissionsSql),
+    ...statementsOf(sessionsSql),
     ...statementsOf(businessSql),
+    ...statementsOf(featuresSql),
+    ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -146,7 +154,7 @@ beforeAll(async () => {
        VALUES (1, 'sub-staff', 'staff@example.com', 'Staff', 'active', ?1, ?1)`,
     ).bind(now),
     testEnv.DB.prepare(
-      `INSERT INTO user_roles (user_id, role_code, warehouse_id) VALUES (1, 'INVENTORY_STAFF', NULL)`,
+      `INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (1, 'INVENTORY_STAFF', NULL, 1)`,
     ),
     testEnv.DB.prepare(
       `INSERT INTO warehouses (id, code, name, created_at, updated_at) VALUES (1, 'WH1', '本社倉庫', ?1, ?1)`,

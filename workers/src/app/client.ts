@@ -91,6 +91,8 @@ function viewLoading(title, kind) {
 }
 function errMsg(e) {
   if (e && e.status === 423) return '棚卸し実施中のため、この操作は停止しています (423)。棚卸しが終了するまでお待ちください。';
+  if (e && e.code === 'STORE_SUSPENDED') return 'この店舗は現在停止中です。全体管理者に連絡してください。';
+  if (e && e.code === 'STORE_NOT_SELECTED') return '店舗が選択されていません。画面を再読み込みして、店舗を選んでください。';
   return e && e.message ? e.message : String(e);
 }
 function msgHtml(kind, text) {
@@ -350,10 +352,16 @@ function loadMore() {
   if (can('admin.permissions') || can('admin.users')) {
     h += '<a class="group-row" href="/admin/permissions"><span class="row-icon" style="background:#30b0c7">' + icon('shield', 17) + '</span><span class="row-label">権限管理</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
   }
+  if (state.me && state.me.isPlatformAdmin) {
+    h += '<a class="group-row" href="/platform"><span class="row-icon" style="background:#5856d6">' + icon('grid', 17) + '</span><span class="row-label">全体管理 (店舗・全体設定)</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
+  }
   h += '</div>';
   h += '<h3>アカウント</h3><div class="group">';
   if (state.me) {
     h += '<div class="group-row static"><span class="row-label">' + esc(state.me.email) + (state.me.displayName ? ' (' + esc(state.me.displayName) + ')' : '') + '</span></div>';
+    if (state.me.currentStore) {
+      h += '<div class="group-row static"><span class="row-label">現在の店舗: ' + esc(state.me.currentStore.name) + ' (' + esc(state.me.currentStore.code) + ')</span></div>';
+    }
   }
   h += '<button class="group-row danger" id="moreLogout"><span class="row-label">ログアウト</span></button>';
   h += '</div>';
@@ -1723,6 +1731,50 @@ function connectWs() {
   }
 }
 
+/* ---------------- 店舗の選択・切替 ---------------- */
+function selectStore(storeId) {
+  api('/api/v1/session/store', { method: 'POST', body: { storeId: storeId } }).then(function () {
+    location.reload();
+  }).catch(function (e) {
+    var m = el('storeMsg');
+    if (m && el('storeBox').style.display !== 'none') m.innerHTML = msgHtml('error', errMsg(e));
+    else window.alert(errMsg(e));
+  });
+}
+function showStorePicker(me) {
+  el('storeBox').style.display = '';
+  var stores = me.stores || [];
+  var h = '';
+  for (var i = 0; i < stores.length; i++) {
+    var s = stores[i];
+    h += '<button class="group-row" data-store="' + s.id + '"><span class="row-label">' + esc(s.name) + ' <small class="muted">' + esc(s.code) + '</small></span>' +
+      (s.status === 'suspended' ? '<span class="badge badge-danger">停止中</span>' : '') +
+      '<span class="chev">' + icon('chevR', 18) + '</span></button>';
+  }
+  if (stores.length === 0) {
+    h = '<div class="group-row static"><span class="row-label">入れる店舗がありません。管理者に確認してください。</span></div>';
+  }
+  el('storeList').innerHTML = h;
+  var rows = el('storeList').querySelectorAll('button[data-store]');
+  for (var j = 0; j < rows.length; j++) {
+    rows[j].onclick = function () { selectStore(Number(this.getAttribute('data-store'))); };
+  }
+}
+function renderStoreSwitch(me) {
+  var sel = el('storeSwitch');
+  if (!sel) return;
+  var stores = me.stores || [];
+  if (stores.length < 2 || !me.currentStore) { sel.style.display = 'none'; return; }
+  var h = '';
+  for (var i = 0; i < stores.length; i++) {
+    var s = stores[i];
+    h += '<option value="' + s.id + '"' + (s.id === me.currentStore.id ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+  }
+  sel.innerHTML = h;
+  sel.style.display = '';
+  sel.onchange = function () { selectStore(Number(sel.value)); };
+}
+
 /* ---------------- boot ---------------- */
 function boot() {
   el('sheetOverlay').addEventListener('click', function (e) { if (e.target === this) closeSheet(); });
@@ -1732,12 +1784,17 @@ function boot() {
     state.features = me.features || {};
     (me.permissions || []).forEach(function (p) { state.perms[p] = true; });
     el('loadingBox').style.display = 'none';
-    if (!me.assignments || me.assignments.length === 0) {
+    if ((!me.assignments || me.assignments.length === 0) && !me.isPlatformAdmin) {
       el('noAssignBox').style.display = '';
+      return;
+    }
+    if (!me.currentStore) {
+      showStorePicker(me);
       return;
     }
     el('appBox').style.display = '';
     el('userLabel').textContent = me.email + (me.displayName ? ' (' + me.displayName + ')' : '');
+    renderStoreSwitch(me);
     buildNav();
     showView('dashboard');
     connectWs();

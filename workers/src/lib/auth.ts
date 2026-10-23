@@ -35,6 +35,10 @@ export interface AuthUser {
   email: string;
   displayName: string;
   assignments: RoleAssignment[];
+  /** Cookie セッションで選択済みの店舗 ID。Bearer 認証では undefined */
+  sessionStoreId?: number | null;
+  /** Cookie セッション経由の認証かどうか (店舗選択の保存可否に使う) */
+  viaSession?: boolean;
 }
 
 interface UserRow {
@@ -45,6 +49,7 @@ interface UserRow {
 interface AssignmentRow {
   role_code: string;
   warehouse_id: number | null;
+  store_id: number | null;
 }
 
 /** クレームから users を同期し、ロール割当を解決する (Nest 版 UsersService 相当) */
@@ -74,7 +79,7 @@ export async function syncUserAndAssignments(
   if (user.status !== 'active') throw unauthorized('User is disabled');
 
   const { results } = await db
-    .prepare('SELECT role_code, warehouse_id FROM user_roles WHERE user_id = ?1')
+    .prepare('SELECT role_code, warehouse_id, store_id FROM user_roles WHERE user_id = ?1')
     .bind(user.id)
     .all<AssignmentRow>();
 
@@ -86,6 +91,7 @@ export async function syncUserAndAssignments(
     assignments: results.map((r) => ({
       roleCode: r.role_code as RoleCode,
       warehouseId: r.warehouse_id,
+      storeId: r.store_id,
     })),
   };
 }

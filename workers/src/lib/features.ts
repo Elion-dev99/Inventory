@@ -37,12 +37,16 @@ export function defaultFeatures(): FeatureMap {
   return out;
 }
 
-/** feature_flags を読み、カタログ既定値に上書きして解決済みフラグを返す */
-export async function getFeatures(db: D1Database): Promise<FeatureMap> {
+/**
+ * feature_flags を読み、カタログ既定値に上書きして解決済みフラグを返す。
+ * フラグは店舗ごとに解決する (feature_flags は (store_id, key) が主キー)。
+ */
+export async function getFeatures(db: D1Database, storeId: number): Promise<FeatureMap> {
   const out = defaultFeatures();
   try {
     const { results } = await db
-      .prepare('SELECT key, enabled FROM feature_flags')
+      .prepare('SELECT key, enabled FROM feature_flags WHERE store_id = ?1')
+      .bind(storeId)
       .all<{ key: string; enabled: number }>();
     for (const row of results) {
       if (FEATURE_KEYS.has(row.key)) out[row.key] = row.enabled === 1;
@@ -53,7 +57,7 @@ export async function getFeatures(db: D1Database): Promise<FeatureMap> {
   return out;
 }
 
-export async function isFeatureEnabled(db: D1Database, key: string): Promise<boolean> {
-  const features = await getFeatures(db);
+export async function isFeatureEnabled(db: D1Database, key: string, storeId: number): Promise<boolean> {
+  const features = await getFeatures(db, storeId);
   return features[key] === true;
 }

@@ -6,6 +6,9 @@ import seedSql from '../migrations/0002_seed_roles.sql?raw';
 import permissionsSql from '../migrations/0003_permissions.sql?raw';
 import sessionsSql from '../migrations/0004_sessions.sql?raw';
 import businessSql from '../migrations/0005_business_completion.sql?raw';
+import featuresSql from '../migrations/0006_feature_flags.sql?raw';
+import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 
 /**
  * 運用系の管理 API の結合テスト (商品化ステップ5):
@@ -105,6 +108,9 @@ beforeAll(async () => {
     ...statementsOf(permissionsSql),
     ...statementsOf(sessionsSql),
     ...statementsOf(businessSql),
+    ...statementsOf(featuresSql),
+    ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -116,8 +122,8 @@ beforeAll(async () => {
               (2, 'sub-viewer', 'viewer@example.com', 'Viewer', 'active', ?1, ?1)`,
     ).bind(now),
     testEnv.DB.prepare(
-      `INSERT INTO user_roles (user_id, role_code, warehouse_id)
-       VALUES (1, 'SYSTEM_ADMIN', NULL), (2, 'VIEWER', NULL)`,
+      `INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id)
+       VALUES (1, 'SYSTEM_ADMIN', NULL, NULL), (2, 'VIEWER', NULL, 1)`,
     ),
     testEnv.DB.prepare(
       `INSERT INTO warehouses (id, code, name, created_at, updated_at) VALUES (1, 'WH1', '本社倉庫', ?1, ?1)`,
@@ -272,7 +278,7 @@ describe('GET /api/v1/admin/export.json (データエクスポート)', () => {
     expect(rowsOf('users').map((u) => u.email)).toContain('admin@example.com');
     expect(rowsOf('products').map((p) => p.sku)).toContain('SKU-1');
     expect(rowsOf('roles')).toHaveLength(5);
-    expect(rowsOf('permissions')).toHaveLength(12);
+    expect(rowsOf('permissions')).toHaveLength(15);
     expect(rowsOf('stocks')).toHaveLength(1);
     expect(rowsOf('stock_movements').some((m) => m.type === 'IN')).toBe(true);
     expect(rowsOf('audit_logs').some((a) => a.action === 'stock.inbound')).toBe(true);

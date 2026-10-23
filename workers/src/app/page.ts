@@ -21,6 +21,7 @@ export const APP_HTML = `<!doctype html>
   <h1>在庫管理システム</h1>
   <span><span class="ws-dot" id="wsDot"></span> <span class="ws-label" id="wsLabel">リアルタイム未接続</span></span>
   <span class="spacer"></span>
+  <select id="storeSwitch" style="display:none" aria-label="店舗を切り替える"></select>
   <span class="small" id="userLabel"></span>
 </header>
 
@@ -36,6 +37,14 @@ export const APP_HTML = `<!doctype html>
 <div id="noAssignBox" class="center-box" style="display:none">
   <h2>権限が付与されていません</h2>
   <p class="muted">ログインはできていますが、このアカウントにはまだロールが割り当てられていません。管理者にロール付与を依頼してください。</p>
+</div>
+
+<div id="storeBox" class="center-box" style="display:none">
+  <img class="app-icon-lg" src="/icons/icon-512.png" alt="">
+  <h2>店舗を選んでください</h2>
+  <p class="muted">複数の店舗に所属しています。作業する店舗を選ぶと、その店舗のデータだけが表示されます。</p>
+  <div id="storeList" class="group" style="text-align:left"></div>
+  <p id="storeMsg"></p>
 </div>
 
 <div id="appBox" style="display:none">

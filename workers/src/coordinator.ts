@@ -39,6 +39,8 @@ interface MovementContext {
   endpoint: string;
   idempotencyKey: string;
   requestHash: string;
+  /** 対象店舗 (テナント)。在庫・台帳・冪等キー・棚卸しロックはすべて店舗単位 */
+  storeId: number;
 }
 
 export interface InboundInput extends MovementContext {
@@ -133,6 +135,12 @@ export class InventoryCoordinator extends DurableObject<Env> {
     const client = pair[0];
     const server = pair[1];
     this.ctx.acceptWebSocket(server);
+    // 接続を店舗でタグ付けし、ブロードキャストを同店舗だけに届ける。
+    // Worker の /realtime が ?store=<id> を付けて転送する。未指定 (null) の
+    // 接続は全体管理者の監視用として全店舗分を受け取る。
+    const raw = new URL(request.url).searchParams.get('store');
+    const parsed = raw === null || raw === '' ? null : Number(raw);
+    server.serializeAttachment({ storeId: parsed !== null && Number.isInteger(parsed) ? parsed : null });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -160,7 +168,19 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
   private broadcast(payload: Record<string, unknown>): void {
     const message = JSON.stringify(payload);
+    // payload.storeId がある通知は、同店舗タグの接続 (と未タグの全体監視) にだけ届ける
+    const target = typeof payload.storeId === 'number' ? payload.storeId : null;
     for (const ws of this.ctx.getWebSockets()) {
+      if (target !== null) {
+        let tag: number | null = null;
+        try {
+          const attachment = ws.deserializeAttachment() as { storeId?: number | null } | null;
+          tag = attachment?.storeId ?? null;
+        } catch {
+          tag = null;
+        }
+        if (tag !== null && tag !== target) continue;
+      }
       try {
         ws.send(message);
       } catch {
@@ -187,9 +207,9 @@ export class InventoryCoordinator extends DurableObject<Env> {
   /** 冪等性: 保存済みレスポンスがあればそれを返す。再利用時のハッシュ不一致は 422 */
   private async findStoredResponse(ctx: MovementContext): Promise<Envelope | null> {
     const row = await this.env.DB.prepare(
-      'SELECT request_hash, response_status, response_body FROM idempotency_keys WHERE key = ?1 AND user_id = ?2',
+      'SELECT request_hash, response_status, response_body FROM idempotency_keys WHERE key = ?1 AND user_id = ?2 AND store_id = ?3',
     )
-      .bind(ctx.idempotencyKey, ctx.actorId)
+      .bind(ctx.idempotencyKey, ctx.actorId, ctx.storeId)
       .first<{ request_hash: string; response_status: number | null; response_body: string | null }>();
     if (!row || row.response_status === null || row.response_body === null) return null;
     if (row.request_hash !== ctx.requestHash) {
@@ -204,8 +224,8 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
   private idempotencyStmt(ctx: MovementContext, status: number, body: unknown): D1PreparedStatement {
     return this.env.DB.prepare(
-      `INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash, response_status, response_body, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      `INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash, response_status, response_body, store_id, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
     ).bind(
       ctx.idempotencyKey,
       ctx.actorId,
@@ -213,6 +233,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       ctx.requestHash,
       status,
       JSON.stringify(body),
+      ctx.storeId,
       Date.now(),
     );
   }
@@ -223,11 +244,12 @@ export class InventoryCoordinator extends DurableObject<Env> {
     targetType: string,
     targetId: string,
     payload: unknown,
+    storeId: number | null,
   ): D1PreparedStatement {
     return this.env.DB.prepare(
-      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
-    ).bind(actorId, action, targetType, targetId, JSON.stringify(payload), Date.now());
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+    ).bind(actorId, action, targetType, targetId, JSON.stringify(payload), storeId, Date.now());
   }
 
   /**
@@ -268,14 +290,17 @@ export class InventoryCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * 棚卸し実施中は全面停止 (要件 Q3)。Prisma の stocktakes に倉庫を持たないため全体ロック。
+   * 棚卸し実施中は全面停止 (要件 Q3)。停止は店舗単位で、他店舗の棚卸しは
+   * この店舗の入出庫に影響しない。
    * 差異承認待ち (pending_approval) の間も在庫は動かせないため同じく停止する。
    * 棚卸し自身の調整 (decideStocktake) はこのチェックを通らない専用パスで行う。
    */
-  private async assertNotLocked(): Promise<void> {
+  private async assertNotLocked(storeId: number): Promise<void> {
     const row = await this.env.DB.prepare(
-      "SELECT id FROM stocktakes WHERE status IN ('in_progress', 'pending_approval') LIMIT 1",
-    ).first<{ id: number }>();
+      "SELECT id FROM stocktakes WHERE store_id = ?1 AND status IN ('in_progress', 'pending_approval') LIMIT 1",
+    )
+      .bind(storeId)
+      .first<{ id: number }>();
     if (row) throw stocktakeLocked();
   }
 
@@ -294,30 +319,34 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async inboundInternal(input: InboundInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked();
+    await this.assertNotLocked(input.storeId);
 
     const db = this.env.DB;
     const now = Date.now();
     const documentId = crypto.randomUUID();
     const batchId = crypto.randomUUID();
 
+    // 商品・保管場所・ロットはすべて対象店舗のものだけを引く (他店舗の ID は存在しない扱い)
     const product = await db
-      .prepare('SELECT id, requires_expiry FROM products WHERE id = ?1 AND deleted_at IS NULL')
-      .bind(input.productId)
+      .prepare('SELECT id, requires_expiry FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+      .bind(input.productId, input.storeId)
       .first<{ id: number; requires_expiry: number }>();
     if (!product) throw badRequest('Product not found');
     if (product.requires_expiry === 1 && input.expiryDateMs === null) {
       throw badRequest('expiryDate is required for this product');
     }
     const location = await db
-      .prepare('SELECT id FROM locations WHERE id = ?1 AND deleted_at IS NULL')
-      .bind(input.locationId)
+      .prepare(
+        `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+          WHERE loc.id = ?1 AND loc.deleted_at IS NULL AND w.store_id = ?2`,
+      )
+      .bind(input.locationId, input.storeId)
       .first<{ id: number }>();
     if (!location) throw badRequest('Location not found');
 
     const lot = await db
-      .prepare('SELECT id FROM lots WHERE product_id = ?1 AND lot_code = ?2')
-      .bind(input.productId, input.lotCode)
+      .prepare('SELECT id FROM lots WHERE product_id = ?1 AND lot_code = ?2 AND store_id = ?3')
+      .bind(input.productId, input.lotCode, input.storeId)
       .first<{ id: number }>();
 
     const stock = lot
@@ -352,20 +381,20 @@ export class InventoryCoordinator extends DurableObject<Env> {
       statements.push(
         db
           .prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, created_at)
-             VALUES (?1, ?2, 'IN', ?3, ?4, ?5, ?6, ?7)`,
+            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+             VALUES (?1, ?2, 'IN', ?3, ?4, ?5, ?6, ?7, ?8)`,
           )
-          .bind(documentId, stock.id, input.quantity, stock.quantity, after, input.actorId, now),
+          .bind(documentId, stock.id, input.quantity, stock.quantity, after, input.actorId, input.storeId, now),
       );
       const body = { documentId, stockId: stock.id, quantity: after };
       statements.push(this.auditStmt(input.actorId, 'stock.inbound', 'stock', String(stock.id), {
         documentId,
         quantity: input.quantity,
-      }));
+      }, input.storeId));
       statements.push(this.idempotencyStmt(input, 201, body));
       statements.push(this.cleanupGuardsStmt(batchId));
       await this.runBatch(statements, expected);
-      this.broadcast({ type: 'stock.changed', stockIds: [stock.id], documentId, at: now });
+      this.broadcast({ type: 'stock.changed', stockIds: [stock.id], documentId, storeId: input.storeId, at: now });
       return this.envelope(201, body);
     }
 
@@ -374,17 +403,17 @@ export class InventoryCoordinator extends DurableObject<Env> {
       statements.push(
         db
           .prepare(
-            `INSERT INTO lots (product_id, lot_code, expiry_date, received_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?4)`,
+            `INSERT INTO lots (product_id, lot_code, expiry_date, received_at, store_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?4)`,
           )
-          .bind(input.productId, input.lotCode, input.expiryDateMs, now),
+          .bind(input.productId, input.lotCode, input.expiryDateMs, now, input.storeId),
       );
     }
     statements.push(
       db.prepare(
-        `INSERT INTO stocks (location_id, lot_id, quantity, version, created_at, updated_at)
-         SELECT ?1, id, ?2, 1, ?3, ?3 FROM lots WHERE product_id = ?4 AND lot_code = ?5`,
-      ).bind(input.locationId, input.quantity, now, input.productId, input.lotCode),
+        `INSERT INTO stocks (location_id, lot_id, quantity, version, store_id, created_at, updated_at)
+         SELECT ?1, id, ?2, 1, ?3, ?4, ?4 FROM lots WHERE product_id = ?5 AND lot_code = ?6 AND store_id = ?3`,
+      ).bind(input.locationId, input.quantity, input.storeId, now, input.productId, input.lotCode),
     );
     statements.push(
       this.guardStmt(
@@ -397,11 +426,11 @@ export class InventoryCoordinator extends DurableObject<Env> {
     );
     statements.push(
       db.prepare(
-        `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, created_at)
-         SELECT ?1, s.id, 'IN', ?2, 0, ?2, ?3, ?4
+        `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+         SELECT ?1, s.id, 'IN', ?2, 0, ?2, ?3, ?4, ?5
            FROM stocks s JOIN lots l ON l.id = s.lot_id
-          WHERE s.location_id = ?5 AND l.product_id = ?6 AND l.lot_code = ?7`,
-      ).bind(documentId, input.quantity, input.actorId, now, input.locationId, input.productId, input.lotCode),
+          WHERE s.location_id = ?6 AND l.product_id = ?7 AND l.lot_code = ?8`,
+      ).bind(documentId, input.quantity, input.actorId, input.storeId, now, input.locationId, input.productId, input.lotCode),
     );
 
     // 作成された stock の ID を引く (batch 実行前に body が要るため、実行後にもう一度引く)
@@ -410,7 +439,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       this.auditStmt(input.actorId, 'stock.inbound', 'product', String(input.productId), {
         documentId,
         quantity: input.quantity,
-      }),
+      }, input.storeId),
     );
     // 冪等レコードは stockId 確定後に別途保存する (後段で処理)
     statements.push(this.cleanupGuardsStmt(batchId));
@@ -427,7 +456,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     const body = { ...bodyPlaceholder, stockId: created.id };
     // DO は直列処理のため、この保存が他リクエストと競合することはない
     await this.idempotencyStmt(input, 201, body).run();
-    this.broadcast({ type: 'stock.changed', stockIds: [created.id], documentId, at: now });
+    this.broadcast({ type: 'stock.changed', stockIds: [created.id], documentId, storeId: input.storeId, at: now });
     return this.envelope(201, body);
   }
 
@@ -446,7 +475,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async consumeInternal(input: ConsumeInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked();
+    await this.assertNotLocked(input.storeId);
 
     const db = this.env.DB;
     const now = Date.now();
@@ -454,14 +483,15 @@ export class InventoryCoordinator extends DurableObject<Env> {
     const batchId = crypto.randomUUID();
 
     // FEFO 候補: 対象商品の stocks を id 昇順で読む (DO 内では他者が書き換えない)
+    // 店舗スコープ: 候補は対象店舗の stocks だけに限る
     let sql = `SELECT s.id AS stock_id, s.lot_id AS lot_id, s.location_id AS location_id,
                       loc.warehouse_id AS warehouse_id, s.quantity AS quantity, s.version AS version,
                       l.expiry_date AS expiry_date, l.received_at AS received_at
                  FROM stocks s
                  JOIN lots l ON l.id = s.lot_id
                  JOIN locations loc ON loc.id = s.location_id
-                WHERE l.product_id = ?`;
-    const params: unknown[] = [input.productId];
+                WHERE l.product_id = ? AND s.store_id = ?`;
+    const params: unknown[] = [input.productId, input.storeId];
     if (input.locationId !== undefined) {
       sql += ' AND s.location_id = ?';
       params.push(input.locationId);
@@ -490,8 +520,8 @@ export class InventoryCoordinator extends DurableObject<Env> {
     let approval: NegativeApprovalInfo | null = null;
     if (input.negativeApprovalId !== undefined) {
       const row = await db
-        .prepare('SELECT id, stock_id, quantity, status, requested_by, approved_by, movement_id FROM negative_stock_approvals WHERE id = ?1')
-        .bind(input.negativeApprovalId)
+        .prepare('SELECT id, stock_id, quantity, status, requested_by, approved_by, movement_id FROM negative_stock_approvals WHERE id = ?1 AND store_id = ?2')
+        .bind(input.negativeApprovalId, input.storeId)
         .first<ApprovalRow>();
       if (!row) throw notFound('Negative stock approval not found');
       if (row.status !== 'approved' || row.movement_id !== null) {
@@ -554,8 +584,8 @@ export class InventoryCoordinator extends DurableObject<Env> {
       statements.push(
         db
           .prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, department, purpose, reason, created_at)
-             VALUES (?1, ?2, 'OUT', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, department, purpose, reason, store_id, created_at)
+             VALUES (?1, ?2, 'OUT', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
           )
           .bind(
             documentId,
@@ -567,6 +597,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
             input.department,
             input.purpose,
             alloc.negative ? 'negative-stock-approved' : (input.fefoDeviationReason ?? null),
+            input.storeId,
             now,
           ),
       );
@@ -613,7 +644,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         documentId,
         quantity: input.quantity,
         ...(plan.usedApprovalId !== null ? { negativeApprovalId: plan.usedApprovalId } : {}),
-      }),
+      }, input.storeId),
     );
     statements.push(this.idempotencyStmt(input, 201, body));
     statements.push(this.cleanupGuardsStmt(batchId));
@@ -624,6 +655,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       type: 'stock.changed',
       stockIds: plan.allocations.map((a) => a.stockId),
       documentId,
+      storeId: input.storeId,
       ...(plan.usedApprovalId !== null
         ? { negativeStockIds: ordered.filter((a) => a.negative).map((a) => a.stockId) }
         : {}),
@@ -652,7 +684,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async transferInternal(input: TransferInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked();
+    await this.assertNotLocked(input.storeId);
 
     const db = this.env.DB;
     const now = Date.now();
@@ -663,14 +695,17 @@ export class InventoryCoordinator extends DurableObject<Env> {
       throw badRequest('fromLocationId and toLocationId must differ');
     }
     const product = await db
-      .prepare('SELECT id FROM products WHERE id = ?1 AND deleted_at IS NULL')
-      .bind(input.productId)
+      .prepare('SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+      .bind(input.productId, input.storeId)
       .first<{ id: number }>();
     if (!product) throw badRequest('Product not found');
     for (const locationId of [input.fromLocationId, input.toLocationId]) {
       const location = await db
-        .prepare('SELECT id FROM locations WHERE id = ?1 AND deleted_at IS NULL')
-        .bind(locationId)
+        .prepare(
+          `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+            WHERE loc.id = ?1 AND loc.deleted_at IS NULL AND w.store_id = ?2`,
+        )
+        .bind(locationId, input.storeId)
         .first<{ id: number }>();
       if (!location) throw badRequest('Location not found');
     }
@@ -680,8 +715,8 @@ export class InventoryCoordinator extends DurableObject<Env> {
                       s.version AS version, l.expiry_date AS expiry_date, l.received_at AS received_at
                  FROM stocks s
                  JOIN lots l ON l.id = s.lot_id
-                WHERE s.location_id = ? AND l.product_id = ?`;
-    const params: unknown[] = [input.fromLocationId, input.productId];
+                WHERE s.location_id = ? AND l.product_id = ? AND s.store_id = ?`;
+    const params: unknown[] = [input.fromLocationId, input.productId, input.storeId];
     if (input.lotId !== undefined) {
       sql += ' AND s.lot_id = ?';
       params.push(input.lotId);
@@ -713,9 +748,9 @@ export class InventoryCoordinator extends DurableObject<Env> {
     const { results: destRows } = await db
       .prepare(
         `SELECT id, lot_id, quantity, version FROM stocks
-          WHERE location_id = ? AND lot_id IN (${lotIds.map(() => '?').join(',')})`,
+          WHERE location_id = ? AND store_id = ? AND lot_id IN (${lotIds.map(() => '?').join(',')})`,
       )
-      .bind(input.toLocationId, ...lotIds)
+      .bind(input.toLocationId, input.storeId, ...lotIds)
       .all<{ id: number; lot_id: number; quantity: number; version: number }>();
     const destByLot = new Map(destRows.map((r) => [r.lot_id, r]));
 
@@ -749,10 +784,10 @@ export class InventoryCoordinator extends DurableObject<Env> {
       statements.push(
         db
           .prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, created_at)
-             VALUES (?1, ?2, 'TRANSFER_OUT', ?3, ?4, ?5, ?6, ?7)`,
+            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+             VALUES (?1, ?2, 'TRANSFER_OUT', ?3, ?4, ?5, ?6, ?7, ?8)`,
           )
-          .bind(documentId, alloc.stockId, -alloc.quantity, src.quantity, srcAfter, input.actorId, now),
+          .bind(documentId, alloc.stockId, -alloc.quantity, src.quantity, srcAfter, input.actorId, input.storeId, now),
       );
 
       const dest = destByLot.get(alloc.lotId);
@@ -778,20 +813,20 @@ export class InventoryCoordinator extends DurableObject<Env> {
         statements.push(
           db
             .prepare(
-              `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, created_at)
-               VALUES (?1, ?2, 'TRANSFER_IN', ?3, ?4, ?5, ?6, ?7)`,
+              `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+               VALUES (?1, ?2, 'TRANSFER_IN', ?3, ?4, ?5, ?6, ?7, ?8)`,
             )
-            .bind(documentId, dest.id, alloc.quantity, dest.quantity, destAfter, input.actorId, now),
+            .bind(documentId, dest.id, alloc.quantity, dest.quantity, destAfter, input.actorId, input.storeId, now),
         );
       } else {
         // 移動先に stocks 行が無い: lot は既存なので lot_id を直接指定して作る
         statements.push(
           db
             .prepare(
-              `INSERT INTO stocks (location_id, lot_id, quantity, version, created_at, updated_at)
-               VALUES (?1, ?2, ?3, 1, ?4, ?4)`,
+              `INSERT INTO stocks (location_id, lot_id, quantity, version, store_id, created_at, updated_at)
+               VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)`,
             )
-            .bind(input.toLocationId, alloc.lotId, alloc.quantity, now),
+            .bind(input.toLocationId, alloc.lotId, alloc.quantity, input.storeId, now),
         );
         statements.push(
           this.guardStmt(
@@ -803,10 +838,10 @@ export class InventoryCoordinator extends DurableObject<Env> {
         );
         statements.push(
           db.prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, created_at)
-             SELECT ?1, s.id, 'TRANSFER_IN', ?2, 0, ?2, ?3, ?4
-               FROM stocks s WHERE s.location_id = ?5 AND s.lot_id = ?6`,
-          ).bind(documentId, alloc.quantity, input.actorId, now, input.toLocationId, alloc.lotId),
+            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+             SELECT ?1, s.id, 'TRANSFER_IN', ?2, 0, ?2, ?3, ?4, ?5
+               FROM stocks s WHERE s.location_id = ?6 AND s.lot_id = ?7`,
+          ).bind(documentId, alloc.quantity, input.actorId, input.storeId, now, input.toLocationId, alloc.lotId),
         );
       }
     }
@@ -817,7 +852,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         fromLocationId: input.fromLocationId,
         toLocationId: input.toLocationId,
         quantity: input.quantity,
-      }),
+      }, input.storeId),
     );
     statements.push(this.cleanupGuardsStmt(batchId));
     await this.runBatch(statements, expected);
@@ -850,6 +885,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         ...bodyAllocations.map((a) => a.toStockId),
       ],
       documentId,
+      storeId: input.storeId,
       at: now,
     });
     return this.envelope(201, body);
@@ -857,7 +893,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- 棚卸し
 
-  async startStocktake(input: { actorId: number }): Promise<Envelope> {
+  async startStocktake(input: { actorId: number; storeId: number }): Promise<Envelope> {
     return this.runExclusive(async () => {
       try {
         return await this.startStocktakeInternal(input);
@@ -867,35 +903,39 @@ export class InventoryCoordinator extends DurableObject<Env> {
     });
   }
 
-  private async startStocktakeInternal(input: { actorId: number }): Promise<Envelope> {
+  private async startStocktakeInternal(input: { actorId: number; storeId: number }): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
+      // 実施中+承認待ちは店舗ごとに 1 件まで (DB の部分ユニークインデックスでも担保)
       const existing = await db
-        .prepare("SELECT id FROM stocktakes WHERE status IN ('in_progress', 'pending_approval') LIMIT 1")
+        .prepare(
+          "SELECT id FROM stocktakes WHERE store_id = ?1 AND status IN ('in_progress', 'pending_approval') LIMIT 1",
+        )
+        .bind(input.storeId)
         .first<{ id: number }>();
       if (existing) throw stocktakeLocked('Another stocktake is already in progress or awaiting approval');
 
       const inserted = await db
         .prepare(
-          `INSERT INTO stocktakes (status, started_by, started_at, created_at, updated_at)
-           VALUES ('in_progress', ?1, ?2, ?2, ?2)`,
+          `INSERT INTO stocktakes (status, started_by, started_at, store_id, created_at, updated_at)
+           VALUES ('in_progress', ?1, ?2, ?3, ?2, ?2)`,
         )
-        .bind(input.actorId, now)
+        .bind(input.actorId, now, input.storeId)
         .run();
       const stocktakeId = Number(inserted.meta.last_row_id);
 
-      // 全 stocks の帳簿数をスナップショットする (Nest 版と同一)
+      // その店舗の全 stocks の帳簿数をスナップショットする (Nest 版と同一)
       const lineResult = await db
         .prepare(
           `INSERT INTO stocktake_lines (stocktake_id, stock_id, book_quantity)
-           SELECT ?1, id, quantity FROM stocks`,
+           SELECT ?1, id, quantity FROM stocks WHERE store_id = ?2`,
         )
-        .bind(stocktakeId)
+        .bind(stocktakeId, input.storeId)
         .run();
       await this.auditStmt(input.actorId, 'stocktake.start', 'stocktake', String(stocktakeId), {
         stocktakeId,
-      }).run();
+      }, input.storeId).run();
 
       const body = {
         id: stocktakeId,
@@ -904,7 +944,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         startedAt: now,
         lineCount: lineResult.meta.changes,
       };
-      this.broadcast({ type: 'stocktake.started', stocktakeId, at: now });
+      this.broadcast({ type: 'stocktake.started', stocktakeId, storeId: input.storeId, at: now });
       return this.envelope(201, body);
     } catch (e) {
       return this.errorEnvelope(e);
@@ -938,7 +978,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
    * 承認 = 調整反映 / 差し戻し = in_progress へ復帰、を決める)。
    * 未入力 (counted_quantity IS NULL) の lines は帳簿どおりとして差異に数えない。
    */
-  async finishStocktake(input: { actorId: number; stocktakeId: number }): Promise<Envelope> {
+  async finishStocktake(input: { actorId: number; stocktakeId: number; storeId: number }): Promise<Envelope> {
     return this.runExclusive(async () => {
       try {
         return await this.finishStocktakeInternal(input);
@@ -948,16 +988,16 @@ export class InventoryCoordinator extends DurableObject<Env> {
     });
   }
 
-  private async finishStocktakeInternal(input: { actorId: number; stocktakeId: number }): Promise<Envelope> {
+  private async finishStocktakeInternal(input: { actorId: number; stocktakeId: number; storeId: number }): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
       const batchId = crypto.randomUUID();
       const stocktake = await db
-        .prepare('SELECT id, status FROM stocktakes WHERE id = ?1')
+        .prepare('SELECT id, status, store_id FROM stocktakes WHERE id = ?1')
         .bind(input.stocktakeId)
-        .first<{ id: number; status: string }>();
-      if (!stocktake || stocktake.status !== 'in_progress') {
+        .first<{ id: number; status: string; store_id: number }>();
+      if (!stocktake || stocktake.store_id !== input.storeId || stocktake.status !== 'in_progress') {
         throw notFound('In-progress stocktake not found');
       }
 
@@ -987,13 +1027,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
           this.auditStmt(input.actorId, 'stocktake.finish', 'stocktake', String(input.stocktakeId), {
             stocktakeId: input.stocktakeId,
             result: 'confirmed',
-          }),
+          }, input.storeId),
         );
         statements.push(this.cleanupGuardsStmt(batchId));
         await this.runBatch(statements, expected);
 
         const body = { id: input.stocktakeId, status: 'confirmed', confirmedAt: now };
-        this.broadcast({ type: 'stocktake.finished', stocktakeId: input.stocktakeId, at: now });
+        this.broadcast({ type: 'stocktake.finished', stocktakeId: input.stocktakeId, storeId: input.storeId, at: now });
         return this.envelope(200, body);
       }
 
@@ -1019,13 +1059,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
           stocktakeId: input.stocktakeId,
           result: 'pending_approval',
           differences: diffs,
-        }),
+        }, input.storeId),
       );
       statements.push(this.cleanupGuardsStmt(batchId));
       await this.runBatch(statements, expected);
 
       const body = { id: input.stocktakeId, status: 'pending_approval', differences: diffs };
-      this.broadcast({ type: 'stocktake.pending_approval', stocktakeId: input.stocktakeId, at: now });
+      this.broadcast({ type: 'stocktake.pending_approval', stocktakeId: input.stocktakeId, storeId: input.storeId, at: now });
       return this.envelope(200, body);
     } catch (e) {
       return this.errorEnvelope(e);
@@ -1043,6 +1083,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     actorId: number;
     stocktakeId: number;
     approve: boolean;
+    storeId: number;
   }): Promise<Envelope> {
     return this.runExclusive(async () => {
       try {
@@ -1057,16 +1098,17 @@ export class InventoryCoordinator extends DurableObject<Env> {
     actorId: number;
     stocktakeId: number;
     approve: boolean;
+    storeId: number;
   }): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
       const batchId = crypto.randomUUID();
       const stocktake = await db
-        .prepare('SELECT id, status FROM stocktakes WHERE id = ?1')
+        .prepare('SELECT id, status, store_id FROM stocktakes WHERE id = ?1')
         .bind(input.stocktakeId)
-        .first<{ id: number; status: string }>();
-      if (!stocktake || stocktake.status !== 'pending_approval') {
+        .first<{ id: number; status: string; store_id: number }>();
+      if (!stocktake || stocktake.store_id !== input.storeId || stocktake.status !== 'pending_approval') {
         throw notFound('Pending-approval stocktake not found');
       }
 
@@ -1095,13 +1137,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
           this.auditStmt(input.actorId, 'stocktake.decide', 'stocktake', String(input.stocktakeId), {
             stocktakeId: input.stocktakeId,
             approve: false,
-          }),
+          }, input.storeId),
         );
         statements.push(this.cleanupGuardsStmt(batchId));
         await this.runBatch(statements, expected);
 
         const body = { id: input.stocktakeId, status: 'in_progress' };
-        this.broadcast({ type: 'stocktake.decision', stocktakeId: input.stocktakeId, approve: false, at: now });
+        this.broadcast({ type: 'stocktake.decision', stocktakeId: input.stocktakeId, approve: false, storeId: input.storeId, at: now });
         return this.envelope(200, body);
       }
 
@@ -1141,10 +1183,10 @@ export class InventoryCoordinator extends DurableObject<Env> {
         statements.push(
           db
             .prepare(
-              `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, reason, created_at)
-               VALUES (?1, ?2, 'ADJUST', ?3, ?4, ?5, ?6, 'stocktake-adjustment', ?7)`,
+              `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, reason, store_id, created_at)
+               VALUES (?1, ?2, 'ADJUST', ?3, ?4, ?5, ?6, 'stocktake-adjustment', ?7, ?8)`,
             )
-            .bind(documentId, diff.stockId, diff.difference, stock.quantity, after, input.actorId, now),
+            .bind(documentId, diff.stockId, diff.difference, stock.quantity, after, input.actorId, input.storeId, now),
         );
         adjustments.push({ ...diff, quantityAfter: after });
       }
@@ -1173,7 +1215,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
           approve: true,
           documentId,
           adjustments: adjustments.map((a) => ({ stockId: a.stockId, difference: a.difference })),
-        }),
+        }, input.storeId),
       );
       statements.push(this.cleanupGuardsStmt(batchId));
       await this.runBatch(statements, expected);
@@ -1189,9 +1231,10 @@ export class InventoryCoordinator extends DurableObject<Env> {
         type: 'stock.changed',
         stockIds: adjustments.map((a) => a.stockId),
         documentId,
+        storeId: input.storeId,
         at: now,
       });
-      this.broadcast({ type: 'stocktake.finished', stocktakeId: input.stocktakeId, at: now });
+      this.broadcast({ type: 'stocktake.finished', stocktakeId: input.stocktakeId, storeId: input.storeId, at: now });
       return this.envelope(200, body);
     } catch (e) {
       return this.errorEnvelope(e);

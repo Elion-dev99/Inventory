@@ -7,6 +7,8 @@ import permissionsSql from '../migrations/0003_permissions.sql?raw';
 import businessSql from '../migrations/0005_business_completion.sql?raw';
 import featuresSql from '../migrations/0006_feature_flags.sql?raw';
 import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import sessionsSql from '../migrations/0004_sessions.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 
 /**
  * 追加機能の結合テスト (実 D1 に 0001〜0007 を適用し、HTTP 経路を通す):
@@ -128,9 +130,11 @@ beforeAll(async () => {
     ...statementsOf(initSql),
     ...statementsOf(seedSql),
     ...statementsOf(permissionsSql),
+    ...statementsOf(sessionsSql),
     ...statementsOf(businessSql),
     ...statementsOf(featuresSql),
     ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -149,9 +153,9 @@ beforeAll(async () => {
        VALUES (1, 'WH1', '本社倉庫', ?1, ?1)`,
     ).bind(now),
     testEnv.DB.prepare(
-      `INSERT INTO user_roles (user_id, role_code, warehouse_id)
-       VALUES (1, 'SYSTEM_ADMIN', NULL), (2, 'INVENTORY_MANAGER', NULL),
-              (3, 'INVENTORY_STAFF', NULL), (4, 'VIEWER', NULL)`,
+      `INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id)
+       VALUES (1, 'SYSTEM_ADMIN', NULL, NULL), (2, 'INVENTORY_MANAGER', NULL, 1),
+              (3, 'INVENTORY_STAFF', NULL, 1), (4, 'VIEWER', NULL, 1)`,
     ),
     testEnv.DB.prepare(
       `INSERT INTO locations (id, warehouse_id, code, name, created_at, updated_at)

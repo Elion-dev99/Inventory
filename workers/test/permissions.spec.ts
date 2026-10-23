@@ -4,6 +4,11 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import initSql from '../migrations/0001_init.sql?raw';
 import seedSql from '../migrations/0002_seed_roles.sql?raw';
 import permissionsSql from '../migrations/0003_permissions.sql?raw';
+import sessionsSql from '../migrations/0004_sessions.sql?raw';
+import businessSql from '../migrations/0005_business_completion.sql?raw';
+import featuresSql from '../migrations/0006_feature_flags.sql?raw';
+import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
+import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 
 /**
  * 権限 (role_permissions) の結合テスト: 実 D1 に 0001〜0003 を適用し、
@@ -85,7 +90,14 @@ beforeAll(async () => {
     return realFetch(input, init);
   }) as typeof fetch;
 
-  for (const stmt of [...statementsOf(initSql), ...statementsOf(seedSql), ...statementsOf(permissionsSql)]) {
+  for (const stmt of [...statementsOf(initSql),
+    ...statementsOf(seedSql),
+    ...statementsOf(permissionsSql),
+    ...statementsOf(sessionsSql),
+    ...statementsOf(businessSql),
+    ...statementsOf(featuresSql),
+    ...statementsOf(purchasingSql),
+    ...statementsOf(multiStoreSql),]) {
     await testEnv.DB.prepare(stmt).run();
   }
   const now = Date.now();
@@ -96,8 +108,8 @@ beforeAll(async () => {
               (2, 'sub-viewer', 'viewer@example.com', 'Viewer', 'active', ?1, ?1)`,
     ).bind(now),
     testEnv.DB.prepare(
-      `INSERT INTO user_roles (user_id, role_code, warehouse_id)
-       VALUES (1, 'SYSTEM_ADMIN', NULL), (2, 'VIEWER', NULL)`,
+      `INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id)
+       VALUES (1, 'SYSTEM_ADMIN', NULL, NULL), (2, 'VIEWER', NULL, 1)`,
     ),
     testEnv.DB.prepare(
       `INSERT INTO warehouses (id, code, name, created_at, updated_at) VALUES (1, 'WH1', '本社倉庫', ?1, ?1)`,
@@ -134,7 +146,7 @@ describe('権限マトリクスと管理 API (D1 結合)', () => {
       roles: { code: string }[];
       matrix: Record<string, string[]>;
     };
-    expect(body.permissions).toHaveLength(11);
+    expect(body.permissions).toHaveLength(15);
     expect(body.roles.map((r) => r.code)).toContain('SYSTEM_ADMIN');
     expect(body.matrix.SYSTEM_ADMIN).toContain('admin.permissions');
     expect(body.matrix.VIEWER).toEqual(['alerts.read', 'master.read', 'stocks.read']);
