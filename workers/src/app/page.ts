@@ -22,8 +22,6 @@ export const APP_HTML = `<!doctype html>
   <span><span class="ws-dot" id="wsDot"></span> <span class="ws-label" id="wsLabel">リアルタイム未接続</span></span>
   <span class="spacer"></span>
   <span class="small" id="userLabel"></span>
-  <a class="small" id="permLink" href="/admin/permissions">権限管理</a>
-  <button class="btn secondary small" id="logoutBtn">ログアウト</button>
 </header>
 
 <div id="loadingBox" class="center-box"><p>読み込み中…</p></div>
@@ -41,8 +39,13 @@ export const APP_HTML = `<!doctype html>
 </div>
 
 <div id="appBox" style="display:none">
-  <nav class="tabs" id="tabs"></nav>
+  <div id="subbar" class="subbar" style="display:none"></div>
   <main id="view"></main>
+  <nav class="tabbar" id="tabbar"></nav>
+  <div id="sheetOverlay" class="sheet-overlay" style="display:none">
+    <div class="sheet" id="sheetBox"></div>
+    <button class="sheet-cancel" id="sheetCancel">キャンセル</button>
+  </div>
 </div>
 
 <div id="modalOverlay" class="modal-overlay" style="display:none">

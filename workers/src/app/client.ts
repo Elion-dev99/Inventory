@@ -170,7 +170,7 @@ function expiryBadge(dateStr, alertDays) {
   return '<span>' + esc(dateStr) + '</span>';
 }
 
-/* ---------------- navigation ---------------- */
+/* ---------------- navigation (iOS 風: 下部タブバー + アクションシート) ---------------- */
 var VIEWS = [
   { id: 'dashboard', label: 'ダッシュボード', visible: function () { return true; } },
   { id: 'stocks', label: '在庫一覧', visible: function () { return can('stocks.read'); } },
@@ -184,18 +184,141 @@ var VIEWS = [
   { id: 'alerts', label: 'アラート', visible: function () { return can('alerts.read'); } },
   { id: 'audit', label: '監査ログ', visible: function () { return can('admin.users'); } },
 ];
+function viewDef(id) { for (var i = 0; i < VIEWS.length; i++) { if (VIEWS[i].id === id) return VIEWS[i]; } return null; }
+function viewVisible(id) { var v = viewDef(id); return v ? v.visible() : false; }
+
+/* SF Symbols 風の線画アイコン (stroke=currentColor の inline SVG) */
+var ICON_PATHS = {
+  home: '<path d="M3.5 11.2 12 4l8.5 7.2"/><path d="M5.5 9.8V20h13V9.8"/><path d="M9.8 20v-5.5h4.4V20"/>',
+  box: '<path d="M3.5 7.8 12 3.5l8.5 4.3v8.4L12 20.5l-8.5-4.3z"/><path d="M3.5 7.8 12 12l8.5-4.2"/><path d="M12 12v8.5"/>',
+  plus: '<path d="M12 5.5v13M5.5 12h13"/>',
+  clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 2"/>',
+  grid: '<path d="M4.5 4.5h6.5v6.5H4.5zM13 4.5h6.5v6.5H13zM4.5 13h6.5v6.5H4.5zM13 13h6.5v6.5H13z"/>',
+  in: '<path d="M12 4v10.5m0 0 4.3-4.3M12 14.5 7.7 10.2"/><path d="M4.5 19.5h15"/>',
+  out: '<path d="M12 14.5V4m0 0 4.3 4.3M12 4 7.7 8.3"/><path d="M4.5 19.5h15"/>',
+  swap: '<path d="M4 8h12.5m0 0L13 4.5M16.5 8 13 11.5"/><path d="M20 16H7.5m0 0L11 12.5M7.5 16l3.5 3.5"/>',
+  list: '<path d="M9 6.2h10.5M9 12h10.5M9 17.8h10.5"/><circle cx="4.8" cy="6.2" r="1.15" fill="currentColor" stroke="none"/><circle cx="4.8" cy="12" r="1.15" fill="currentColor" stroke="none"/><circle cx="4.8" cy="17.8" r="1.15" fill="currentColor" stroke="none"/>',
+  clip: '<path d="M7 4.8h10a1 1 0 0 1 1 1V19a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5.8a1 1 0 0 1 1-1z"/><path d="m9.3 13.6 2 2 3.6-4.2"/>',
+  bell: '<path d="M6.2 16v-4.8a5.8 5.8 0 0 1 11.6 0V16l1.1 2.6a.6.6 0 0 1-.55.85H5.65a.6.6 0 0 1-.55-.85z"/><path d="M10.2 21a2 2 0 0 0 3.6 0"/>',
+  minus: '<circle cx="12" cy="12" r="8.5"/><path d="M8.5 12h7"/>',
+  doc: '<path d="M7 3.8h6.8L18.5 8.5v11a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-14.7a1 1 0 0 1 1-1z"/><path d="M13.8 3.8v4.7h4.7"/>',
+  shield: '<path d="M12 3.5 5.5 6v5.2c0 4.6 2.8 7.5 6.5 9.3 3.7-1.8 6.5-4.7 6.5-9.3V6z"/>',
+  chevL: '<path d="M14.5 5.5 8 12l6.5 6.5"/>',
+  chevR: '<path d="M9.5 5.5 16 12l-6.5 6.5"/>',
+};
+function icon(name, size) {
+  var s = size || 24;
+  return '<svg width="' + s + '" height="' + s + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ICON_PATHS[name] || '') + '</svg>';
+}
+
+/* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
+var RECORD_VIEWS = ['inbound', 'consume', 'transfer'];
+var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'audit'];
+function tabOf(view) {
+  if (view === 'dashboard') return 'dashboard';
+  if (view === 'stocks') return 'stocks';
+  if (view === 'history') return 'history';
+  if (RECORD_VIEWS.indexOf(view) >= 0) return 'record';
+  return 'more';
+}
 function buildNav() {
+  var active = tabOf(state.view);
   var h = '';
-  for (var i = 0; i < VIEWS.length; i++) {
-    var v = VIEWS[i];
-    if (!v.visible()) continue;
-    h += '<button data-view="' + v.id + '"' + (state.view === v.id ? ' class="active"' : '') + '>' + esc(v.label) + '</button>';
+  h += '<button class="tab-item' + (active === 'dashboard' ? ' active' : '') + '" data-tab="dashboard">' + icon('home', 25) + '<span>ホーム</span></button>';
+  if (can('stocks.read')) {
+    h += '<button class="tab-item' + (active === 'stocks' ? ' active' : '') + '" data-tab="stocks">' + icon('box', 25) + '<span>在庫</span></button>';
   }
-  el('tabs').innerHTML = h;
-  var btns = el('tabs').querySelectorAll('button[data-view]');
+  var anyRecord = RECORD_VIEWS.some(viewVisible) || viewVisible('negative');
+  if (anyRecord) {
+    h += '<button class="tab-plus' + (active === 'record' ? ' active' : '') + '" data-tab="record" aria-label="記録する"><span class="plus-circle">' + icon('plus', 26) + '</span><span>記録</span></button>';
+  }
+  if (can('stocks.read')) {
+    h += '<button class="tab-item' + (active === 'history' ? ' active' : '') + '" data-tab="history">' + icon('clock', 25) + '<span>履歴</span></button>';
+  }
+  h += '<button class="tab-item' + (active === 'more' ? ' active' : '') + '" data-tab="more">' + icon('grid', 25) + '<span>その他</span></button>';
+  el('tabbar').innerHTML = h;
+  var btns = el('tabbar').querySelectorAll('button[data-tab]');
   for (var j = 0; j < btns.length; j++) {
-    btns[j].onclick = function () { showView(this.getAttribute('data-view')); };
+    btns[j].onclick = function () {
+      var t = this.getAttribute('data-tab');
+      if (t === 'record') openSheet();
+      else showView(t === 'more' ? 'more' : t);
+    };
   }
+  updateSubbar();
+}
+function updateSubbar() {
+  var bar = el('subbar');
+  if (!bar) return;
+  var v = state.view;
+  var parent = null;
+  var parentLabel = '';
+  if (RECORD_VIEWS.indexOf(v) >= 0) { parent = 'dashboard'; parentLabel = 'ホーム'; }
+  else if (MORE_VIEWS.indexOf(v) >= 0) { parent = 'more'; parentLabel = 'その他'; }
+  if (!parent) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  bar.innerHTML = '<button class="back-btn">' + icon('chevL', 20) + esc(parentLabel) + '</button>';
+  bar.querySelector('.back-btn').onclick = function () { showView(parent); };
+}
+/* ---- 記録アクションシート ---- */
+var SHEET_ITEMS = [
+  { view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する' },
+  { view: 'consume', icon: 'out', color: '#ff9500', label: '消費する' },
+  { view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する' },
+  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫 (申請・承認)' },
+];
+function openSheet() {
+  var h = '<div class="sheet-title">記録する</div>';
+  for (var i = 0; i < SHEET_ITEMS.length; i++) {
+    var it = SHEET_ITEMS[i];
+    if (!viewVisible(it.view)) continue;
+    h += '<button class="sheet-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 18) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+  }
+  el('sheetBox').innerHTML = h;
+  el('sheetOverlay').style.display = '';
+  var rows = el('sheetBox').querySelectorAll('button[data-view]');
+  for (var j = 0; j < rows.length; j++) {
+    rows[j].onclick = function () { closeSheet(); showView(this.getAttribute('data-view')); };
+  }
+}
+function closeSheet() { el('sheetOverlay').style.display = 'none'; }
+/* ---- その他 (iOS 設定風グループリスト) ---- */
+var MORE_ITEMS = [
+  { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理' },
+  { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し' },
+  { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート' },
+  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫' },
+  { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ' },
+];
+function loadMore() {
+  var h = '<h2>その他</h2>';
+  h += '<div class="group">';
+  for (var i = 0; i < MORE_ITEMS.length; i++) {
+    var it = MORE_ITEMS[i];
+    if (!viewVisible(it.view)) continue;
+    h += '<button class="group-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 17) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+  }
+  if (can('admin.permissions') || can('admin.users')) {
+    h += '<a class="group-row" href="/admin/permissions"><span class="row-icon" style="background:#30b0c7">' + icon('shield', 17) + '</span><span class="row-label">権限管理</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
+  }
+  h += '</div>';
+  h += '<h3>アカウント</h3><div class="group">';
+  if (state.me) {
+    h += '<div class="group-row static"><span class="row-label">' + esc(state.me.email) + (state.me.displayName ? ' (' + esc(state.me.displayName) + ')' : '') + '</span></div>';
+  }
+  h += '<button class="group-row danger" id="moreLogout"><span class="row-label">ログアウト</span></button>';
+  h += '</div>';
+  el('view').innerHTML = h;
+  var rows = el('view').querySelectorAll('button[data-view]');
+  for (var j = 0; j < rows.length; j++) {
+    rows[j].onclick = function () { showView(this.getAttribute('data-view')); };
+  }
+  var lo = el('moreLogout');
+  if (lo) lo.onclick = doLogout;
+}
+function doLogout() {
+  api('/api/v1/auth/logout', { method: 'POST' }).then(function () { location.href = '/'; })
+    .catch(function () { location.href = '/'; });
 }
 function showView(id) {
   state.view = id;
@@ -212,9 +335,11 @@ function showView(id) {
     stocktakes: loadStocktakes,
     alerts: loadAlerts,
     audit: loadAudit,
+    more: loadMore,
   };
   var fn = loaders[id];
   if (fn) fn();
+  window.scrollTo(0, 0);
 }
 function refreshCurrent() { showView(state.view); }
 function scheduleRefresh() {
@@ -251,10 +376,10 @@ function loadDashboard() {
       var counts = { EXPIRED: 0, EXPIRING: 0, LOW_STOCK: 0, NEGATIVE_STOCK: 0 };
       for (var a = 0; a < alerts.length; a++) { if (counts[alerts[a].type] !== undefined) counts[alerts[a].type]++; }
       h += '<div class="card"><div class="num">' + alerts.length + '</div><div class="lbl">アラート総数</div></div>';
-      h += '<div class="card"><div class="num">' + counts.EXPIRED + '</div><div class="lbl">期限切れ</div></div>';
+      h += '<div class="card"><div class="num' + (counts.EXPIRED > 0 ? ' qty-neg' : '') + '">' + counts.EXPIRED + '</div><div class="lbl">期限切れ</div></div>';
       h += '<div class="card"><div class="num">' + counts.EXPIRING + '</div><div class="lbl">期限接近</div></div>';
       h += '<div class="card"><div class="num">' + counts.LOW_STOCK + '</div><div class="lbl">在庫不足</div></div>';
-      h += '<div class="card"><div class="num">' + counts.NEGATIVE_STOCK + '</div><div class="lbl">マイナス在庫</div></div>';
+      h += '<div class="card"><div class="num' + (counts.NEGATIVE_STOCK > 0 ? ' qty-neg' : '') + '">' + counts.NEGATIVE_STOCK + '</div><div class="lbl">マイナス在庫</div></div>';
     }
     if (stocks) {
       var total = 0;
@@ -263,6 +388,17 @@ function loadDashboard() {
       h += '<div class="card"><div class="num">' + total + '</div><div class="lbl">総数量 (表示分)</div></div>';
     }
     h += '</div>';
+    var qa = [];
+    if (can('movements.inbound')) qa.push({ view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する' });
+    if (can('movements.consume')) qa.push({ view: 'consume', icon: 'out', color: '#ff9500', label: '消費する' });
+    if (can('movements.transfer')) qa.push({ view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する' });
+    if (qa.length > 0) {
+      h += '<div class="quick-grid">';
+      for (var q = 0; q < qa.length; q++) {
+        h += '<button class="quick-btn" data-view="' + qa[q].view + '"><span class="row-icon" style="background:' + qa[q].color + '">' + icon(qa[q].icon, 20) + '</span>' + esc(qa[q].label) + '</button>';
+      }
+      h += '</div>';
+    }
     if (alerts) {
       var exp = alerts.filter(function (x) { return x.type === 'EXPIRED' || x.type === 'EXPIRING'; });
       exp.sort(function (x, y) { return String(x.expiryDate) < String(y.expiryDate) ? -1 : 1; });
@@ -281,6 +417,10 @@ function loadDashboard() {
     el('view').innerHTML = h;
     var b = el('dashToAlerts');
     if (b) b.onclick = function () { showView('alerts'); };
+    var qbs = el('view').querySelectorAll('.quick-btn[data-view]');
+    for (var qi = 0; qi < qbs.length; qi++) {
+      qbs[qi].onclick = function () { showView(this.getAttribute('data-view')); };
+    }
   }).catch(function (e) {
     el('view').innerHTML = '<h2>ダッシュボード</h2>' + msgHtml('error', errMsg(e));
   });
@@ -1152,10 +1292,8 @@ function connectWs() {
 
 /* ---------------- boot ---------------- */
 function boot() {
-  el('logoutBtn').onclick = function () {
-    api('/api/v1/auth/logout', { method: 'POST' }).then(function () { location.href = '/'; })
-      .catch(function () { location.href = '/'; });
-  };
+  el('sheetOverlay').addEventListener('click', function (e) { if (e.target === this) closeSheet(); });
+  el('sheetCancel').onclick = closeSheet;
   api('/api/v1/me').then(function (me) {
     state.me = me;
     (me.permissions || []).forEach(function (p) { state.perms[p] = true; });
@@ -1166,8 +1304,6 @@ function boot() {
     }
     el('appBox').style.display = '';
     el('userLabel').textContent = me.email + (me.displayName ? ' (' + me.displayName + ')' : '');
-    var permLink = el('permLink');
-    if (permLink && !can('admin.permissions') && !can('admin.users')) permLink.style.display = 'none';
     buildNav();
     showView('dashboard');
     connectWs();
