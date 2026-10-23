@@ -210,6 +210,7 @@ td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
 </style></head>
 <body>
 <header class="app-header">
+  <img class="app-icon" src="/icons/icon-192.png" alt="">
   <h1>権限管理</h1>
   <span class="spacer"></span>
   <span id="who" class="ws-label"></span>
@@ -218,7 +219,7 @@ td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
 <main>
 <p id="status" style="color: var(--ok);"></p>
 <p id="error" style="color: var(--danger); white-space: pre-wrap;"></p>
-<div id="loginGuide" style="display:none; background:#fff; border:1px solid var(--line); border-radius:8px; padding:1rem;">
+<div id="loginGuide" class="section-box" style="display:none;">
   <p>ログインが必要です（セッションの有効期限は8時間です）。</p>
   <p><a class="btn" href="/auth/login">Google でログインする</a></p>
 </div>

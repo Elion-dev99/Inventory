@@ -7,7 +7,7 @@ import { ICON_192, ICON_512, ICON_APPLE } from './pwa-icons';
 
 export const PWA_HEAD = `
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#1a56db">
+<meta name="theme-color" content="#f5f5f7">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -24,8 +24,8 @@ export const MANIFEST = {
   start_url: '/app',
   scope: '/',
   display: 'standalone',
-  background_color: '#ffffff',
-  theme_color: '#1a56db',
+  background_color: '#f5f5f7',
+  theme_color: '#f5f5f7',
   icons: [
     { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
     { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' },

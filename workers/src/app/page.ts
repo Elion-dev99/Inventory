@@ -17,6 +17,7 @@ export const APP_HTML = `<!doctype html>
 </head>
 <body>
 <header class="app-header">
+  <img class="app-icon" src="/icons/icon-192.png" alt="">
   <h1>在庫管理システム</h1>
   <span><span class="ws-dot" id="wsDot"></span> <span class="ws-label" id="wsLabel">リアルタイム未接続</span></span>
   <span class="spacer"></span>
@@ -28,6 +29,7 @@ export const APP_HTML = `<!doctype html>
 <div id="loadingBox" class="center-box"><p>読み込み中…</p></div>
 
 <div id="loginBox" class="center-box" style="display:none">
+  <img class="app-icon-lg" src="/icons/icon-512.png" alt="">
   <h2>ログインが必要です</h2>
   <p class="muted">在庫管理システムを利用するには Google アカウントでログインしてください。</p>
   <p><a class="btn" href="/auth/login">Google でログイン</a></p>
