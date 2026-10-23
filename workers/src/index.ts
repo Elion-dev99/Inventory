@@ -88,7 +88,7 @@ app.get('/login', (c) => {
 <body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
 <h1>在庫管理システム ログイン</h1>
 <div id="gbtn"></div>
-<p><a id="fallback" href="#" style="display:inline-block; padding: 0.5rem 1rem; border: 1px solid #888; border-radius: 6px; text-decoration: none;">Google でログイン (ボタンが出ない場合はこちら)</a></p>
+<p><a id="fallback" href="/auth/login" style="display:inline-block; padding: 0.5rem 1rem; border: 1px solid #888; border-radius: 6px; text-decoration: none;">Google でログイン (ボタンが出ない場合はこちら)</a></p>
 <p id="who"></p>
 <button id="apitest" style="display:none; padding: 0.5rem 1rem;">API をテストする (在庫一覧)</button>
 <button id="logout" style="display:none; padding: 0.5rem 1rem;">ログアウト</button>
@@ -106,20 +106,6 @@ function refresh() {
     try { const d = decodeJwt(t); document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub); } catch (e) {}
   } else { document.getElementById('who').textContent = ''; }
 }
-document.getElementById('fallback').onclick = function () {
-  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
-  sessionStorage.setItem('oauthNonce', nonce);
-  const params = new URLSearchParams({
-    client_id: '${clientId}',
-    redirect_uri: location.origin + '/auth/callback',
-    response_type: 'id_token',
-    scope: 'openid email profile',
-    nonce: nonce,
-    prompt: 'select_account',
-  });
-  location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
-  return false;
-};
 window.onload = function () {
   let tries = 0;
   const timer = setInterval(function () {
@@ -158,6 +144,29 @@ document.getElementById('logout').onclick = function () {
 </html>`);
 });
 
+// ログイン開始 (サーバー側リダイレクト)。GIS のボタンが動かない環境でも
+// 通常のリンク遷移だけで Google ログインへ進める。nonce は Cookie で保持する。
+app.get('/auth/login', (c) => {
+  const clientId = c.env.OIDC_CLIENT_ID ?? '';
+  if (!clientId) return c.text('OIDC is not configured', 503);
+  const nonce = crypto.randomUUID();
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: new URL('/auth/callback', c.req.url).toString(),
+    response_type: 'id_token',
+    scope: 'openid email profile',
+    nonce,
+    prompt: 'select_account',
+  });
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
+      'Set-Cookie': `oauth_nonce=${nonce}; Path=/; Max-Age=600; SameSite=Lax`,
+    },
+  });
+});
+
 // OAuth リダイレクト受け口。id_token はフラグメント (#id_token=...) で届くため
 // このページの JS が取り出して sessionStorage に保存し、/login へ戻す。
 app.get('/auth/callback', (c) =>
@@ -178,7 +187,8 @@ app.get('/auth/callback', (c) =>
   try {
     const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
     const payload = JSON.parse(decodeURIComponent(escape(atob(p))));
-    const expected = sessionStorage.getItem('oauthNonce');
+    const cookieNonce = (document.cookie.match(/(?:^|; )oauth_nonce=([^;]*)/) || [])[1] || '';
+    const expected = sessionStorage.getItem('oauthNonce') || cookieNonce;
     if (expected && payload.nonce !== expected) { msg.textContent = 'nonce が一致しません。もう一度ログインしてください。'; return; }
   } catch (e) { msg.textContent = 'トークンの形式が不正です。'; return; }
   sessionStorage.setItem('idToken', token);
