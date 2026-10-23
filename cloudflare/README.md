@@ -13,6 +13,31 @@
 コンテナイメージをビルドするため）が必要です。以降のコマンドで `cloudflare/` と書いた場合は
 本ディレクトリ、`ルート` と書いた場合はリポジトリルート（`inventory-system/`）を指します。
 
+## 最小コストで試す場合
+
+Cloudflare Containers は Workers Free では使えないため、Cloudflare 上で試す場合の
+最低額は **Workers Paid の $5/月** です。すでに Paid 加入済みのアカウントでは、
+追加の固定費なしで始められます。
+
+- PostgreSQL は Neon の Free プランを使う
+- Redis は Upstash の Free プランを使う（250 MB / 月 500K コマンド / 10 GB 帯域）
+- デプロイには本番用ではなく、同ディレクトリの `wrangler.trial.jsonc` を使う
+
+  ```bash
+  cd cloudflare
+  npx wrangler deploy --config wrangler.trial.jsonc
+  ```
+
+`trial` 設定は `basic`（1/4 vCPU / 1 GiB / 4 GB）× 1 台に制限しています。
+Workers Paid のコンテナ包含量（メモリ 25 GiB-hours/月、ディスク 200 GB-hours/月）なら、
+メモリ換算で約 25 時間、ディスク換算で約 50 時間の起動分に相当します。
+短時間の疎通確認であれば、コンテナ従量分を追加せずに試せる可能性があります。
+使い終わったらダッシュボードから Worker を削除するか、無アクセスのままスリープさせてください。
+
+完全な $0 で見た目だけ先に確認したい場合は、アプリを手元の PC の Docker Compose で起動し、
+Cloudflare Tunnel で一時公開する方法もあります。ただし、その構成ではアプリの実行場所は
+Cloudflare ではなく手元の PC になるため、Containers の検証にはなりません。
+
 ---
 
 ## 手順 1: Cloudflare — Workers Paid に加入する

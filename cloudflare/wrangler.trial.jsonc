@@ -1,0 +1,41 @@
+{
+  // 在庫管理システム — Cloudflare Containers 無料/最小コスト検証用設定
+  // 本番用 wrangler.jsonc と同じ Worker 名を使うため、Secret は共通。
+  // デプロイ方法: npx wrangler deploy --config wrangler.trial.jsonc
+  // 注意: Containers 自体は Workers Paid が必須。ここでの「最小コスト」は
+  // $5/月の Paid を前提に、コンテナ従量分を Paid の包含量へ収めやすくする設定。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inventory-system",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-24",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "containers": [
+    {
+      "class_name": "InventoryContainer",
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      // 検証用途では basic (1/4 vCPU / 1 GiB / 4 GB) に抑える。
+      // Paid 包含量の目安: メモリ 25 GiB-hours は basic で約25時間分、
+      // ディスク 200 GB-hours は basic で約50時間分に相当する。
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "INVENTORY_CONTAINER",
+        "class_name": "InventoryContainer"
+      }
+    ]
+  },
+  "exports": {
+    "InventoryContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
