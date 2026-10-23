@@ -45,7 +45,7 @@ interface AssignmentRow {
 }
 
 /** クレームから users を同期し、ロール割当を解決する (Nest 版 UsersService 相当) */
-async function syncUserAndAssignments(
+export async function syncUserAndAssignments(
   db: D1Database,
   claims: { sub: string; email: string; displayName: string },
 ): Promise<AuthUser> {
@@ -87,6 +87,34 @@ async function syncUserAndAssignments(
   };
 }
 
+/** ID トークン / アクセストークンを JWKS で検証してペイロードを返す */
+export async function verifyToken(env: Env, token: string): Promise<JWTPayload> {
+  const issuer = env.OIDC_ISSUER_URL ?? '';
+  if (!issuer) {
+    throw new ApiError(401, 'OIDC_NOT_CONFIGURED', 'OIDC is not configured (OIDC_ISSUER_URL)');
+  }
+  const jwksUrl =
+    env.OIDC_JWKS_URL ?? `${issuer.replace(/\/$/, '')}/.well-known/jwks.json`;
+  const audience = env.OIDC_AUDIENCE ?? 'inventory-system';
+  try {
+    const verified = await jwtVerify(token, getJwks(jwksUrl), { issuer, audience });
+    return verified.payload;
+  } catch {
+    throw unauthorized('Invalid access token');
+  }
+}
+
+/** 検証済みペイロードから users を同期し、ロール割当を解決する */
+export async function syncUserFromPayload(env: Env, payload: JWTPayload): Promise<AuthUser> {
+  if (!payload.sub) throw unauthorized('Invalid access token (no sub)');
+  const email =
+    typeof payload.email === 'string' && payload.email.length > 0
+      ? payload.email
+      : `${payload.sub}@no-email`;
+  const displayName = typeof payload.name === 'string' ? payload.name : '';
+  return syncUserAndAssignments(env.DB, { sub: payload.sub, email, displayName });
+}
+
 export async function authenticate(request: Request, env: Env): Promise<AuthUser> {
   const issuer = env.OIDC_ISSUER_URL ?? '';
   if (!issuer) {
@@ -102,25 +130,8 @@ export async function authenticate(request: Request, env: Env): Promise<AuthUser
     : queryToken ?? undefined;
   if (!token) throw unauthorized('Bearer token is required');
 
-  const jwksUrl =
-    env.OIDC_JWKS_URL ?? `${issuer.replace(/\/$/, '')}/.well-known/jwks.json`;
-  const audience = env.OIDC_AUDIENCE ?? 'inventory-system';
-
-  let payload: JWTPayload;
-  try {
-    const verified = await jwtVerify(token, getJwks(jwksUrl), { issuer, audience });
-    payload = verified.payload;
-  } catch {
-    throw unauthorized('Invalid access token');
-  }
-  if (!payload.sub) throw unauthorized('Invalid access token (no sub)');
-
-  const email =
-    typeof payload.email === 'string' && payload.email.length > 0
-      ? payload.email
-      : `${payload.sub}@no-email`;
-  const displayName = typeof payload.name === 'string' ? payload.name : '';
-  return syncUserAndAssignments(env.DB, { sub: payload.sub, email, displayName });
+  const payload = await verifyToken(env, token);
+  return syncUserFromPayload(env, payload);
 }
 
 /** ロール割当が 1 件も無いユーザーは業務 API を使えない */

@@ -7,7 +7,13 @@ import {
   type Envelope,
   type InboundInput,
 } from './coordinator';
-import { authenticate, assertHasAssignments, type AuthUser } from './lib/auth';
+import {
+  authenticate,
+  assertHasAssignments,
+  syncUserFromPayload,
+  verifyToken,
+  type AuthUser,
+} from './lib/auth';
 import {
   canAccessWarehouse,
   canPerform,
@@ -154,8 +160,8 @@ document.getElementById('logout').onclick = function () {
 </html>`);
 });
 
-// ログイン開始 (サーバー側リダイレクト)。GIS のボタンが動かない環境でも
-// 通常のリンク遷移だけで Google ログインへ進める。nonce は Cookie で保持する。
+// ログイン開始 (サーバー側リダイレクト、認可コードフロー)。
+// ブラウザ側の JS に依存せず、通常のリンク遷移だけで進める。nonce/state は Cookie で保持する。
 app.get('/auth/login', (c) => {
   const clientId = c.env.OIDC_CLIENT_ID ?? '';
   if (!clientId) return c.text('OIDC is not configured', 503);
@@ -163,9 +169,10 @@ app.get('/auth/login', (c) => {
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: new URL('/auth/callback', c.req.url).toString(),
-    response_type: 'id_token',
+    response_type: 'code',
     scope: 'openid email profile',
     nonce,
+    state: nonce,
     prompt: 'select_account',
   });
   return new Response(null, {
@@ -177,38 +184,81 @@ app.get('/auth/login', (c) => {
   });
 });
 
-// OAuth リダイレクト受け口。id_token はフラグメント (#id_token=...) で届くため
-// このページの JS が取り出して sessionStorage に保存し、/login へ戻す。
-app.get('/auth/callback', (c) =>
-  c.html(`<!doctype html>
+// OAuth リダイレクト受け口 (サーバー側で完結)。
+// 認可コードを Google と交換して ID トークンを得て、検証し、users を同期して
+// 結果をそのまま表示する。画面側のボタン操作は不要。
+app.get('/auth/callback', async (c) => {
+  const page = (title: string, body: string, status: 200 | 400 | 500 = 200) =>
+    c.html(
+      `<!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ログイン処理中 | 在庫管理システム</title></head>
+<title>${title} | 在庫管理システム</title></head>
 <body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
-<p id="msg">ログイン処理中です…</p>
-<script>
-(function () {
-  const params = new URLSearchParams(location.hash.slice(1));
-  const token = params.get('id_token');
-  const err = params.get('error');
-  const msg = document.getElementById('msg');
-  if (err) { msg.textContent = 'ログインに失敗しました: ' + err; return; }
-  if (!token) { msg.textContent = 'トークンが返されませんでした。'; return; }
-  try {
-    const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    const payload = JSON.parse(decodeURIComponent(escape(atob(p))));
-    const cookieNonce = (document.cookie.match(/(?:^|; )oauth_nonce=([^;]*)/) || [])[1] || '';
-    const expected = sessionStorage.getItem('oauthNonce') || cookieNonce;
-    if (expected && payload.nonce !== expected) { msg.textContent = 'nonce が一致しません。もう一度ログインしてください。'; return; }
-  } catch (e) { msg.textContent = 'トークンの形式が不正です。'; return; }
-  localStorage.setItem('idToken', token);
-  sessionStorage.setItem('idToken', token);
-  location.replace('/login');
-})();
-</script>
+<h1>${title}</h1>
+${body}
+<p><a href="/login">ログイン画面へ</a></p>
 </body>
-</html>`),
-);
+</html>`,
+      status,
+    );
+
+  const url = new URL(c.req.url);
+  const code = url.searchParams.get('code');
+  const oauthError = url.searchParams.get('error');
+  if (oauthError) return page('ログインに失敗しました', `<p>Google からエラーが返されました: ${oauthError}</p>`, 400);
+  if (!code) return page('ログインに失敗しました', '<p>認可コードが返されませんでした。</p>', 400);
+
+  const clientId = c.env.OIDC_CLIENT_ID ?? '';
+  const clientSecret = c.env.GOOGLE_CLIENT_SECRET ?? '';
+  if (!clientId || !clientSecret) {
+    return page('サーバー設定が不足しています', '<p>GOOGLE_CLIENT_SECRET が未設定です。</p>', 500);
+  }
+
+  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: new URL('/auth/callback', c.req.url).toString(),
+      grant_type: 'authorization_code',
+    }),
+  });
+  if (!tokenRes.ok) {
+    return page('ログインに失敗しました', `<p>トークン交換に失敗しました (HTTP ${tokenRes.status})。</p>`, 400);
+  }
+  const tokenJson = (await tokenRes.json()) as { id_token?: string };
+  if (!tokenJson.id_token) {
+    return page('ログインに失敗しました', '<p>ID トークンが返されませんでした。</p>', 400);
+  }
+
+  let authUser: AuthUser;
+  try {
+    const payload = await verifyToken(c.env, tokenJson.id_token);
+    const cookieNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_nonce=([^;]*)/)?.[1] ?? '';
+    if (cookieNonce && payload.nonce !== cookieNonce) {
+      return page('ログインに失敗しました', '<p>nonce が一致しません。もう一度ログインしてください。</p>', 400);
+    }
+    authUser = await syncUserFromPayload(c.env, payload);
+  } catch {
+    return page('ログインに失敗しました', '<p>ID トークンの検証に失敗しました。</p>', 400);
+  }
+
+  const roles =
+    authUser.assignments.length > 0
+      ? authUser.assignments.map((a) => a.roleCode).join(', ')
+      : '未付与';
+  const note =
+    authUser.assignments.length > 0
+      ? '<p>このまま業務 API を利用できます。</p>'
+      : '<p>アカウントは作成されましたが、権限はまだ付いていません。この画面が出たことをチャットで教えてください。管理者ロールを付与します。</p>';
+  return page(
+    'ログインしました',
+    `<p>メールアドレス: ${authUser.email}</p><p>ユーザー ID: ${authUser.userId}</p><p>現在のロール: ${roles}</p>${note}`,
+  );
+});
 
 // ---------------------------------------------------------------- 認証
 app.use('/api/v1/*', async (c, next) => {

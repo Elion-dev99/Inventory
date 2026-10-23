@@ -9,4 +9,6 @@ export interface Env {
   /** 省略時は {OIDC_ISSUER_URL}/.well-known/jwks.json */
   OIDC_JWKS_URL?: string;
   OIDC_CLIENT_ID?: string;
+  /** Google OAuth のクライアントシークレット (Secret)。認可コード交換でのみ使用 */
+  GOOGLE_CLIENT_SECRET?: string;
 }
