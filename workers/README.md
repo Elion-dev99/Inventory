@@ -58,9 +58,11 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
   ある場合のみ、承認数量の範囲で Coordinator の専用パスが許可します。
   使用した承認は同一 batch で使用済み（movement_id 記録）になります。
   結果としてマイナスになった在庫は `GET /api/v1/alerts` の `NEGATIVE_STOCK` に出ます。
-- 棚卸し: `stocktakes` が実施中（in_progress）の間は、入庫・消費を 423 で拒否します
-  （Coordinator 内でもチェック）。Prisma スキーマの stocktakes に倉庫の概念が無いため、
-  NestJS 版と同じく**全体ロック**です。同時実施中は 1 件のみ（部分ユニークインデックス）。
+- 棚卸し: `stocktakes` が実施中（in_progress）または差異承認待ち（pending_approval）の
+  間は、入庫・消費・移動を 423 で拒否します（Coordinator 内でもチェック）。
+  例外は棚卸し自身の承認による差異調整だけです。Prisma スキーマの stocktakes に倉庫の
+  概念が無いため、NestJS 版と同じく**全体ロック**です。同時実施中・承認待ちは 1 件のみ
+  （部分ユニークインデックス）。
 - リアルタイム: `GET /api/v1/realtime` が WebSocket を Coordinator へつなぎます。
   在庫変更の確定後に `{ "type": "stock.changed", "stockIds": [...], "documentId": "..." }`
   をブロードキャストします。**再送保証はありません**: 切断中に起きた変更は届かないため、
@@ -101,24 +103,77 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 |---|---|---|
 | GET | `/api/v1/health` | 認証不要 |
 | GET/POST | `/api/v1/master/products`、`/api/v1/products` | 参照は `master.read`、作成は `master.write` (下記「権限」参照) |
+| PUT/DELETE | `/api/v1/master/products/:id`、`/api/v1/products/:id` | 編集・論理削除 (`master.write`)。SKU は変更不可 |
+| POST | `/api/v1/master/products/import`、`/api/v1/products/import` | 商品 CSV 一括登録 (`master.write`、下記「CSV」参照) |
 | GET/POST | `/api/v1/master/warehouses`、`/api/v1/warehouses` | 同上 |
+| PUT/DELETE | `/api/v1/master/warehouses/:id`、`/api/v1/warehouses/:id` | 編集・論理削除 (`master.write`) |
 | GET/POST | `/api/v1/master/locations`、`/api/v1/locations` | 同上（倉庫スコープ検証あり） |
+| PUT/DELETE | `/api/v1/master/locations/:id`、`/api/v1/locations/:id` | 編集・論理削除 (`master.write`、スコープ検証あり) |
 | GET/POST | `/api/v1/master/lots`、`/api/v1/lots` | 同上 |
+| PUT/DELETE | `/api/v1/master/lots/:id`、`/api/v1/lots/:id` | 編集は `lotCode` / `expiryDate` のみ・論理削除 (`master.write`) |
 | GET | `/api/v1/stocks` (`locationId` / `productId` / `skip` / `take`) | 倉庫スコープで絞り込み |
 | GET | `/api/v1/stocks/:id` | スコープ外は 404 |
+| GET | `/api/v1/stocks.csv` | 在庫一覧の CSV ダウンロード (`stocks.read`、スコープ適用) |
 | POST | `/api/v1/movements/inbound` | `Idempotency-Key` 必須。Coordinator 経由 |
 | POST | `/api/v1/movements/consumption` | FEFO。`department` / `purpose` 必須。`negativeApprovalId` 任意 |
+| POST | `/api/v1/movements/transfer` | 保管場所間の移動 (`movements.transfer`)。FEFO または `lotId` 指定。Coordinator 経由 |
 | POST | `/api/v1/negative-approvals` | 申請（理由必須） |
 | GET | `/api/v1/negative-approvals` | 一覧（スコープ内） |
 | POST | `/api/v1/negative-approvals/:id/decide` | 承認/却下 (`negative.decide`)。自己承認は 422 |
 | POST | `/api/v1/stocktakes` | 開始（全 stocks の帳簿数スナップショット） |
 | GET | `/api/v1/stocktakes` | 一覧 |
-| POST | `/api/v1/stocktakes/:id/finish` | 終了（confirmed） |
+| GET | `/api/v1/stocktakes/:id` | 詳細（lines: 帳簿数・実数・差異） |
+| PUT | `/api/v1/stocktakes/:id/lines/:lineId` | 実数 (`countedQuantity`) の入力。実施中のみ (`stocktakes.manage`) |
+| POST | `/api/v1/stocktakes/:id/finish` | 終了。差異が無ければ confirmed、あれば `pending_approval` で停止 |
+| POST | `/api/v1/stocktakes/:id/decide` | 差異の承認/差し戻し (`stocktakes.manage`、下記「棚卸しの差異承認」参照) |
 | GET | `/api/v1/alerts` | `LOW_STOCK` / `EXPIRING` / `EXPIRED` / `NEGATIVE_STOCK` |
 | GET | `/api/v1/movements` (`productId` / `type` / `skip` / `take`) | 入出庫履歴 (`stocks.read`、倉庫スコープで絞り込み) |
 | GET | `/api/v1/me` | 自分の id / email / 割当 / 実効権限キー一覧 |
 | POST | `/api/v1/auth/logout` | Cookie セッションを破棄 |
 | GET | `/api/v1/realtime` | WebSocket アップグレード |
+
+### 在庫移動 (transfer)
+
+`POST /api/v1/movements/transfer` は保管場所間で在庫を移します
+(`{ fromLocationId, toLocationId, productId, quantity, lotId? }`)。
+`lotId` 未指定なら消費と同じ FEFO 順（期限切れは除外）に引き、`lotId` 指定時は
+そのロットのみから引きます。移動先に同一 product × lot の stocks 行があれば
+加算、無ければ新規作成します。台帳には `TRANSFER_OUT`（移動元）と
+`TRANSFER_IN`（移動先）を同一 `document_id` で記録します
+（既存の CHECK 制約の値域をそのまま使用）。
+権限は `movements.transfer` に加え、移動元・移動先の両方の倉庫に到達可能で
+あること（倉庫スコープ）を Worker 側で判定します。その他の作法（冪等キー
+必須、条件付き UPDATE + ガード、batch 原子化、棚卸し中 423）は入庫・消費と
+同一で、処理はすべて Coordinator に集約されます。
+
+### 棚卸しの差異承認
+
+1. `POST /stocktakes` で開始し、`PUT /stocktakes/:id/lines/:lineId` で各行の
+   実数 (`counted_quantity`) を入力します。実数未入力の行は「差異なし」として
+   扱われます。
+2. `POST /stocktakes/:id/finish` は、差異が無い行だけなら従来どおり即
+   `confirmed`。差異がある場合は status を `pending_approval` にして止めます
+   （この間も全面停止 = 423 は継続）。
+3. `POST /stocktakes/:id/decide { approve }`:
+   - `approve: true` — Coordinator が差異を調整伝票として在庫へ反映します
+     （`stock_movements` type `ADJUST`、`quantity_change` = 差分、理由
+     `stocktake-adjustment`）。反映は棚卸しロックの対象外（調整専用パス）ですが、
+     条件付き UPDATE + ガードの作法は守ります。反映後に `confirmed` になります。
+   - `approve: false` — `in_progress` に戻ります（実数は保持）。
+   承認は棚卸し開始者本人でも可です（マイナス在庫の自己承認禁止とは別の話）。
+
+### マスタの編集・削除と CSV
+
+- マスタの PUT/DELETE は `master.write` が必要です。削除はすべて論理削除
+  (`deleted_at`) で、一覧からは消えますが、参照している在庫・履歴
+  (`stock_movements`) には影響しません。商品の SKU は編集できません。
+- `GET /api/v1/stocks.csv`: 在庫一覧を CSV (UTF-8 BOM 付き) で返します。
+  列は商品コード・商品名・倉庫・保管場所・ロット・期限・数量です。
+- `POST /api/v1/master/products/import`: 商品 CSV を一括登録します
+  (`multipart/form-data` の `file` フィールド、またはテキストボディ)。
+  ヘッダは `sku,name,unit,requires_expiry`（requires_expiry は省略可、`true`/`1`/`yes`
+  を真とみなします）。既存 SKU（論理削除済みを含む）はスキップし、行ごとの
+  成否を `{ total, created, skipped, failed: [{ line, sku?, reason }] }` で返します。
 
 認証: `Authorization: Bearer <OIDC アクセストークン>`。ユーザーは初回アクセス時に
 クレーム (sub / email / name) から `users` へ自動同期されますが、**ロールの割当
@@ -151,10 +206,11 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 | 在庫一覧 | キーワード検索、倉庫・保管場所フィルタ、期限切れ/接近の色分け |
 | 入庫 | 商品・ロット・場所・数量・期限を入力して登録 (`Idempotency-Key` は自動付与) |
 | 消費 | FEFO で消費し、どのロットから引かれたかを表示。マイナス在庫承認 ID の指定も可 |
-| 履歴 | 入出庫履歴 (種別・変化量・数量の前後・部署/用途) |
-| マスタ管理 | 商品・倉庫・保管場所・ロットの一覧と追加フォーム |
+| 移動 | 移動元・移動先・商品・数量 (ロット指定任意) を入力し、FEFO の内訳を表示 |
+| 履歴 | 入出庫履歴 (種別・変化量・数量の前後・部署/用途)。移動・調整は専用バッジで表示 |
+| マスタ管理 | 商品・倉庫・保管場所・ロットの一覧、追加・編集・削除フォーム、商品 CSV インポート |
 | マイナス在庫 | 例外申請フォームと承認待ち一覧 (承認/却下) |
-| 棚卸し | 開始・終了と履歴。実施中は他操作が 423 になる旨を表示 |
+| 棚卸し | 開始・実数入力・差異表示・承認/差し戻しと履歴。実施中・承認待ちは他操作が 423 になる旨を表示 |
 | アラート | 期限切れ・期限接近・在庫不足・マイナス在庫の一覧 |
 
 メニューとボタンは `/api/v1/me` の実効権限で出し分けます (サーバー側でも
@@ -177,11 +233,12 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 | `alerts.read` | アラート参照 | GET /alerts |
 | `movements.inbound` | 入庫 | POST /movements/inbound |
 | `movements.consume` | 消費 | POST /movements/consumption |
+| `movements.transfer` | 在庫移動 | POST /movements/transfer |
 | `master.read` | マスタ参照 | GET /master/* (products / warehouses / locations / lots) |
-| `master.write` | マスタ登録・編集 | POST /master/* |
+| `master.write` | マスタ登録・編集 | POST /master/*、PUT・DELETE /master/*/:id、POST /master/products/import |
 | `negative.request` | マイナス在庫申請 | POST /negative-approvals |
 | `negative.decide` | マイナス在庫承認 | POST /negative-approvals/:id/decide |
-| `stocktakes.manage` | 棚卸し管理 | POST /stocktakes、/stocktakes/:id/finish |
+| `stocktakes.manage` | 棚卸し管理 | POST /stocktakes、PUT /stocktakes/:id/lines/:lineId、/stocktakes/:id/finish、/stocktakes/:id/decide |
 | `admin.users` | ユーザー管理 | GET /admin/users、PUT /admin/users/:id/roles |
 | `admin.permissions` | 権限管理 | PUT /admin/role-permissions/:roleCode |
 
@@ -199,8 +256,8 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 | ロール | 既定の権限 |
 |---|---|
 | SYSTEM_ADMIN | 全権限 |
-| INVENTORY_MANAGER | stocks.read / alerts.read / movements.inbound / movements.consume / master.read / master.write / negative.request / negative.decide / stocktakes.manage |
-| INVENTORY_STAFF | stocks.read / alerts.read / movements.inbound / movements.consume / master.read / negative.request |
+| INVENTORY_MANAGER | stocks.read / alerts.read / movements.inbound / movements.consume / movements.transfer / master.read / master.write / negative.request / negative.decide / stocktakes.manage |
+| INVENTORY_STAFF | stocks.read / alerts.read / movements.inbound / movements.consume / movements.transfer / master.read / negative.request |
 | VIEWER | stocks.read / alerts.read / master.read |
 | AUDITOR | stocks.read / alerts.read / master.read |
 
@@ -260,6 +317,11 @@ npx wrangler d1 migrations apply inventory-system --remote
 ```
 
 `migrations/0001_init.sql`（スキーマ）と `0002_seed_roles.sql`（ロール 5 種）が適用されます。
+`0003_permissions.sql`（権限カタログと既定マトリクス）、`0004_sessions.sql`
+（ログインセッション）、`0005_business_completion.sql` も含みます。0005 の内容:
+権限 `movements.transfer` の seed（SYSTEM_ADMIN / INVENTORY_MANAGER / INVENTORY_STAFF)、
+`stocktakes` の差異承認ステータス `pending_approval` と `decided_by` / `decided_at` 列
+（テーブル再作成、既存データは引き継ぎ）、`lots.deleted_at` の追加。
 
 ### 4. OIDC の Secret を登録
 
@@ -315,9 +377,12 @@ npm test          # vitest (@cloudflare/vitest-pool-workers): 純粋ロジック
 npm run typecheck
 ```
 
-テストは 7 ファイル・42 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
+テストは 8 ファイル・56 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
 マイグレーションを適用し、Coordinator の RPC 経由で入庫→冪等リプレイ→消費→
 在庫不足 409→マイナス承認消費→棚卸し 423 を通す結合テストです。
+`test/business.spec.ts` は 0005 適用後の環境で、移動 (FEFO / lot 指定 / 409 / 403 /
+423 / 冪等)、棚卸しの実数入力→差異承認→ADJUST 反映と差し戻し、マスタ CRUD、
+CSV エクスポート / インポートを通す結合テストです。
 `test/permissions.spec.ts` はテスト用 OIDC トークンで HTTP 経路を通し、
 権限の付け外しによる可否の変化・締め出し防止・ロール付与 API を検証します。
 `test/session.spec.ts` は /auth/callback (トークン交換は fetch 差し替えで模擬) の
@@ -333,10 +398,7 @@ npm run typecheck
 
 正直な一覧です。本版の Phase 1 では以下を意図的に省いています。
 
-- マスタ CRUD の完全版（取得 1 件・更新・削除、商品バーコード検索など）
-- 倉庫間・場所間の移動 (transfer) API
-- 棚卸しの実数入力 API と差異の承認フロー（現状は開始＝スナップショット、
-  終了＝confirmed のみ。差異の ADJUST 反映は未実装。/app の棚卸し画面も開始・終了のみ）
+- マスタの取得 1 件 API と商品バーコード検索（編集・削除・CSV 入出力は実装済み）
 - フロントエンドの本格的な作り込み（/app は実務に耐える最小構成。NestJS 版には画面なし）
 - リアルタイム配信の再送保証（Outbox 相当）。切断中の変更は再接続時の REST 再同期で吸収する前提
 - IdP の amr クレーム検証（Face ID / パスキー MFA の必須化チェック）

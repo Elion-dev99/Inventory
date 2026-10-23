@@ -57,6 +57,7 @@ export const Permission = {
   ALERTS_READ: 'alerts.read',
   MOVEMENTS_INBOUND: 'movements.inbound',
   MOVEMENTS_CONSUME: 'movements.consume',
+  MOVEMENTS_TRANSFER: 'movements.transfer',
   MASTER_READ: 'master.read',
   MASTER_WRITE: 'master.write',
   NEGATIVE_REQUEST: 'negative.request',
@@ -74,12 +75,13 @@ export interface PermissionDef {
   description: string;
 }
 
-/** 権限カタログ (migrations/0003_permissions.sql の seed と一致させること) */
+/** 権限カタログ (migrations/0003_permissions.sql / 0005 の seed と一致させること) */
 export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.STOCKS_READ, label: '在庫参照', description: '在庫一覧・詳細の参照' },
   { key: Permission.ALERTS_READ, label: 'アラート参照', description: '期限・不足・マイナス在庫アラートの参照' },
   { key: Permission.MOVEMENTS_INBOUND, label: '入庫', description: '入庫の登録' },
   { key: Permission.MOVEMENTS_CONSUME, label: '消費', description: '社内消費 (FEFO 出庫) の登録' },
+  { key: Permission.MOVEMENTS_TRANSFER, label: '在庫移動', description: '保管場所間の在庫移動の登録' },
   { key: Permission.MASTER_READ, label: 'マスタ参照', description: '商品・倉庫・保管場所・ロットの一覧参照' },
   { key: Permission.MASTER_WRITE, label: 'マスタ登録・編集', description: '商品・倉庫・保管場所・ロットの登録' },
   { key: Permission.NEGATIVE_REQUEST, label: 'マイナス在庫申請', description: 'マイナス在庫の例外申請の作成' },
@@ -113,6 +115,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<RoleCode, readonly Permis
     Permission.ALERTS_READ,
     Permission.MOVEMENTS_INBOUND,
     Permission.MOVEMENTS_CONSUME,
+    Permission.MOVEMENTS_TRANSFER,
     Permission.MASTER_READ,
     Permission.MASTER_WRITE,
     Permission.NEGATIVE_REQUEST,
@@ -124,6 +127,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<RoleCode, readonly Permis
     Permission.ALERTS_READ,
     Permission.MOVEMENTS_INBOUND,
     Permission.MOVEMENTS_CONSUME,
+    Permission.MOVEMENTS_TRANSFER,
     Permission.MASTER_READ,
     Permission.NEGATIVE_REQUEST,
   ],

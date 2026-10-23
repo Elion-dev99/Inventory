@@ -111,6 +111,21 @@ function productOf(id) {
   if (m) { for (var i = 0; i < m.products.length; i++) { if (m.products[i].id === id) return m.products[i]; } }
   return null;
 }
+function warehouseOf(id) {
+  var m = state.master;
+  if (m) { for (var i = 0; i < m.warehouses.length; i++) { if (m.warehouses[i].id === id) return m.warehouses[i]; } }
+  return null;
+}
+function locationOf(id) {
+  var m = state.master;
+  if (m) { for (var i = 0; i < m.locations.length; i++) { if (m.locations[i].id === id) return m.locations[i]; } }
+  return null;
+}
+function lotOf(id) {
+  var m = state.master;
+  if (m) { for (var i = 0; i < m.lots.length; i++) { if (m.lots[i].id === id) return m.lots[i]; } }
+  return null;
+}
 function lotLabel(id) {
   var m = state.master;
   if (m) { for (var i = 0; i < m.lots.length; i++) { if (m.lots[i].id === id) return m.lots[i].lotCode; } }
@@ -161,6 +176,7 @@ var VIEWS = [
   { id: 'stocks', label: '在庫一覧', visible: function () { return can('stocks.read'); } },
   { id: 'inbound', label: '入庫', visible: function () { return can('movements.inbound'); } },
   { id: 'consume', label: '消費', visible: function () { return can('movements.consume'); } },
+  { id: 'transfer', label: '移動', visible: function () { return can('movements.transfer'); } },
   { id: 'history', label: '履歴', visible: function () { return can('stocks.read'); } },
   { id: 'master', label: 'マスタ管理', visible: function () { return can('master.read'); } },
   { id: 'negative', label: 'マイナス在庫', visible: function () { return can('negative.request') || can('negative.decide'); } },
@@ -188,6 +204,7 @@ function showView(id) {
     stocks: loadStocks,
     inbound: loadInbound,
     consume: loadConsume,
+    transfer: loadTransfer,
     history: loadHistory,
     master: loadMasterView,
     negative: loadNegative,
@@ -219,8 +236,14 @@ function loadDashboard() {
     var stocktakes = r[2] || [];
     var h = '<h2>ダッシュボード</h2>';
     var active = null;
-    for (var i = 0; i < stocktakes.length; i++) { if (stocktakes[i].status === 'in_progress') { active = stocktakes[i]; break; } }
-    if (active) h += msgHtml('warn', '棚卸し実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。入庫・消費は停止しています。');
+    for (var i = 0; i < stocktakes.length; i++) {
+      if (stocktakes[i].status === 'in_progress' || stocktakes[i].status === 'pending_approval') { active = stocktakes[i]; break; }
+    }
+    if (active && active.status === 'pending_approval') {
+      h += msgHtml('warn', '棚卸し #' + active.id + ' が差異承認待ちです。在庫更新は停止しています。');
+    } else if (active) {
+      h += msgHtml('warn', '棚卸し実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。入庫・消費・移動は停止しています。');
+    }
     h += '<div class="cards">';
     if (alerts) {
       var counts = { EXPIRED: 0, EXPIRING: 0, LOW_STOCK: 0, NEGATIVE_STOCK: 0 };
@@ -278,6 +301,7 @@ function loadStocks() {
     '<div><label>倉庫</label><select id="stWh"><option value="">すべて</option></select></div>' +
     '<div><label>保管場所</label><select id="stLoc"><option value="">すべて</option></select></div>' +
     '<div><button class="btn" id="stReload">再読み込み</button></div>' +
+    '<div><label>&nbsp;</label><a class="btn secondary" href="/api/v1/stocks.csv">CSV ダウンロード</a></div>' +
     '</div>' +
     '<div id="stMsg"></div><div id="stBody"><p class="muted">読み込み中…</p></div>';
   ensureMaster().then(function (m) {
@@ -432,7 +456,77 @@ function loadConsume() {
   });
 }
 
+/* ---------------- transfer ---------------- */
+function loadTransfer() {
+  el('view').innerHTML = '<h2>移動</h2><p class="muted">読み込み中…</p>';
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>移動</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var h = '<h2>在庫移動</h2><div id="trMsg"></div>' +
+      '<form class="grid" id="trForm">' +
+      '<div><label>商品</label><select id="trProduct" required>' +
+      optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+      '<div><label>移動元 保管場所</label><select id="trFrom" required>' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+      '<div><label>移動先 保管場所</label><select id="trTo" required>' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+      '<div><label>ロット (任意: 指定しない場合は FEFO 順)</label><select id="trLot"></select></div>' +
+      '<div><label>数量</label><input id="trQty" type="number" min="1" step="1" required value="1"></div>' +
+      '<div><label>&nbsp;</label><button class="btn" type="submit" id="trSubmit">移動を登録</button></div>' +
+      '</form><div id="trResult"></div>';
+    el('view').innerHTML = h;
+    var fillLots = function () {
+      var pid = Number(el('trProduct').value);
+      var lots = m.lots.filter(function (l) { return l.productId === pid; });
+      el('trLot').innerHTML = optionsHtml(lots, function (l) { return l.id; }, function (l) { return l.lotCode; }, '', 'FEFO (自動)');
+    };
+    el('trProduct').onchange = fillLots;
+    fillLots();
+    el('trForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      var btn = el('trSubmit');
+      btn.disabled = true;
+      el('trMsg').innerHTML = '';
+      el('trResult').innerHTML = '';
+      var body = {
+        fromLocationId: Number(el('trFrom').value),
+        toLocationId: Number(el('trTo').value),
+        productId: Number(el('trProduct').value),
+        quantity: Number(el('trQty').value),
+      };
+      var lot = el('trLot').value;
+      if (lot) body.lotId = Number(lot);
+      api('/api/v1/movements/transfer', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
+        .then(function (r) {
+          var hh = msgHtml('success', '移動を登録しました。') +
+            '<div class="table-wrap"><table><thead><tr><th>ロット</th><th>移動元 在庫ID</th><th>移動先 在庫ID</th><th>数量</th></tr></thead><tbody>';
+          for (var i = 0; i < r.allocations.length; i++) {
+            var a = r.allocations[i];
+            hh += '<tr><td>' + esc(lotLabel(a.lotId)) + '</td><td>' + a.fromStockId + '</td><td>' + a.toStockId + '</td><td>' + a.quantity + '</td></tr>';
+          }
+          hh += '</tbody></table></div>';
+          el('trResult').innerHTML = hh;
+          btn.disabled = false;
+        })
+        .catch(function (e) {
+          el('trMsg').innerHTML = msgHtml('error', errMsg(e));
+          btn.disabled = false;
+        });
+    };
+  });
+}
+
 /* ---------------- history ---------------- */
+var MOVEMENT_TYPE_LABELS = {
+  IN: ['入庫', 'badge-ok'],
+  OUT: ['消費', ''],
+  TRANSFER_IN: ['移動 (入)', 'badge-ok'],
+  TRANSFER_OUT: ['移動 (出)', ''],
+  ADJUST: ['調整', 'badge-warn'],
+  CANCEL: ['取消', 'badge-danger'],
+};
 function loadHistory() {
   el('view').innerHTML = '<h2>入出庫履歴</h2><p class="muted">読み込み中…</p>';
   ensureMaster().then(function () {
@@ -445,15 +539,15 @@ function loadHistory() {
         '<th>日時</th><th>種別</th><th>商品</th><th>ロット</th><th>保管場所</th><th>変化</th><th>数量 (前 → 後)</th><th>部署 / 用途</th></tr></thead><tbody>';
       for (var i = 0; i < rows.length; i++) {
         var r = rows[i];
-        var isIn = r.type === 'IN' || r.type === 'TRANSFER_IN';
+        var tl = MOVEMENT_TYPE_LABELS[r.type] || [r.type, ''];
         h += '<tr><td>' + fmtDateTime(r.createdAt) + '</td>' +
-          '<td>' + (isIn ? '<span class="badge badge-ok">入庫</span>' : '<span class="badge">消費</span>') + '</td>' +
+          '<td><span class="badge ' + tl[1] + '">' + esc(tl[0]) + '</span></td>' +
           '<td>' + esc(productLabel(r.productId)) + '</td>' +
           '<td>' + esc(r.lotCode || '') + '</td>' +
           '<td>' + esc(locationLabel(r.locationId)) + '</td>' +
           '<td>' + (r.quantityChange > 0 ? '<span class="qty-pos">+' + r.quantityChange + '</span>' : '<span class="qty-neg">' + r.quantityChange + '</span>') + '</td>' +
           '<td>' + r.quantityBefore + ' → ' + r.quantityAfter + '</td>' +
-          '<td>' + esc([r.department, r.purpose].filter(Boolean).join(' / ')) + '</td></tr>';
+          '<td>' + esc([r.department, r.purpose].filter(Boolean).join(' / ') || r.reason || '') + '</td></tr>';
       }
       h += '</tbody></table></div>';
       el('view').innerHTML = h;
@@ -464,6 +558,93 @@ function loadHistory() {
 }
 
 /* ---------------- master ---------------- */
+function askValue(label, current) {
+  return window.prompt(label, current === null || current === undefined ? '' : String(current));
+}
+function masterDone(flash) {
+  state.flash = flash;
+  state.master = null;
+  loadMasterView();
+}
+function masterFail(e) {
+  var box = el('maMsg');
+  if (box) box.innerHTML = msgHtml('error', errMsg(e));
+}
+function onMasterAction(act, id) {
+  var kind = act.split('-')[1];
+  var base = '/api/v1/master/' + kind + 's/' + id;
+  if (act.indexOf('del-') === 0) {
+    if (!window.confirm('削除しますか? (論理削除のため、在庫や履歴には影響しません)')) return;
+    api(base, { method: 'DELETE' }).then(function () { masterDone('削除しました。'); }).catch(masterFail);
+    return;
+  }
+  if (kind === 'product') {
+    var p = productOf(id);
+    if (!p) return;
+    var name = askValue('商品名', p.name); if (name === null || name === '') return;
+    var unit = askValue('単位', p.unit); if (unit === null || unit === '') return;
+    var safety = askValue('安全在庫', p.safetyStock); if (safety === null) return;
+    var exp = askValue('有効期限 (1=必須, 0=不要)', p.requiresExpiry ? '1' : '0'); if (exp === null) return;
+    var days = askValue('アラート日数 (空欄で解除)', p.expiryAlertDays); if (days === null) return;
+    var body = {
+      name: name,
+      unit: unit,
+      safetyStock: Number(safety || 0),
+      requiresExpiry: exp === '1',
+      expiryAlertDays: days === '' ? null : Number(days),
+    };
+    api(base, { method: 'PUT', body: body }).then(function () { masterDone('商品を更新しました。'); }).catch(masterFail);
+    return;
+  }
+  if (kind === 'warehouse' || kind === 'location') {
+    var row = kind === 'warehouse' ? warehouseOf(id) : locationOf(id);
+    if (!row) return;
+    var code = askValue('コード', row.code); if (code === null || code === '') return;
+    var wname = askValue('名前', row.name); if (wname === null || wname === '') return;
+    api(base, { method: 'PUT', body: { code: code, name: wname } })
+      .then(function () { masterDone('更新しました。'); }).catch(masterFail);
+    return;
+  }
+  if (kind === 'lot') {
+    var lot = lotOf(id);
+    if (!lot) return;
+    var lotCode = askValue('ロット番号', lot.lotCode); if (lotCode === null || lotCode === '') return;
+    var expiry = askValue('有効期限 YYYY-MM-DD (空欄で期限なし)', lot.expiryDate); if (expiry === null) return;
+    api(base, { method: 'PUT', body: { lotCode: lotCode, expiryDate: expiry === '' ? null : expiry } })
+      .then(function () { masterDone('ロットを更新しました。'); }).catch(masterFail);
+  }
+}
+function onCsvImport() {
+  var input = el('maCsvFile');
+  var out = el('maCsvResult');
+  var f = input && input.files ? input.files[0] : null;
+  if (!f) { out.innerHTML = msgHtml('error', 'CSV ファイルを選んでください。'); return; }
+  var fd = new FormData();
+  fd.append('file', f);
+  fetch('/api/v1/master/products/import', { method: 'POST', body: fd, credentials: 'same-origin' })
+    .then(function (res) {
+      return res.text().then(function (t) {
+        var d = null;
+        try { d = JSON.parse(t); } catch (e) { /* ignore */ }
+        if (!res.ok) throw new Error(d && d.message ? d.message : 'HTTP ' + res.status);
+        return d;
+      });
+    })
+    .then(function (r) {
+      var hh = msgHtml('success', 'インポート完了: 対象 ' + r.total + ' 件 / 登録 ' + r.created + ' 件 / スキップ ' + r.skipped + ' 件 / 失敗 ' + r.failed.length + ' 件');
+      if (r.failed.length) {
+        hh += '<ul>';
+        r.failed.forEach(function (x) {
+          hh += '<li>' + x.line + ' 行目' + (x.sku ? ' (' + esc(x.sku) + ')' : '') + ': ' + esc(x.reason) + '</li>';
+        });
+        hh += '</ul>';
+      }
+      if (r.created > 0) hh += '<p class="small muted">一覧へ反映するには画面を開き直してください。</p>';
+      out.innerHTML = hh;
+      state.master = null;
+    })
+    .catch(function (e) { out.innerHTML = msgHtml('error', errMsg(e)); });
+}
 function masterSection(title, tableHtml, formHtml) {
   return '<div class="section-box"><h3>' + esc(title) + '</h3>' + tableHtml + formHtml + '</div>';
 }
@@ -480,10 +661,17 @@ function loadMasterView() {
     if (state.flash) { h += msgHtml('success', state.flash); state.flash = ''; }
     if (state.masterError) h += msgHtml('error', state.masterError);
 
+    var actHead = writable ? '<th>操作</th>' : '';
+    function actCell(kind, id) {
+      if (!writable) return '';
+      return '<td><button class="btn small secondary" data-mact="edit-' + kind + '" data-mid="' + id + '">編集</button> ' +
+        '<button class="btn small danger" data-mact="del-' + kind + '" data-mid="' + id + '">削除</button></td>';
+    }
     var prow = '';
     m.products.forEach(function (p) {
       prow += '<tr><td>' + esc(p.sku) + '</td><td>' + esc(p.name) + '</td><td>' + esc(p.unit) + '</td><td>' + p.safetyStock + '</td><td>' +
-        (p.requiresExpiry ? '必須' : '-') + '</td><td>' + (p.expiryAlertDays === null || p.expiryAlertDays === undefined ? '-' : p.expiryAlertDays + '日前') + '</td></tr>';
+        (p.requiresExpiry ? '必須' : '-') + '</td><td>' + (p.expiryAlertDays === null || p.expiryAlertDays === undefined ? '-' : p.expiryAlertDays + '日前') + '</td>' +
+        actCell('product', p.id) + '</tr>';
     });
     var pform = '';
     if (writable) {
@@ -497,10 +685,20 @@ function loadMasterView() {
         '<div><label>有効期限</label><select id="mpExpiry"><option value="">不要</option><option value="1">必須</option></select></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">商品を追加</button></div></form>';
     }
-    h += masterSection('商品', simpleTable('<th>SKU</th><th>商品名</th><th>単位</th><th>安全在庫</th><th>期限</th><th>アラート</th>', prow), pform);
+    h += masterSection('商品', simpleTable('<th>SKU</th><th>商品名</th><th>単位</th><th>安全在庫</th><th>期限</th><th>アラート</th>' + actHead, prow), pform);
+
+    if (writable) {
+      h += '<div class="section-box"><h3>商品 CSV インポート</h3>' +
+        '<p class="small muted">ヘッダが sku,name,unit,requires_expiry の CSV を読み込みます。既存の SKU はスキップされます。</p>' +
+        '<input type="file" id="maCsvFile" accept=".csv,text/csv"> ' +
+        '<button class="btn" id="maCsvBtn">インポート</button>' +
+        '<div id="maCsvResult"></div></div>';
+    }
 
     var wrow = '';
-    m.warehouses.forEach(function (w) { wrow += '<tr><td>' + esc(w.code) + '</td><td>' + esc(w.name) + '</td></tr>'; });
+    m.warehouses.forEach(function (w) {
+      wrow += '<tr><td>' + esc(w.code) + '</td><td>' + esc(w.name) + '</td>' + actCell('warehouse', w.id) + '</tr>';
+    });
     var wform = '';
     if (writable) {
       wform = '<form class="grid" id="maWarehouseForm">' +
@@ -508,10 +706,12 @@ function loadMasterView() {
         '<div><label>倉庫名</label><input id="mwName" required></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">倉庫を追加</button></div></form>';
     }
-    h += masterSection('倉庫', simpleTable('<th>コード</th><th>名前</th>', wrow), wform);
+    h += masterSection('倉庫', simpleTable('<th>コード</th><th>名前</th>' + actHead, wrow), wform);
 
     var lrow = '';
-    m.locations.forEach(function (l) { lrow += '<tr><td>' + esc(locationLabel(l.id)) + '</td><td>' + esc(l.code) + '</td></tr>'; });
+    m.locations.forEach(function (l) {
+      lrow += '<tr><td>' + esc(locationLabel(l.id)) + '</td><td>' + esc(l.code) + '</td>' + actCell('location', l.id) + '</tr>';
+    });
     var lform = '';
     if (writable) {
       lform = '<form class="grid" id="maLocationForm">' +
@@ -520,11 +720,12 @@ function loadMasterView() {
         '<div><label>場所名</label><input id="mlName" required></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">保管場所を追加</button></div></form>';
     }
-    h += masterSection('保管場所', simpleTable('<th>場所</th><th>コード</th>', lrow), lform);
+    h += masterSection('保管場所', simpleTable('<th>場所</th><th>コード</th>' + actHead, lrow), lform);
 
     var lotrow = '';
     m.lots.forEach(function (l) {
-      lotrow += '<tr><td>' + esc(productLabel(l.productId)) + '</td><td>' + esc(l.lotCode) + '</td><td>' + esc(l.expiryDate || '-') + '</td></tr>';
+      lotrow += '<tr><td>' + esc(productLabel(l.productId)) + '</td><td>' + esc(l.lotCode) + '</td><td>' + esc(l.expiryDate || '-') + '</td>' +
+        actCell('lot', l.id) + '</tr>';
     });
     var lotform = '';
     if (writable) {
@@ -534,9 +735,16 @@ function loadMasterView() {
         '<div><label>有効期限 (任意)</label><input id="mlotExpiry" type="date"></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">ロットを追加</button></div></form>';
     }
-    h += masterSection('ロット', simpleTable('<th>商品</th><th>ロット番号</th><th>期限</th>', lotrow), lotform);
+    h += masterSection('ロット', simpleTable('<th>商品</th><th>ロット番号</th><th>期限</th>' + actHead, lotrow), lotform);
 
     el('view').innerHTML = h;
+
+    var actBtns = el('view').querySelectorAll('button[data-mact]');
+    for (var bi = 0; bi < actBtns.length; bi++) {
+      actBtns[bi].onclick = function () { onMasterAction(this.getAttribute('data-mact'), Number(this.getAttribute('data-mid'))); };
+    }
+    var csvBtn = el('maCsvBtn');
+    if (csvBtn) csvBtn.onclick = onCsvImport;
 
     function bindForm(id, build, done) {
       var f = el(id);
@@ -643,27 +851,44 @@ function loadNegative() {
 }
 
 /* ---------------- stocktakes ---------------- */
+function stocktakeStatusBadge(st) {
+  if (st === 'in_progress') return '<span class="badge badge-warn">実施中</span>';
+  if (st === 'pending_approval') return '<span class="badge badge-danger">差異承認待ち</span>';
+  if (st === 'confirmed') return '<span class="badge badge-ok">確定済み</span>';
+  return '<span class="badge">' + esc(st) + '</span>';
+}
 function loadStocktakes() {
   el('view').innerHTML = '<h2>棚卸し</h2><p class="muted">読み込み中…</p>';
-  api('/api/v1/stocktakes').then(function (rows) {
+  ensureMaster().then(function () {
+    return api('/api/v1/stocktakes');
+  }).then(function (rows) {
     var active = null;
-    rows.forEach(function (t) { if (t.status === 'in_progress') active = t; });
+    rows.forEach(function (t) {
+      if (t.status === 'in_progress' || t.status === 'pending_approval') active = t;
+    });
+    var manage = can('stocktakes.manage');
     var h = '<h2>棚卸し</h2><div id="tkMsg"></div>';
-    h += msgHtml('info', '棚卸し実施中は、入庫・消費などの在庫更新がすべて停止します (API は 423 を返します)。');
-    if (active) {
-      h += msgHtml('warn', '棚卸し #' + active.id + ' が実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。');
-      if (can('stocktakes.manage')) {
-        h += '<p><button class="btn" id="tkFinish">棚卸しを終了する</button></p>';
+    h += msgHtml('info', '棚卸し実施中・差異承認待ちの間は、入庫・消費・移動などの在庫更新がすべて停止します (API は 423 を返します)。');
+    if (active && active.status === 'in_progress') {
+      h += msgHtml('warn', '棚卸し #' + active.id + ' が実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。各在庫の実数を入力し、終了してください。');
+      if (manage) h += '<p><button class="btn" id="tkFinish">棚卸しを終了する</button></p>';
+    }
+    if (active && active.status === 'pending_approval') {
+      h += msgHtml('warn', '棚卸し #' + active.id + ' に差異があり、承認待ちです。承認すると差異が在庫へ反映されます。');
+      if (manage) {
+        h += '<p><button class="btn" id="tkApprove">承認して在庫へ反映</button> ' +
+          '<button class="btn danger" id="tkReject">差し戻す (実数入力に戻る)</button></p>';
       }
-    } else if (can('stocktakes.manage')) {
+    }
+    if (!active && manage) {
       h += '<p><button class="btn" id="tkStart">棚卸しを開始する</button></p>';
     }
+    h += '<div id="tkDetail"></div>';
     if (!rows || rows.length === 0) h += '<p class="muted">棚卸しの履歴はありません。</p>';
     else {
       h += '<div class="table-wrap"><table><thead><tr><th>ID</th><th>状態</th><th>開始者</th><th>開始日時</th><th>確定日時</th></tr></thead><tbody>';
       rows.forEach(function (t) {
-        h += '<tr><td>' + t.id + '</td><td>' +
-          (t.status === 'in_progress' ? '<span class="badge badge-warn">実施中</span>' : '<span class="badge badge-ok">確定済み</span>') +
+        h += '<tr><td>' + t.id + '</td><td>' + stocktakeStatusBadge(t.status) +
           '</td><td>' + t.startedBy + '</td><td>' + fmtDateTime(t.startedAt) + '</td><td>' + fmtDateTime(t.confirmedAt) + '</td></tr>';
       });
       h += '</tbody></table></div>';
@@ -676,11 +901,72 @@ function loadStocktakes() {
     };
     var finish = el('tkFinish');
     if (finish) finish.onclick = function () {
-      api('/api/v1/stocktakes/' + active.id + '/finish', { method: 'POST', body: {} }).then(function () { loadStocktakes(); })
+      api('/api/v1/stocktakes/' + active.id + '/finish', { method: 'POST', body: {} }).then(function (r) {
+        if (r && r.status === 'pending_approval') {
+          el('tkMsg').innerHTML = msgHtml('warn', '差異が ' + (r.differences ? r.differences.length : 0) + ' 件あります。承認待ちになりました。');
+          loadStocktakes();
+        } else {
+          loadStocktakes();
+        }
+      }).catch(function (e) { el('tkMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+    var approve = el('tkApprove');
+    if (approve) approve.onclick = function () {
+      if (!window.confirm('差異を在庫へ反映して棚卸しを確定します。よろしいですか?')) return;
+      api('/api/v1/stocktakes/' + active.id + '/decide', { method: 'POST', body: { approve: true } })
+        .then(function () { loadStocktakes(); })
         .catch(function (e) { el('tkMsg').innerHTML = msgHtml('error', errMsg(e)); });
     };
+    var reject = el('tkReject');
+    if (reject) reject.onclick = function () {
+      api('/api/v1/stocktakes/' + active.id + '/decide', { method: 'POST', body: { approve: false } })
+        .then(function () { loadStocktakes(); })
+        .catch(function (e) { el('tkMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+    if (active) renderStocktakeDetail(active);
   }).catch(function (e) {
     el('view').innerHTML = '<h2>棚卸し</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+function renderStocktakeDetail(t) {
+  var box = el('tkDetail');
+  if (!box) return;
+  api('/api/v1/stocktakes/' + t.id).then(function (d) {
+    var manage = can('stocktakes.manage');
+    var editable = manage && d.status === 'in_progress';
+    var h = '<div class="section-box"><h3>棚卸し #' + d.id + ' の明細 ' + stocktakeStatusBadge(d.status) + '</h3>';
+    if (!d.lines || d.lines.length === 0) {
+      h += '<p class="muted">対象の在庫がありません。</p>';
+    } else {
+      h += '<div class="table-wrap"><table><thead><tr><th>商品</th><th>ロット</th><th>保管場所</th><th>帳簿数</th><th>実数</th><th>差異</th><th></th></tr></thead><tbody>';
+      d.lines.forEach(function (ln) {
+        var diff = ln.difference === null ? '<span class="muted">-</span>'
+          : (ln.difference === 0 ? '0' : '<span class="' + (ln.difference < 0 ? 'qty-neg' : 'qty-pos') + '">' + (ln.difference > 0 ? '+' : '') + ln.difference + '</span>');
+        var input = editable
+          ? '<input type="number" min="0" step="1" id="cnt-' + ln.id + '" value="' + (ln.countedQuantity === null ? '' : ln.countedQuantity) + '" style="width: 6em;">'
+          : (ln.countedQuantity === null ? '<span class="muted">未入力</span>' : ln.countedQuantity);
+        var btn = editable ? '<button class="btn small" data-count-line="' + ln.id + '">保存</button>' : '';
+        h += '<tr><td>' + esc(productLabel(ln.productId)) + '</td><td>' + esc(ln.lotCode) + '</td><td>' + esc(locationLabel(ln.locationId)) +
+          '</td><td>' + ln.bookQuantity + '</td><td>' + input + '</td><td>' + diff + '</td><td>' + btn + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+      h += '<p class="small muted">実数が未入力の行は帳簿どおり (差異なし) として扱われます。</p>';
+    }
+    h += '</div>';
+    box.innerHTML = h;
+    var btns = box.querySelectorAll('button[data-count-line]');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function () {
+        var lineId = this.getAttribute('data-count-line');
+        var v = el('cnt-' + lineId).value;
+        if (v === '') { el('tkMsg').innerHTML = msgHtml('error', '実数を入力してください。'); return; }
+        api('/api/v1/stocktakes/' + d.id + '/lines/' + lineId, { method: 'PUT', body: { countedQuantity: Number(v) } })
+          .then(function () { renderStocktakeDetail(t); })
+          .catch(function (e) { el('tkMsg').innerHTML = msgHtml('error', errMsg(e)); });
+      };
+    }
+  }).catch(function (e) {
+    box.innerHTML = msgHtml('error', errMsg(e));
   });
 }
 

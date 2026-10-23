@@ -61,6 +61,51 @@ export const consumptionSchema = z.object({
   negativeApprovalId: idValue.optional(),
 });
 
+export const transferSchema = z.object({
+  fromLocationId: idValue,
+  toLocationId: idValue,
+  productId: idValue,
+  /** 指定時はそのロットのみから移動する。未指定は FEFO 順 */
+  lotId: idValue.optional(),
+  quantity: z.number().int().min(1),
+});
+
+/** 商品の編集 (SKU は識別子のため変更不可。バーコードは null で解除可) */
+export const updateProductSchema = z.object({
+  name: z.string().min(1).optional(),
+  unit: z.string().min(1).optional(),
+  barcode: z.string().nullable().optional(),
+  safetyStock: z.number().int().min(0).optional(),
+  requiresExpiry: z.boolean().optional(),
+  expiryAlertDays: z.number().int().min(0).nullable().optional(),
+});
+
+export const updateWarehouseSchema = z.object({
+  code: z.string().min(1).optional(),
+  name: z.string().min(1).optional(),
+});
+
+export const updateLocationSchema = z.object({
+  code: z.string().min(1).optional(),
+  name: z.string().min(1).optional(),
+});
+
+/** ロットの編集は lot_code と expiry_date のみ (expiryDate: null で期限を外す) */
+export const updateLotSchema = z.object({
+  lotCode: z.string().min(1).optional(),
+  expiryDate: dateString.nullable().optional(),
+});
+
+/** 棚卸し lines への実数入力 */
+export const countedQuantitySchema = z.object({
+  countedQuantity: z.number().int().min(0),
+});
+
+/** 棚卸しの差異承認/差し戻し */
+export const decideStocktakeSchema = z.object({
+  approve: z.boolean(),
+});
+
 export const createApprovalSchema = z.object({
   stockId: idValue,
   quantity: z.number().int().min(1),

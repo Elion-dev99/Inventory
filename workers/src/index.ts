@@ -6,6 +6,7 @@ import {
   type ConsumeInput,
   type Envelope,
   type InboundInput,
+  type TransferInput,
 } from './coordinator';
 import {
   authenticate,
@@ -41,16 +42,24 @@ import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
   consumptionSchema,
+  countedQuantitySchema,
   createApprovalSchema,
   createLocationSchema,
   createLotSchema,
   createProductSchema,
   createWarehouseSchema,
   decideApprovalSchema,
+  decideStocktakeSchema,
   formatDateOnly,
   inboundSchema,
   parseDateOnly,
+  transferSchema,
+  updateLocationSchema,
+  updateLotSchema,
+  updateProductSchema,
+  updateWarehouseSchema,
 } from './lib/schemas';
+import { parseCsv, toCsv } from './lib/csv';
 
 export { InventoryCoordinator };
 
@@ -552,8 +561,10 @@ async function sha256Hex(text: string): Promise<string> {
 interface CoordinatorStub {
   inbound: (input: InboundInput) => Promise<Envelope>;
   consume: (input: ConsumeInput) => Promise<Envelope>;
+  transfer: (input: TransferInput) => Promise<Envelope>;
   startStocktake: (input: { actorId: number }) => Promise<Envelope>;
   finishStocktake: (input: { actorId: number; stocktakeId: number }) => Promise<Envelope>;
+  decideStocktake: (input: { actorId: number; stocktakeId: number; approve: boolean }) => Promise<Envelope>;
   fetch: (request: Request) => Promise<Response>;
 }
 
@@ -799,12 +810,30 @@ async function createLocation(c: AppContext): Promise<Response> {
 async function listLots(c: AppContext): Promise<Response> {
   await requirePermission(c, Permission.MASTER_READ);
   const productId = c.req.query('productId');
+  // 論理削除済みは出さない。lots.deleted_at は 0005 で追加されるため、
+  // 未適用環境では従来のクエリにフォールバックする
   let sql = 'SELECT id, product_id AS productId, lot_code AS lotCode, expiry_date AS expiryMs, received_at AS receivedAt FROM lots';
   const params: number[] = [];
+  const conditions: string[] = [];
   if (productId !== undefined) {
-    sql += ' WHERE product_id = ?';
+    conditions.push('product_id = ?');
     params.push(Number(productId));
   }
+  try {
+    const filtered =
+      sql +
+      (conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')} AND deleted_at IS NULL` : ' WHERE deleted_at IS NULL') +
+      ' ORDER BY id ASC LIMIT 200';
+    const { results } = await c.env.DB.prepare(filtered)
+      .bind(...params)
+      .all<{ id: number; productId: number; lotCode: string; expiryMs: number | null; receivedAt: number }>();
+    return c.json(
+      results.map((r) => ({ ...r, expiryDate: formatDateOnly(r.expiryMs), expiryMs: undefined })),
+    );
+  } catch {
+    // deleted_at 列が無い環境では従来どおり全件を返す
+  }
+  if (conditions.length > 0) sql += ` WHERE ${conditions.join(' AND ')}`;
   sql += ' ORDER BY id ASC LIMIT 200';
   const { results } = await c.env.DB.prepare(sql)
     .bind(...params)
@@ -846,15 +875,318 @@ async function createLot(c: AppContext): Promise<Response> {
   }
 }
 
+// ------------------------------------------------------- マスタ編集・削除
+// 編集・論理削除はいずれも master.write が必要。論理削除 (deleted_at) のため
+// 在庫・台帳などの履歴データには影響しない (README 参照)。
+
+async function updateProduct(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateProductSchema, await parseJson(c));
+  const row = await c.env.DB.prepare('SELECT * FROM products WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(id)
+    .first<ProductRow>();
+  if (!row) throw notFound('Product not found');
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (dto.unit !== undefined) { sets.push('unit = ?'); params.push(dto.unit); }
+  if (dto.barcode !== undefined) { sets.push('barcode = ?'); params.push(dto.barcode); }
+  if (dto.safetyStock !== undefined) { sets.push('safety_stock = ?'); params.push(dto.safetyStock); }
+  if (dto.requiresExpiry !== undefined) { sets.push('requires_expiry = ?'); params.push(dto.requiresExpiry ? 1 : 0); }
+  if (dto.expiryAlertDays !== undefined) { sets.push('expiry_alert_days = ?'); params.push(dto.expiryAlertDays); }
+  if (sets.length > 0) {
+    const now = Date.now();
+    await c.env.DB.prepare(
+      `UPDATE products SET ${sets.join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+    )
+      .bind(...params, now, id)
+      .run();
+  }
+  const updated = await c.env.DB.prepare('SELECT * FROM products WHERE id = ?1')
+    .bind(id)
+    .first<ProductRow>();
+  return c.json(productJson(updated as ProductRow));
+}
+
+async function deleteProduct(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE products SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(now, id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Product not found');
+  return c.json({ id, deleted: true });
+}
+
+async function updateWarehouse(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateWarehouseSchema, await parseJson(c));
+  const row = await c.env.DB.prepare('SELECT id FROM warehouses WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(id)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Warehouse not found');
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (dto.code !== undefined) { sets.push('code = ?'); params.push(dto.code); }
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (sets.length > 0) {
+    try {
+      await c.env.DB.prepare(
+        `UPDATE warehouses SET ${sets.join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+      )
+        .bind(...params, Date.now(), id)
+        .run();
+    } catch {
+      throw new ApiError(409, 'DUPLICATE', 'Warehouse with this code already exists');
+    }
+  }
+  const updated = await c.env.DB.prepare('SELECT id, code, name FROM warehouses WHERE id = ?1')
+    .bind(id)
+    .first();
+  return c.json(updated);
+}
+
+async function deleteWarehouse(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE warehouses SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(now, id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Warehouse not found');
+  return c.json({ id, deleted: true });
+}
+
+async function updateLocation(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateLocationSchema, await parseJson(c));
+  const row = await c.env.DB.prepare('SELECT id, warehouse_id FROM locations WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(id)
+    .first<{ id: number; warehouse_id: number }>();
+  if (!row) throw notFound('Location not found');
+  if (!canAccessWarehouse(user(c).assignments, row.warehouse_id)) {
+    throw forbidden('Out of warehouse scope');
+  }
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (dto.code !== undefined) { sets.push('code = ?'); params.push(dto.code); }
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (sets.length > 0) {
+    try {
+      await c.env.DB.prepare(
+        `UPDATE locations SET ${sets.join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+      )
+        .bind(...params, Date.now(), id)
+        .run();
+    } catch {
+      throw new ApiError(409, 'DUPLICATE', 'Location with this code already exists in the warehouse');
+    }
+  }
+  const updated = await c.env.DB.prepare(
+    'SELECT id, warehouse_id AS warehouseId, code, name FROM locations WHERE id = ?1',
+  )
+    .bind(id)
+    .first();
+  return c.json(updated);
+}
+
+async function deleteLocation(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const warehouseId = await warehouseIdOfLocation(c, id);
+  if (!canAccessWarehouse(user(c).assignments, warehouseId)) {
+    throw forbidden('Out of warehouse scope');
+  }
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE locations SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(now, id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Location not found');
+  return c.json({ id, deleted: true });
+}
+
+interface LotRow {
+  id: number;
+  product_id: number;
+  lot_code: string;
+  expiry_date: number | null;
+  received_at: number;
+}
+
+function lotJson(r: LotRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    productId: r.product_id,
+    lotCode: r.lot_code,
+    expiryDate: formatDateOnly(r.expiry_date),
+    receivedAt: r.received_at,
+  };
+}
+
+async function updateLot(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateLotSchema, await parseJson(c));
+  const row = await c.env.DB.prepare('SELECT * FROM lots WHERE id = ?1 AND deleted_at IS NULL')
+    .bind(id)
+    .first<LotRow>();
+  if (!row) throw notFound('Lot not found');
+  let expiryMs = row.expiry_date;
+  if (dto.expiryDate !== undefined) {
+    if (dto.expiryDate === null) {
+      expiryMs = null;
+    } else {
+      expiryMs = parseDateOnly(dto.expiryDate);
+      if (expiryMs === null) throw badRequest('expiryDate must be a valid YYYY-MM-DD date');
+    }
+  }
+  const product = await c.env.DB.prepare('SELECT requires_expiry FROM products WHERE id = ?1')
+    .bind(row.product_id)
+    .first<{ requires_expiry: number }>();
+  if (product?.requires_expiry === 1 && expiryMs === null) {
+    throw badRequest('expiryDate is required for this product');
+  }
+  const lotCode = dto.lotCode ?? row.lot_code;
+  try {
+    await c.env.DB.prepare('UPDATE lots SET lot_code = ?1, expiry_date = ?2, updated_at = ?3 WHERE id = ?4')
+      .bind(lotCode, expiryMs, Date.now(), id)
+      .run();
+  } catch {
+    throw new ApiError(409, 'DUPLICATE', 'Lot with this lotCode already exists for the product');
+  }
+  const updated = await c.env.DB.prepare('SELECT * FROM lots WHERE id = ?1')
+    .bind(id)
+    .first<LotRow>();
+  return c.json(lotJson(updated as LotRow));
+}
+
+async function deleteLot(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const id = Number(c.req.param('id'));
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE lots SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(now, id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Lot not found');
+  return c.json({ id, deleted: true });
+}
+
+// ------------------------------------------------------- 商品 CSV インポート
+// CSV (sku,name,unit,requires_expiry) を multipart の file フィールド、
+// または text/csv などの生ボディで受け取り、商品を一括登録する。
+// 既存 SKU (論理削除済みを含む) はスキップし、行ごとの成否を集計して返す。
+
+async function importProducts(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const contentType = c.req.header('content-type') ?? '';
+  let text: string;
+  if (contentType.includes('multipart/form-data')) {
+    let form: FormData | null = null;
+    try {
+      form = await c.req.formData();
+    } catch {
+      form = null;
+    }
+    const file = form?.get('file');
+    if (!(file instanceof File)) {
+      throw badRequest('multipart field "file" (CSV file) is required');
+    }
+    text = await file.text();
+  } else {
+    text = await c.req.text();
+  }
+  if (text.trim().length === 0) throw badRequest('CSV body is empty');
+
+  const records = parseCsv(text);
+  const headerIdx = records.findIndex((r) => r.some((cell) => cell.trim().length > 0));
+  const headerRow = headerIdx >= 0 ? records[headerIdx] : undefined;
+  if (!headerRow) throw badRequest('CSV header row is required');
+  const header = headerRow.map((h) => h.trim().toLowerCase());
+  const col = {
+    sku: header.indexOf('sku'),
+    name: header.indexOf('name'),
+    unit: header.indexOf('unit'),
+    requiresExpiry: header.indexOf('requires_expiry'),
+  };
+  if (col.sku < 0 || col.name < 0 || col.unit < 0) {
+    throw badRequest('CSV header must include sku, name, unit');
+  }
+
+  const { results: existingRows } = await c.env.DB.prepare('SELECT sku FROM products').all<{
+    sku: string;
+  }>();
+  const knownSkus = new Set(existingRows.map((r) => r.sku));
+
+  const now = Date.now();
+  let total = 0;
+  let created = 0;
+  let skipped = 0;
+  const failed: { line: number; sku?: string; reason: string }[] = [];
+
+  for (let i = headerIdx + 1; i < records.length; i++) {
+    const record = records[i] as string[];
+    if (record.every((cell) => cell.trim().length === 0)) continue;
+    const line = i + 1;
+    total += 1;
+    const sku = (record[col.sku] ?? '').trim();
+    const name = (record[col.name] ?? '').trim();
+    const unit = (record[col.unit] ?? '').trim();
+    if (!sku || !name || !unit) {
+      failed.push({ line, ...(sku ? { sku } : {}), reason: 'sku, name, unit are required' });
+      continue;
+    }
+    if (knownSkus.has(sku)) {
+      skipped += 1;
+      continue;
+    }
+    const expiryRaw = col.requiresExpiry >= 0 ? (record[col.requiresExpiry] ?? '').trim().toLowerCase() : '';
+    const requiresExpiry = ['true', '1', 'yes'].includes(expiryRaw) ? 1 : 0;
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO products (sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
+         VALUES (?1, ?2, ?3, NULL, 0, ?4, NULL, ?5, ?5)`,
+      )
+        .bind(sku, name, unit, requiresExpiry, now)
+        .run();
+      knownSkus.add(sku);
+      created += 1;
+    } catch {
+      failed.push({ line, sku, reason: 'failed to insert product' });
+    }
+  }
+  return c.json({ total, created, skipped, failed });
+}
+
 for (const base of ['/api/v1/master', '/api/v1'] as const) {
   app.get(`${base}/products`, listProducts);
   app.post(`${base}/products`, createProduct);
+  app.post(`${base}/products/import`, importProducts);
+  app.put(`${base}/products/:id`, updateProduct);
+  app.delete(`${base}/products/:id`, deleteProduct);
   app.get(`${base}/warehouses`, listWarehouses);
   app.post(`${base}/warehouses`, createWarehouse);
+  app.put(`${base}/warehouses/:id`, updateWarehouse);
+  app.delete(`${base}/warehouses/:id`, deleteWarehouse);
   app.get(`${base}/locations`, listLocations);
   app.post(`${base}/locations`, createLocation);
+  app.put(`${base}/locations/:id`, updateLocation);
+  app.delete(`${base}/locations/:id`, deleteLocation);
   app.get(`${base}/lots`, listLots);
   app.post(`${base}/lots`, createLot);
+  app.put(`${base}/lots/:id`, updateLot);
+  app.delete(`${base}/lots/:id`, deleteLot);
 }
 
 // ---------------------------------------------------------------- 在庫参照
@@ -939,6 +1271,62 @@ app.get('/api/v1/stocks/:id', async (c) => {
   return c.json(stockJson(row));
 });
 
+/** 在庫一覧の CSV エクスポート (stocks.read、倉庫スコープ適用) */
+app.get('/api/v1/stocks.csv', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const reachable = reachableWarehouseIds(user(c).assignments);
+  let sql = `SELECT p.sku, p.name AS product_name, w.name AS warehouse_name,
+                    loc.name AS location_name, loc.code AS location_code,
+                    l.lot_code, l.expiry_date, s.quantity
+               FROM stocks s
+               JOIN locations loc ON loc.id = s.location_id
+               JOIN warehouses w ON w.id = loc.warehouse_id
+               JOIN lots l ON l.id = s.lot_id
+               JOIN products p ON p.id = l.product_id`;
+  const params: number[] = [];
+  if (reachable !== null) {
+    if (reachable.length === 0) {
+      return csvDownload(c, []);
+    }
+    sql += ` WHERE loc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
+    params.push(...reachable);
+  }
+  sql += ' ORDER BY s.id ASC LIMIT 5000';
+  const { results } = await c.env.DB.prepare(sql)
+    .bind(...params)
+    .all<{
+      sku: string;
+      product_name: string;
+      warehouse_name: string;
+      location_name: string;
+      location_code: string;
+      lot_code: string;
+      expiry_date: number | null;
+      quantity: number;
+    }>();
+  return csvDownload(
+    c,
+    results.map((r) => [
+      r.sku,
+      r.product_name,
+      r.warehouse_name,
+      `${r.location_name} (${r.location_code})`,
+      r.lot_code,
+      formatDateOnly(r.expiry_date) ?? '',
+      r.quantity,
+    ]),
+  );
+});
+
+function csvDownload(c: AppContext, rows: readonly (readonly unknown[])[]): Response {
+  const header = ['商品コード', '商品名', '倉庫', '保管場所', 'ロット', '期限', '数量'];
+  // Excel での文字化けを避けるため UTF-8 BOM を付ける
+  return c.body('\uFEFF' + toCsv(header, rows), 200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="stocks.csv"',
+  });
+}
+
 // ---------------------------------------------------------------- 入出庫
 
 app.post('/api/v1/movements/inbound', async (c) => {
@@ -991,6 +1379,33 @@ app.post('/api/v1/movements/consumption', async (c) => {
     ...(dto.fefoDeviationReason !== undefined ? { fefoDeviationReason: dto.fefoDeviationReason } : {}),
     ...(dto.negativeApprovalId !== undefined ? { negativeApprovalId: dto.negativeApprovalId } : {}),
     allowedLocationIds: await allowedLocationIds(c),
+  });
+  return respond(c, envelope);
+});
+
+app.post('/api/v1/movements/transfer', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_TRANSFER);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(transferSchema, raw);
+  // 移動元・移動先の両方の倉庫に到達できることが必要
+  const fromWarehouseId = await warehouseIdOfLocation(c, dto.fromLocationId);
+  const toWarehouseId = await warehouseIdOfLocation(c, dto.toLocationId);
+  if (
+    !canPerformPermission(user(c).assignments, rp, fromWarehouseId, Permission.MOVEMENTS_TRANSFER) ||
+    !canPerformPermission(user(c).assignments, rp, toWarehouseId, Permission.MOVEMENTS_TRANSFER)
+  ) {
+    throw forbidden('Out of warehouse scope');
+  }
+  const envelope = await coordinator(c).transfer({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/movements/transfer',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    fromLocationId: dto.fromLocationId,
+    toLocationId: dto.toLocationId,
+    productId: dto.productId,
+    ...(dto.lotId !== undefined ? { lotId: dto.lotId } : {}),
+    quantity: dto.quantity,
   });
   return respond(c, envelope);
 });
@@ -1111,6 +1526,103 @@ app.post('/api/v1/stocktakes/:id/finish', async (c) => {
   const envelope = await coordinator(c).finishStocktake({
     actorId: user(c).userId,
     stocktakeId: Number(c.req.param('id')),
+  });
+  return respond(c, envelope);
+});
+
+interface StocktakeLineView {
+  id: number;
+  stockId: number;
+  bookQuantity: number;
+  countedQuantity: number | null;
+  locationId: number;
+  warehouseId: number;
+  productId: number;
+  sku: string;
+  productName: string;
+  lotCode: string;
+  expiryDate: number | null;
+}
+
+function stocktakeLineJson(r: StocktakeLineView): Record<string, unknown> {
+  return {
+    id: r.id,
+    stockId: r.stockId,
+    bookQuantity: r.bookQuantity,
+    countedQuantity: r.countedQuantity,
+    difference: r.countedQuantity === null ? null : r.countedQuantity - r.bookQuantity,
+    locationId: r.locationId,
+    warehouseId: r.warehouseId,
+    productId: r.productId,
+    sku: r.sku,
+    productName: r.productName,
+    lotCode: r.lotCode,
+    expiryDate: formatDateOnly(r.expiryDate),
+  };
+}
+
+const STOCKTAKE_LINE_SQL = `SELECT sl.id, sl.stock_id AS stockId, sl.book_quantity AS bookQuantity,
+           sl.counted_quantity AS countedQuantity, s.location_id AS locationId,
+           loc.warehouse_id AS warehouseId, l.product_id AS productId, p.sku,
+           p.name AS productName, l.lot_code AS lotCode, l.expiry_date AS expiryDate
+      FROM stocktake_lines sl
+      JOIN stocks s ON s.id = sl.stock_id
+      JOIN locations loc ON loc.id = s.location_id
+      JOIN lots l ON l.id = s.lot_id
+      JOIN products p ON p.id = l.product_id`;
+
+/** 棚卸しの詳細 (lines: 帳簿数・実数・差異つき)。一覧と同じく割当が条件 */
+app.get('/api/v1/stocktakes/:id', async (c) => {
+  assertHasAssignments(user(c));
+  const id = Number(c.req.param('id'));
+  const stocktake = await c.env.DB.prepare(
+    `SELECT id, status, started_by AS startedBy, started_at AS startedAt, confirmed_at AS confirmedAt
+       FROM stocktakes WHERE id = ?1`,
+  )
+    .bind(id)
+    .first();
+  if (!stocktake) throw notFound('Stocktake not found');
+  const { results } = await c.env.DB.prepare(
+    `${STOCKTAKE_LINE_SQL} WHERE sl.stocktake_id = ?1 ORDER BY sl.id ASC`,
+  )
+    .bind(id)
+    .all<StocktakeLineView>();
+  return c.json({ ...stocktake, lines: results.map(stocktakeLineJson) });
+});
+
+/** 棚卸し lines への実数入力 (実施中のみ)。lines は stocks ではないため Worker が直接更新する */
+app.put('/api/v1/stocktakes/:id/lines/:lineId', async (c) => {
+  await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  const stocktakeId = Number(c.req.param('id'));
+  const lineId = Number(c.req.param('lineId'));
+  const dto = parseWith(countedQuantitySchema, await parseJson(c));
+  const stocktake = await c.env.DB.prepare('SELECT id, status FROM stocktakes WHERE id = ?1')
+    .bind(stocktakeId)
+    .first<{ id: number; status: string }>();
+  if (!stocktake) throw notFound('Stocktake not found');
+  if (stocktake.status !== 'in_progress') {
+    throw new ApiError(409, 'STOCKTAKE_NOT_IN_PROGRESS', 'Counted quantities can only be entered while the stocktake is in progress');
+  }
+  const res = await c.env.DB.prepare(
+    'UPDATE stocktake_lines SET counted_quantity = ?1 WHERE id = ?2 AND stocktake_id = ?3',
+  )
+    .bind(dto.countedQuantity, lineId, stocktakeId)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Stocktake line not found');
+  const line = await c.env.DB.prepare(`${STOCKTAKE_LINE_SQL} WHERE sl.id = ?1`)
+    .bind(lineId)
+    .first<StocktakeLineView>();
+  return c.json(stocktakeLineJson(line as StocktakeLineView));
+});
+
+/** 棚卸しの差異承認/差し戻し (pending_approval のときのみ Coordinator が処理する) */
+app.post('/api/v1/stocktakes/:id/decide', async (c) => {
+  await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  const dto = parseWith(decideStocktakeSchema, await parseJson(c));
+  const envelope = await coordinator(c).decideStocktake({
+    actorId: user(c).userId,
+    stocktakeId: Number(c.req.param('id')),
+    approve: dto.approve,
   });
   return respond(c, envelope);
 });
