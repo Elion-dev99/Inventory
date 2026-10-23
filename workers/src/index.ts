@@ -62,10 +62,76 @@ app.get('/', (c) =>
 <li>ヘルスチェック: <a href="/api/v1/health">/api/v1/health</a></li>
 <li>API ベースパス: <code>/api/v1</code> (業務 API は認証が必要です)</li>
 </ul>
+<p><a href="/login">Google でログイン</a> (業務 API の動作確認用ページ)</p>
 <p>画面 (フロントエンド) は Phase 2 で提供予定です。</p>
 </body>
 </html>`),
 );
+
+// ------------------------------------------------------------ ログイン (動作確認用)
+// Google Identity Services で ID トークンを取得し、業務 API を呼ぶ最小ページ。
+// トークンは sessionStorage にのみ保持し、サーバー側では JWKS で検証する。
+app.get('/login', (c) => {
+  const clientId = c.env.OIDC_CLIENT_ID ?? '';
+  if (!clientId) {
+    return c.html(
+      '<!doctype html><html lang="ja"><body style="font-family: system-ui, sans-serif; margin: 2rem;">OIDC が未設定です。</body></html>',
+      503,
+    );
+  }
+  return c.html(`<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ログイン | 在庫管理システム</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
+<h1>在庫管理システム ログイン</h1>
+<div id="gbtn"></div>
+<p id="who"></p>
+<button id="apitest" style="display:none; padding: 0.5rem 1rem;">API をテストする (在庫一覧)</button>
+<button id="logout" style="display:none; padding: 0.5rem 1rem;">ログアウト</button>
+<pre id="out" style="white-space: pre-wrap; background: #f4f4f4; padding: 1rem;"></pre>
+<script>
+function decodeJwt(t) {
+  const p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(decodeURIComponent(escape(atob(p))));
+}
+function refresh() {
+  const t = sessionStorage.getItem('idToken');
+  document.getElementById('apitest').style.display = t ? '' : 'none';
+  document.getElementById('logout').style.display = t ? '' : 'none';
+  if (t) {
+    try { const d = decodeJwt(t); document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub); } catch (e) {}
+  } else { document.getElementById('who').textContent = ''; }
+}
+window.onload = function () {
+  google.accounts.id.initialize({
+    client_id: '${clientId}',
+    callback: function (res) {
+      sessionStorage.setItem('idToken', res.credential);
+      document.getElementById('out').textContent = 'ログインしました。「API をテストする」を押してください。';
+      refresh();
+    },
+  });
+  google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large' });
+  refresh();
+};
+document.getElementById('apitest').onclick = async function () {
+  const t = sessionStorage.getItem('idToken');
+  const r = await fetch('/api/v1/stocks', { headers: { Authorization: 'Bearer ' + t } });
+  document.getElementById('out').textContent = 'HTTP ' + r.status + '\n' + (await r.text());
+};
+document.getElementById('logout').onclick = function () {
+  sessionStorage.removeItem('idToken');
+  google.accounts.id.disableAutoSelect();
+  document.getElementById('out').textContent = 'ログアウトしました。';
+  refresh();
+};
+</script>
+</body>
+</html>`);
+});
 
 // ---------------------------------------------------------------- 認証
 app.use('/api/v1/*', async (c, next) => {
