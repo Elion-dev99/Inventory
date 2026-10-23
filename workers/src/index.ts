@@ -88,6 +88,7 @@ app.get('/login', (c) => {
 <body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
 <h1>在庫管理システム ログイン</h1>
 <div id="gbtn"></div>
+<p><a id="fallback" href="#" style="display:inline-block; padding: 0.5rem 1rem; border: 1px solid #888; border-radius: 6px; text-decoration: none;">Google でログイン (ボタンが出ない場合はこちら)</a></p>
 <p id="who"></p>
 <button id="apitest" style="display:none; padding: 0.5rem 1rem;">API をテストする (在庫一覧)</button>
 <button id="logout" style="display:none; padding: 0.5rem 1rem;">ログアウト</button>
@@ -105,16 +106,40 @@ function refresh() {
     try { const d = decodeJwt(t); document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub); } catch (e) {}
   } else { document.getElementById('who').textContent = ''; }
 }
-window.onload = function () {
-  google.accounts.id.initialize({
+document.getElementById('fallback').onclick = function () {
+  const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  sessionStorage.setItem('oauthNonce', nonce);
+  const params = new URLSearchParams({
     client_id: '${clientId}',
-    callback: function (res) {
-      sessionStorage.setItem('idToken', res.credential);
-      document.getElementById('out').textContent = 'ログインしました。「API をテストする」を押してください。';
-      refresh();
-    },
+    redirect_uri: location.origin + '/auth/callback',
+    response_type: 'id_token',
+    scope: 'openid email profile',
+    nonce: nonce,
+    prompt: 'select_account',
   });
-  google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large' });
+  location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
+  return false;
+};
+window.onload = function () {
+  let tries = 0;
+  const timer = setInterval(function () {
+    tries++;
+    if (window.google && google.accounts && google.accounts.id) {
+      clearInterval(timer);
+      google.accounts.id.initialize({
+        client_id: '${clientId}',
+        callback: function (res) {
+          sessionStorage.setItem('idToken', res.credential);
+          document.getElementById('out').textContent = 'ログインしました。「API をテストする」を押してください。';
+          refresh();
+        },
+      });
+      google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large' });
+    } else if (tries > 50) {
+      clearInterval(timer);
+      document.getElementById('out').textContent = 'Google のボタンを読み込めませんでした。下の「Google でログイン」リンクを使ってください。';
+    }
+  }, 200);
   refresh();
 };
 document.getElementById('apitest').onclick = async function () {
@@ -124,7 +149,7 @@ document.getElementById('apitest').onclick = async function () {
 };
 document.getElementById('logout').onclick = function () {
   sessionStorage.removeItem('idToken');
-  google.accounts.id.disableAutoSelect();
+  if (window.google && google.accounts && google.accounts.id) google.accounts.id.disableAutoSelect();
   document.getElementById('out').textContent = 'ログアウトしました。';
   refresh();
 };
@@ -132,6 +157,37 @@ document.getElementById('logout').onclick = function () {
 </body>
 </html>`);
 });
+
+// OAuth リダイレクト受け口。id_token はフラグメント (#id_token=...) で届くため
+// このページの JS が取り出して sessionStorage に保存し、/login へ戻す。
+app.get('/auth/callback', (c) =>
+  c.html(`<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ログイン処理中 | 在庫管理システム</title></head>
+<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
+<p id="msg">ログイン処理中です…</p>
+<script>
+(function () {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const token = params.get('id_token');
+  const err = params.get('error');
+  const msg = document.getElementById('msg');
+  if (err) { msg.textContent = 'ログインに失敗しました: ' + err; return; }
+  if (!token) { msg.textContent = 'トークンが返されませんでした。'; return; }
+  try {
+    const p = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(decodeURIComponent(escape(atob(p))));
+    const expected = sessionStorage.getItem('oauthNonce');
+    if (expected && payload.nonce !== expected) { msg.textContent = 'nonce が一致しません。もう一度ログインしてください。'; return; }
+  } catch (e) { msg.textContent = 'トークンの形式が不正です。'; return; }
+  sessionStorage.setItem('idToken', token);
+  location.replace('/login');
+})();
+</script>
+</body>
+</html>`),
+);
 
 // ---------------------------------------------------------------- 認証
 app.use('/api/v1/*', async (c, next) => {
