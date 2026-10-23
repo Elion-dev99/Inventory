@@ -1,5 +1,6 @@
 import { APP_CSS } from './styles';
 import { APP_JS } from './client';
+import { PWA_HEAD } from '../pwa';
 
 /**
  * /app の SPA シェル。Worker から直接配信する単一 HTML。
@@ -10,8 +11,8 @@ export const APP_HTML = `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>在庫管理システム</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>在庫管理システム</title>${PWA_HEAD}
 <style>${APP_CSS}</style>
 </head>
 <body>

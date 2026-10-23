@@ -34,7 +34,7 @@ header.app-header .spacer { flex: 1; }
 .ws-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #bbb; vertical-align: middle; }
 .ws-dot.on { background: #2e9e4f; }
 .ws-label { font-size: 0.8rem; color: var(--muted); }
-main { padding: 1rem; max-width: 1100px; margin: 0 auto; }
+main { padding: 1rem; padding-bottom: calc(1rem + env(safe-area-inset-bottom)); max-width: 1100px; margin: 0 auto; }
 nav.tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.6rem 1rem; background: #fff; border-bottom: 1px solid var(--line); }
 nav.tabs button {
   border: 1px solid var(--line);

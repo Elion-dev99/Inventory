@@ -39,6 +39,7 @@ import {
 } from './lib/session';
 import { APP_HTML } from './app/page';
 import { APP_CSS } from './app/styles';
+import { PWA_HEAD, manifestResponse, iconResponse } from './pwa';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
@@ -104,6 +105,10 @@ app.get('/', (c) =>
 // /app で配信する単一ページアプリ (src/app/)。認証は Cookie セッションで、
 // 未ログイン時はアプリ側が /api/v1/me の 401 を見てログイン導線を出す。
 app.get('/app', (c) => c.html(APP_HTML));
+
+// PWA: ホーム画面追加でブラウザのバーを出さずにフルスクリーン起動する
+app.get('/manifest.webmanifest', () => manifestResponse());
+app.get('/icons/:name', (c) => iconResponse(c.req.param('name')) ?? c.notFound());
 
 // ------------------------------------------------------------ ログイン (動作確認用)
 // Google Identity Services で ID トークンを取得し、業務 API を呼ぶ最小ページ。
@@ -198,7 +203,7 @@ app.get('/admin/permissions', (c) =>
   c.html(`<!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>権限管理 | 在庫管理システム</title>
+<title>権限管理 | 在庫管理システム</title>${PWA_HEAD}
 <style>${APP_CSS}
 td.perm-cell { text-align: center; }
 td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
