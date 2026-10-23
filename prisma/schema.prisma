@@ -11,8 +11,11 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  // アプリ実行時: Neon 等の pooled (PgBouncer) 接続を使う
+  url       = env("DATABASE_URL")
+  // マイグレーション (prisma migrate) 用: プールを介さない direct 接続が必須
+  directUrl = env("DIRECT_URL")
 }
 
 model User {

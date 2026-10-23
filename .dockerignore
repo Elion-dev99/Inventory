@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+coverage
+.prisma
+.env
+.env.*
+!.env.example
+*.log
+cloudflare
+.wrangler
+Dockerfile
+.dockerignore

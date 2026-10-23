@@ -1,0 +1,42 @@
+{
+  // 在庫管理システム — Cloudflare Containers デプロイ設定
+  // 手順書は同ディレクトリの README.md を参照。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inventory-system",
+  "main": "src/index.ts",
+  // 2026-10-24 時点の日付。wrangler の更新に合わせて定期的に見直すこと。
+  "compatibility_date": "2026-10-24",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+  },
+  "containers": [
+    {
+      "class_name": "InventoryContainer",
+      // イメージはリポジトリルートの本番用 Dockerfile からビルドする
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      // NestJS + Prisma の常駐プロセス向けに標準サイズを選択
+      "instance_type": "standard-2",
+      // 上限。実際の同時稼働数は src/index.ts のルーティングで決まる
+      // (現在はシングルトン運用のため通常は 1。README の「スケーリング条件」参照)
+      "max_instances": 3,
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "INVENTORY_CONTAINER",
+        "class_name": "InventoryContainer",
+      },
+    ],
+  },
+  // この Worker が export する Durable Object クラスの宣言 (exports 形式)。
+  // 旧来の migrations は使わない。
+  "exports": {
+    "InventoryContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

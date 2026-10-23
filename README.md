@@ -37,6 +37,27 @@ npm test
 > `PRISMA_ENGINES_MIRROR=https://registry.npmmirror.com/-/binary/prisma npx prisma generate`
 > また postinstall が落ちる環境では `npm install --ignore-scripts` で導入し、上記 generate を別途実行します。
 
+## 運用構成 (本番: Cloudflare Containers)
+
+本番の運用構成は以下に決定済みです。デプロイ手順の詳細は [cloudflare/README.md](cloudflare/README.md) を参照してください。
+
+| 層 | 採用 | 備考 |
+|---|---|---|
+| アプリ実行 | Cloudflare Containers | ルートの `Dockerfile` (node:22, linux/amd64) を `cloudflare/` の Worker が起動・中継する |
+| PostgreSQL | 外部マネージド (第一候補: Neon) | アプリは pooled 接続 (`DATABASE_URL`)、マイグレーションは direct 接続 (`DIRECT_URL`) — 下記参照 |
+| Redis | 外部マネージド (第一候補: Upstash) | Pub/Sub 配信基盤。`REDIS_URL` は TLS の `rediss://` を使う |
+| 認証 | OIDC (IdP 製品は未確定) | `OIDC_*` は Worker の Secret として注入する |
+
+本番の環境変数 (アプリ側):
+
+- `DATABASE_URL`: アプリ実行時用。Neon の pooled (PgBouncer) 接続文字列。Prisma から pooler 経由で使う場合は `?pgbouncer=true` を付ける
+- `DIRECT_URL`: `prisma migrate deploy` 専用。Neon の direct 接続文字列 (pooler を介さない)。マイグレーションはプール経由では実行できないため必須
+- `REDIS_URL`: Upstash の接続文字列 (`rediss://<user>:<password>@<host>:<port>`、TLS)
+
+なお現在の Socket.IO は Redis Adapter 未導入のため、WebSocket セッションの親和性を確保する目的で
+コンテナは当面シングルトン (1インスタンス) で運用します。複数インスタンス化の条件は
+`cloudflare/src/index.ts` のコメントと `cloudflare/README.md` に明記しています。
+
 ## 設計との対応
 
 | 設計 (基本設計 v0.1) | 実装 |
@@ -75,7 +96,7 @@ Prisma スキーマで表現できない制約は、初回マイグレーショ�
 - **アラート**: 集計の最適化と定期バッチ化 (現状は導出のみ)
 - **フロントエンド**: 未着手 (TypeScript SPA 想定)
 - **テスト**: FEFO と権限判定の単体テストのみ。競合・冪等性・整合性の必須テスト (要件9章) は未実装
-- **運用**: CI、監視、バックアップ、負荷テストは未整備。運用環境 (クラウド等) は未確定
+- **運用**: CI、監視、バックアップ、負荷テストは未整備。運用構成は Cloudflare Containers + 外部マネージド DB/Redis に決定済みで、デプロイ構成一式 (Dockerfile / `cloudflare/`) は用意したが、実デプロイは未実施 (手順は `cloudflare/README.md`)
 
 ## ディレクトリ
 
