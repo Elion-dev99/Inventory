@@ -51,9 +51,43 @@ function api(path, opts) {
         err.code = data && data.error ? data.error : '';
         throw err;
       }
+      if ((opts.method || 'GET') !== 'GET') invalidateCache();
       return data;
     });
   });
+}
+/* ---------------- data cache (画面遷移を即時にするための先読みキャッシュ) ---------------- */
+var dataCache = {};
+var CACHE_TTL = 20000;
+function getJson(path) {
+  var c = dataCache[path];
+  if (c && Date.now() - c.at < CACHE_TTL) return Promise.resolve(c.data);
+  return api(path).then(function (d) { dataCache[path] = { at: Date.now(), data: d }; return d; });
+}
+function invalidateCache() { dataCache = {}; }
+
+/* ---------------- skeleton (読み込み中テキストの代わりの骨格表示) ---------------- */
+var keepContent = false; /* リアルタイム更新時は前の画面を残してちらつかせない */
+function skeletonHtml(kind) {
+  if (kind === 'cards') {
+    return '<div class="cards"><div class="skl skl-card"></div><div class="skl skl-card"></div><div class="skl skl-card"></div><div class="skl skl-card"></div></div>' +
+      '<div class="skl skl-line" style="width:55%"></div><div class="skl skl-line" style="width:85%"></div><div class="skl skl-line" style="width:70%"></div>';
+  }
+  if (kind === 'form') {
+    return '<div class="skl skl-form"></div><div class="skl skl-line" style="width:40%"></div>';
+  }
+  var h = '<div class="group">';
+  for (var i = 0; i < 6; i++) h += '<div class="skl skl-row"></div>';
+  return h + '</div>';
+}
+function skeletonRows() {
+  var h = '';
+  for (var i = 0; i < 6; i++) h += '<div class="skl skl-row"></div>';
+  return h;
+}
+function viewLoading(title, kind) {
+  if (keepContent) return;
+  el('view').innerHTML = '<h2>' + esc(title) + '</h2>' + skeletonHtml(kind);
 }
 function errMsg(e) {
   if (e && e.status === 423) return '棚卸し実施中のため、この操作は停止しています (423)。棚卸しが終了するまでお待ちください。';
@@ -341,7 +375,10 @@ function showView(id) {
   if (fn) fn();
   window.scrollTo(0, 0);
 }
-function refreshCurrent() { showView(state.view); }
+function refreshCurrent() {
+  keepContent = true;
+  try { showView(state.view); } finally { keepContent = false; }
+}
 function scheduleRefresh() {
   if (state.refreshTimer) return;
   state.refreshTimer = setTimeout(function () {
@@ -352,11 +389,11 @@ function scheduleRefresh() {
 
 /* ---------------- dashboard ---------------- */
 function loadDashboard() {
-  el('view').innerHTML = '<h2>ダッシュボード</h2><p class="muted">読み込み中…</p>';
+  viewLoading('ダッシュボード', 'cards');
   var jobs = [];
-  jobs.push(can('alerts.read') ? api('/api/v1/alerts') : Promise.resolve(null));
-  jobs.push(can('stocks.read') ? api('/api/v1/stocks?take=200') : Promise.resolve(null));
-  jobs.push(api('/api/v1/stocktakes'));
+  jobs.push(can('alerts.read') ? getJson('/api/v1/alerts') : Promise.resolve(null));
+  jobs.push(can('stocks.read') ? getJson('/api/v1/stocks?take=200') : Promise.resolve(null));
+  jobs.push(getJson('/api/v1/stocktakes'));
   Promise.all(jobs).then(function (r) {
     var alerts = r[0];
     var stocks = r[1];
@@ -445,7 +482,7 @@ function loadStocks() {
     '<div><button class="btn" id="stReload">再読み込み</button></div>' +
     '<div><label>&nbsp;</label><a class="btn secondary" href="/api/v1/stocks.csv">CSV ダウンロード</a></div>' +
     '</div>' +
-    '<div id="stMsg"></div><div id="stBody"><p class="muted">読み込み中…</p></div>';
+    '<div id="stMsg"></div><div id="stBody">' + skeletonRows() + '</div>';
   ensureMaster().then(function (m) {
     el('stWh').innerHTML = '<option value="">すべて</option>' + optionsHtml(m.warehouses, function (w) { return w.id; }, function (w) { return w.name; }, '');
     var fillLocs = function () {
@@ -464,7 +501,7 @@ function loadStocks() {
     var loc = el('stLoc') ? el('stLoc').value : '';
     var path = '/api/v1/stocks?take=200' + (loc ? '&locationId=' + encodeURIComponent(loc) : '');
     el('stMsg').innerHTML = '';
-    api(path).then(function (rows) {
+    getJson(path).then(function (rows) {
       var q = (el('stQ').value || '').toLowerCase();
       var wh = el('stWh').value;
       var filtered = rows.filter(function (s) {
@@ -489,7 +526,7 @@ function loadStocks() {
 
 /* ---------------- inbound ---------------- */
 function loadInbound() {
-  el('view').innerHTML = '<h2>入庫</h2><p class="muted">読み込み中…</p>';
+  viewLoading('入庫', 'form');
   ensureMaster().then(function (m) {
     if (state.masterError) {
       el('view').innerHTML = '<h2>入庫</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
@@ -542,7 +579,7 @@ function loadInbound() {
 
 /* ---------------- consume ---------------- */
 function loadConsume() {
-  el('view').innerHTML = '<h2>消費</h2><p class="muted">読み込み中…</p>';
+  viewLoading('消費', 'form');
   ensureMaster().then(function (m) {
     if (state.masterError) {
       el('view').innerHTML = '<h2>消費</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
@@ -600,7 +637,7 @@ function loadConsume() {
 
 /* ---------------- transfer ---------------- */
 function loadTransfer() {
-  el('view').innerHTML = '<h2>移動</h2><p class="muted">読み込み中…</p>';
+  viewLoading('移動', 'form');
   ensureMaster().then(function (m) {
     if (state.masterError) {
       el('view').innerHTML = '<h2>移動</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
@@ -670,9 +707,9 @@ var MOVEMENT_TYPE_LABELS = {
   CANCEL: ['取消', 'badge-danger'],
 };
 function loadHistory() {
-  el('view').innerHTML = '<h2>入出庫履歴</h2><p class="muted">読み込み中…</p>';
+  viewLoading('入出庫履歴', 'list');
   ensureMaster().then(function () {
-    api('/api/v1/movements?take=100').then(function (rows) {
+    getJson('/api/v1/movements?take=100').then(function (rows) {
       if (!rows || rows.length === 0) {
         el('view').innerHTML = '<h2>入出庫履歴</h2><p class="muted">履歴がありません。</p>';
         return;
@@ -831,7 +868,7 @@ function simpleTable(head, rowsHtml) {
   return '<div class="table-wrap"><table><thead><tr>' + head + '</tr></thead><tbody>' + rowsHtml + '</tbody></table></div>';
 }
 function loadMasterView() {
-  el('view').innerHTML = '<h2>マスタ管理</h2><p class="muted">読み込み中…</p>';
+  viewLoading('マスタ管理', 'list');
   state.master = null;
   ensureMaster().then(function (m) {
     var writable = can('master.write');
@@ -965,10 +1002,10 @@ function statusBadge(st) {
   return '<span class="badge badge-warn">承認待ち</span>';
 }
 function loadNegative() {
-  el('view').innerHTML = '<h2>マイナス在庫</h2><p class="muted">読み込み中…</p>';
+  viewLoading('マイナス在庫', 'list');
   ensureMaster().then(function () {
-    var jobs = [api('/api/v1/negative-approvals')];
-    if (can('stocks.read')) jobs.push(api('/api/v1/stocks?take=200'));
+    var jobs = [getJson('/api/v1/negative-approvals')];
+    if (can('stocks.read')) jobs.push(getJson('/api/v1/stocks?take=200'));
     Promise.all(jobs).then(function (r) {
       var approvals = r[0] || [];
       var stocks = r[1] || [];
@@ -1036,9 +1073,9 @@ function stocktakeStatusBadge(st) {
   return '<span class="badge">' + esc(st) + '</span>';
 }
 function loadStocktakes() {
-  el('view').innerHTML = '<h2>棚卸し</h2><p class="muted">読み込み中…</p>';
+  viewLoading('棚卸し', 'list');
   ensureMaster().then(function () {
-    return api('/api/v1/stocktakes');
+    return getJson('/api/v1/stocktakes');
   }).then(function (rows) {
     var active = null;
     rows.forEach(function (t) {
@@ -1151,9 +1188,9 @@ function renderStocktakeDetail(t) {
 /* ---------------- alerts ---------------- */
 var ALERT_LABELS = { EXPIRED: '期限切れ', EXPIRING: '期限接近', LOW_STOCK: '在庫不足', NEGATIVE_STOCK: 'マイナス在庫' };
 function loadAlerts() {
-  el('view').innerHTML = '<h2>アラート</h2><p class="muted">読み込み中…</p>';
+  viewLoading('アラート', 'list');
   ensureMaster().then(function () {
-    api('/api/v1/alerts').then(function (rows) {
+    getJson('/api/v1/alerts').then(function (rows) {
       if (!rows || rows.length === 0) {
         el('view').innerHTML = '<h2>アラート</h2><p class="muted">現在アラートはありません。</p>';
         return;
@@ -1191,7 +1228,7 @@ function loadAudit() {
     '<div><label>&nbsp;</label><button class="btn" id="auSearch">検索</button></div>' +
     '<div><label>&nbsp;</label><button class="btn secondary" id="auExport">データをエクスポート (JSON)</button></div>' +
     '</div>' +
-    '<div id="auMsg"></div><div id="auBody"><p class="muted">読み込み中…</p></div>' +
+    '<div id="auMsg"></div><div id="auBody">' + skeletonRows() + '</div>' +
     '<div class="toolbar">' +
     '<div><button class="btn secondary" id="auPrev">前へ</button></div>' +
     '<div><span id="auPage" class="small muted"></span></div>' +
@@ -1218,7 +1255,7 @@ function fetchAudit() {
   if (from) q += '&from=' + new Date(from).getTime();
   var to = el('auTo').value;
   if (to) q += '&to=' + new Date(to).getTime();
-  api('/api/v1/admin/audit-logs' + q).then(function (r) {
+  getJson('/api/v1/admin/audit-logs' + q).then(function (r) {
     auditState.total = r.total;
     el('auPage').textContent = r.total === 0
       ? '0 件'
@@ -1277,7 +1314,7 @@ function connectWs() {
     wsConn.onmessage = function (ev) {
       try {
         var m = JSON.parse(ev.data);
-        if (m && m.type && m.type.indexOf('stock') === 0) scheduleRefresh();
+        if (m && m.type && m.type.indexOf('stock') === 0) { invalidateCache(); scheduleRefresh(); }
       } catch (e) { /* ignore */ }
     };
     wsConn.onclose = function () {
@@ -1307,6 +1344,14 @@ function boot() {
     buildNav();
     showView('dashboard');
     connectWs();
+    /* 先読み: よく使うデータを裏で温めて、タブ切り替えを即時にする */
+    ensureMaster();
+    if (can('alerts.read')) getJson('/api/v1/alerts').catch(function () {});
+    if (can('stocks.read')) {
+      getJson('/api/v1/stocks?take=200').catch(function () {});
+      getJson('/api/v1/movements?take=100').catch(function () {});
+    }
+    getJson('/api/v1/stocktakes').catch(function () {});
   }).catch(function (err) {
     el('loadingBox').style.display = 'none';
     if (err && err.status === 403) el('noAssignBox').style.display = '';

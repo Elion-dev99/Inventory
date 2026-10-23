@@ -225,11 +225,11 @@ td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
 </div>
 
 <h2>ロール × 権限マトリクス</h2>
-<div class="table-wrap"><div id="matrix">読み込み中…</div></div>
+<div class="table-wrap"><div id="matrix"><div class="skl skl-row"></div><div class="skl skl-row"></div><div class="skl skl-row"></div></div></div>
 <button id="saveMatrix" class="btn" style="margin-top: 0.75rem;">マトリクスを保存</button>
 
 <h2>ユーザーとロール付与</h2>
-<div id="users">読み込み中…</div>
+<div id="users"><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
 </main>
 
 <script>

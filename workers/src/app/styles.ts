@@ -338,6 +338,23 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
   z-index: 60;
   overflow-y: auto;
 }
+/* ---- スケルトン (読み込み中テキストの代替) と起動スプラッシュ ---- */
+.skl {
+  border-radius: 10px;
+  background: linear-gradient(100deg, var(--surface-2) 40%, var(--control) 50%, var(--surface-2) 60%);
+  background-size: 200% 100%;
+  animation: skl-shimmer 1.15s linear infinite;
+}
+@keyframes skl-shimmer { from { background-position: 180% 0; } to { background-position: -20% 0; } }
+.skl-card { height: 104px; border-radius: var(--r-lg); }
+.skl-line { height: 14px; margin: 12px 0; }
+.skl-row { height: 26px; margin: 14px 16px; }
+.skl-form { height: 190px; border-radius: var(--r-lg); margin-bottom: 12px; }
+.splash { display: flex; flex-direction: column; align-items: center; gap: 1rem; margin: 22vh auto 0; text-align: center; }
+.splash img { animation: splash-pulse 1.6s ease-in-out infinite; }
+.splash-name { font-size: 1.15rem; font-weight: 700; letter-spacing: -0.01em; color: var(--muted); }
+@keyframes splash-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(0.94); opacity: 0.75; } }
+
 .modal { background: var(--surface); color: var(--fg); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 1.4rem 1.5rem; width: 100%; max-width: 540px; }
 .modal h3 { margin-top: 0; }
 .modal form.grid { border: none; padding: 0; background: transparent; box-shadow: none; }

@@ -24,7 +24,7 @@ export const APP_HTML = `<!doctype html>
   <span class="small" id="userLabel"></span>
 </header>
 
-<div id="loadingBox" class="center-box"><p>読み込み中…</p></div>
+<div id="loadingBox" class="splash"><img class="app-icon-lg" src="/icons/icon-512.png" alt=""><div class="splash-name">在庫管理システム</div></div>
 
 <div id="loginBox" class="center-box" style="display:none">
   <img class="app-icon-lg" src="/icons/icon-512.png" alt="">
