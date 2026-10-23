@@ -48,6 +48,25 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 // ------------------------------------------------------------ ヘルスチェック
 app.get('/api/v1/health', (c) => c.json({ status: 'ok' }));
 
+// ------------------------------------------------------------ ルート (案内ページ)
+// フロントエンド未実装のため、トップではサービスの状態と API の入口だけを示す。
+app.get('/', (c) =>
+  c.html(`<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>在庫管理システム</title></head>
+<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
+<h1>在庫管理システム</h1>
+<p>サービスは稼働中です (Workers + D1 版)。</p>
+<ul>
+<li>ヘルスチェック: <a href="/api/v1/health">/api/v1/health</a></li>
+<li>API ベースパス: <code>/api/v1</code> (業務 API は認証が必要です)</li>
+</ul>
+<p>画面 (フロントエンド) は Phase 2 で提供予定です。</p>
+</body>
+</html>`),
+);
+
 // ---------------------------------------------------------------- 認証
 app.use('/api/v1/*', async (c, next) => {
   if (c.req.path === '/api/v1/health') return next();
