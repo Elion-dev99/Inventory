@@ -15,12 +15,19 @@ import {
   type AuthUser,
 } from './lib/auth';
 import {
+  ALL_ROLE_CODES,
   canAccessWarehouse,
-  canPerform,
-  hasRole,
+  canPerformPermission,
+  hasPermission,
+  PERMISSION_CATALOG,
+  PERMISSION_KEYS,
+  Permission,
   reachableWarehouseIds,
+  resolveRolePermissions,
   RoleCode,
+  type PermissionKey,
   type RoleAssignment,
+  type RolePermissionMap,
 } from './lib/access';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
@@ -69,6 +76,7 @@ app.get('/', (c) =>
 <li>API ベースパス: <code>/api/v1</code> (業務 API は認証が必要です)</li>
 </ul>
 <p><a href="/login">Google でログイン</a> (業務 API の動作確認用ページ)</p>
+<p><a href="/admin/permissions">権限管理</a> (管理者用: ロールごとの権限とユーザーのロール付与)</p>
 <p>画面 (フロントエンド) は Phase 2 で提供予定です。</p>
 </body>
 </html>`),
@@ -159,6 +167,196 @@ document.getElementById('logout').onclick = function () {
 </body>
 </html>`);
 });
+
+// ------------------------------------------------------------ 権限管理画面 (最小)
+// 静的ページ。/login と同様に localStorage の idToken を Authorization に使って
+// 管理 API を呼ぶ。権限が無い場合は API が 403 を返し、画面にエラー表示する。
+app.get('/admin/permissions', (c) =>
+  c.html(`<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>権限管理 | 在庫管理システム</title></head>
+<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.6;">
+<h1>権限管理</h1>
+<p id="who"></p>
+<p id="status" style="color: #27632a;"></p>
+<p id="error" style="color: #b00020; white-space: pre-wrap;"></p>
+
+<h2>ロール × 権限マトリクス</h2>
+<div id="matrix">読み込み中…</div>
+<button id="saveMatrix" style="padding: 0.5rem 1rem; margin-top: 0.5rem;">マトリクスを保存</button>
+
+<h2>ユーザーとロール付与</h2>
+<div id="users">読み込み中…</div>
+
+<script>
+function getToken() {
+  return localStorage.getItem('idToken') || sessionStorage.getItem('idToken') || '';
+}
+function decodeJwt(t) {
+  const p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(decodeURIComponent(escape(atob(p))));
+}
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function setError(msg) { document.getElementById('error').textContent = msg; }
+async function api(path, opts) {
+  const t = getToken();
+  if (!t) throw new Error('未ログインです。先に /login でログインしてください。');
+  const res = await fetch(path, {
+    ...(opts || {}),
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t, ...((opts && opts.headers) || {}) },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text);
+  return text ? JSON.parse(text) : null;
+}
+
+let catalog = [];
+let roleList = [];
+let matrix = {};
+let userList = [];
+
+function renderMatrix() {
+  const el = document.getElementById('matrix');
+  if (roleList.length === 0) { el.textContent = 'ロールがありません。'; return; }
+  let html = '<table border="1" cellspacing="0" cellpadding="4"><thead><tr><th>権限</th>';
+  for (const r of roleList) html += '<th>' + r.code + '<br><small>' + r.name + '</small></th>';
+  html += '</tr></thead><tbody>';
+  for (const p of catalog) {
+    html += '<tr><td><code>' + p.key + '</code><br><small>' + (p.label || '') + '</small></td>';
+    for (const r of roleList) {
+      const checked = (matrix[r.code] || []).includes(p.key) ? ' checked' : '';
+      html += '<td style="text-align:center"><input type="checkbox" data-role="' + r.code + '" data-perm="' + p.key + '"' + checked + '></td>';
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+async function saveMatrix() {
+  setError(''); setStatus('保存中…');
+  try {
+    for (const r of roleList) {
+      const boxes = document.querySelectorAll('input[type=checkbox][data-role="' + r.code + '"]:checked');
+      const permissions = [...boxes].map((b) => b.dataset.perm);
+      await api('/api/v1/admin/role-permissions/' + encodeURIComponent(r.code), {
+        method: 'PUT',
+        body: JSON.stringify({ permissions }),
+      });
+      matrix[r.code] = permissions;
+    }
+    setStatus('マトリクスを保存しました。');
+  } catch (e) {
+    setStatus('');
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
+function renderUsers() {
+  const el = document.getElementById('users');
+  if (userList.length === 0) { el.textContent = 'ユーザーがいません。'; return; }
+  el.innerHTML = '';
+  for (const u of userList) {
+    const box = document.createElement('div');
+    box.style.border = '1px solid #ccc';
+    box.style.padding = '0.75rem';
+    box.style.marginBottom = '0.75rem';
+    const roleOptions = roleList.map((r) => '<option value="' + r.code + '">' + r.code + '</option>').join('');
+    let rows = '';
+    u.assignments.forEach((a, i) => {
+      rows += '<li>' + a.roleCode + ' / 倉庫: ' + (a.warehouseId === null ? '全倉庫' : a.warehouseId) +
+        ' <button data-act="remove" data-user="' + u.id + '" data-idx="' + i + '">削除</button></li>';
+    });
+    box.innerHTML =
+      '<strong>#' + u.id + ' ' + u.email + '</strong> (' + u.displayName + ', ' + u.status + ')' +
+      '<ul>' + rows + '</ul>' +
+      '<select id="role-' + u.id + '">' + roleOptions + '</select> ' +
+      '<input id="wh-' + u.id + '" type="number" min="1" placeholder="倉庫ID (空=全倉庫)" style="width: 12em;"> ' +
+      '<button data-act="add" data-user="' + u.id + '">割当を追加</button> ' +
+      '<button data-act="save" data-user="' + u.id + '">このユーザーを保存</button>';
+    el.appendChild(box);
+  }
+  el.querySelectorAll('button[data-act]').forEach((btn) => {
+    btn.onclick = () => onUserAction(btn.dataset.act, Number(btn.dataset.user), btn.dataset.idx);
+  });
+}
+
+async function onUserAction(act, userId, idx) {
+  const u = userList.find((x) => x.id === userId);
+  if (!u) return;
+  setError(''); setStatus('');
+  if (act === 'remove') {
+    u.assignments.splice(Number(idx), 1);
+    renderUsers();
+    setStatus('割当を外しました (保存ボタンで確定します)。');
+    return;
+  }
+  if (act === 'add') {
+    const roleCode = document.getElementById('role-' + userId).value;
+    const whRaw = document.getElementById('wh-' + userId).value;
+    const warehouseId = whRaw === '' ? null : Number(whRaw);
+    if (u.assignments.some((a) => a.roleCode === roleCode && a.warehouseId === warehouseId)) {
+      setError('同じ割当が既にあります。');
+      return;
+    }
+    u.assignments.push({ roleCode, warehouseId });
+    renderUsers();
+    setStatus('割当を追加しました (保存ボタンで確定します)。');
+    return;
+  }
+  if (act === 'save') {
+    try {
+      await api('/api/v1/admin/users/' + userId + '/roles', {
+        method: 'PUT',
+        body: JSON.stringify({ assignments: u.assignments }),
+      });
+      setStatus('ユーザー #' + userId + ' の割当を保存しました。');
+    } catch (e) {
+      setError(String(e && e.message ? e.message : e));
+    }
+  }
+}
+
+async function loadAll() {
+  const t = getToken();
+  if (!t) {
+    document.getElementById('who').textContent = '未ログインです。';
+    setError('先に /login でログインしてください。');
+    document.getElementById('matrix').textContent = '';
+    document.getElementById('users').textContent = '';
+    return;
+  }
+  try {
+    const d = decodeJwt(t);
+    document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub);
+  } catch (e) {}
+  try {
+    const data = await api('/api/v1/admin/permissions');
+    catalog = data.permissions;
+    roleList = data.roles;
+    matrix = data.matrix;
+    renderMatrix();
+  } catch (e) {
+    document.getElementById('matrix').textContent = '';
+    setError(String(e && e.message ? e.message : e));
+    return;
+  }
+  try {
+    userList = await api('/api/v1/admin/users');
+    renderUsers();
+  } catch (e) {
+    document.getElementById('users').textContent = '';
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
+document.getElementById('saveMatrix').onclick = saveMatrix;
+loadAll();
+</script>
+</body>
+</html>`),
+);
 
 // ログイン開始 (サーバー側リダイレクト、認可コードフロー)。
 // ブラウザ側の JS に依存せず、通常のリンク遷移だけで進める。nonce/state は Cookie で保持する。
@@ -272,9 +470,33 @@ function user(c: AppContext): AuthUser {
   return c.get('user');
 }
 
-function requireRole(c: AppContext, ...roles: RoleCode[]): void {
+/**
+ * 実効権限マトリクスを D1 の role_permissions から解決する (リクエストごと)。
+ * テーブル未適用・未投入の環境では既定マトリクスにフォールバックする。
+ */
+async function loadRolePermissions(c: AppContext): Promise<RolePermissionMap> {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT role_code, permission_key FROM role_permissions',
+    ).all<{ role_code: string; permission_key: string }>();
+    return resolveRolePermissions(results);
+  } catch {
+    return resolveRolePermissions([]);
+  }
+}
+
+/** 権限が無ければ 403。解決済みマトリクスを返すのでスコープ判定にも再利用できる */
+async function requirePermission(
+  c: AppContext,
+  permission: PermissionKey,
+  preloaded?: RolePermissionMap,
+): Promise<RolePermissionMap> {
   assertHasAssignments(user(c));
-  if (!hasRole(user(c).assignments, ...roles)) throw forbidden('Insufficient role');
+  const rp = preloaded ?? (await loadRolePermissions(c));
+  if (!hasPermission(user(c).assignments, rp, permission)) {
+    throw forbidden('Insufficient permission');
+  }
+  return rp;
 }
 
 // ------------------------------------------------------------ ユーティリティ
@@ -390,7 +612,7 @@ function productJson(r: ProductRow): Record<string, unknown> {
 }
 
 async function listProducts(c: AppContext): Promise<Response> {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.MASTER_READ);
   const skip = Number(c.req.query('skip') ?? 0);
   const take = Math.min(Number(c.req.query('take') ?? 50), 200);
   const { results } = await c.env.DB.prepare(
@@ -402,7 +624,7 @@ async function listProducts(c: AppContext): Promise<Response> {
 }
 
 async function createProduct(c: AppContext): Promise<Response> {
-  requireRole(c, RoleCode.SYSTEM_ADMIN, RoleCode.INVENTORY_MANAGER);
+  await requirePermission(c, Permission.MASTER_WRITE);
   const dto = parseWith(createProductSchema, await parseJson(c));
   const now = Date.now();
   try {
@@ -419,7 +641,7 @@ async function createProduct(c: AppContext): Promise<Response> {
 }
 
 async function listWarehouses(c: AppContext): Promise<Response> {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.MASTER_READ);
   const reachable = reachableWarehouseIds(user(c).assignments);
   let sql = 'SELECT id, code, name FROM warehouses WHERE deleted_at IS NULL';
   const params: number[] = [];
@@ -434,7 +656,7 @@ async function listWarehouses(c: AppContext): Promise<Response> {
 }
 
 async function createWarehouse(c: AppContext): Promise<Response> {
-  requireRole(c, RoleCode.SYSTEM_ADMIN, RoleCode.INVENTORY_MANAGER);
+  await requirePermission(c, Permission.MASTER_WRITE);
   const dto = parseWith(createWarehouseSchema, await parseJson(c));
   const now = Date.now();
   try {
@@ -450,7 +672,7 @@ async function createWarehouse(c: AppContext): Promise<Response> {
 }
 
 async function listLocations(c: AppContext): Promise<Response> {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.MASTER_READ);
   const reachable = reachableWarehouseIds(user(c).assignments);
   const warehouseId = c.req.query('warehouseId');
   let sql = `SELECT id, warehouse_id AS warehouseId, code, name
@@ -471,7 +693,7 @@ async function listLocations(c: AppContext): Promise<Response> {
 }
 
 async function createLocation(c: AppContext): Promise<Response> {
-  requireRole(c, RoleCode.SYSTEM_ADMIN, RoleCode.INVENTORY_MANAGER);
+  await requirePermission(c, Permission.MASTER_WRITE);
   const dto = parseWith(createLocationSchema, await parseJson(c));
   if (!canAccessWarehouse(user(c).assignments, dto.warehouseId)) {
     throw forbidden('Out of warehouse scope');
@@ -490,7 +712,7 @@ async function createLocation(c: AppContext): Promise<Response> {
 }
 
 async function listLots(c: AppContext): Promise<Response> {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.MASTER_READ);
   const productId = c.req.query('productId');
   let sql = 'SELECT id, product_id AS productId, lot_code AS lotCode, expiry_date AS expiryMs, received_at AS receivedAt FROM lots';
   const params: number[] = [];
@@ -508,7 +730,7 @@ async function listLots(c: AppContext): Promise<Response> {
 }
 
 async function createLot(c: AppContext): Promise<Response> {
-  requireRole(c, RoleCode.SYSTEM_ADMIN, RoleCode.INVENTORY_MANAGER);
+  await requirePermission(c, Permission.MASTER_WRITE);
   const dto = parseWith(createLotSchema, await parseJson(c));
   const product = await c.env.DB.prepare('SELECT id, requires_expiry FROM products WHERE id = ?1 AND deleted_at IS NULL')
     .bind(dto.productId)
@@ -588,7 +810,7 @@ const STOCK_VIEW_SQL = `SELECT s.id, s.location_id, s.lot_id, s.quantity, s.vers
                           JOIN products p ON p.id = l.product_id`;
 
 app.get('/api/v1/stocks', async (c) => {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.STOCKS_READ);
   const reachable = reachableWarehouseIds(user(c).assignments);
   const conditions: string[] = [];
   const params: (number | string)[] = [];
@@ -619,7 +841,7 @@ app.get('/api/v1/stocks', async (c) => {
 });
 
 app.get('/api/v1/stocks/:id', async (c) => {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.STOCKS_READ);
   const id = Number(c.req.param('id'));
   const row = await c.env.DB.prepare(`${STOCK_VIEW_SQL} WHERE s.id = ?1`)
     .bind(id)
@@ -635,11 +857,11 @@ app.get('/api/v1/stocks/:id', async (c) => {
 // ---------------------------------------------------------------- 入出庫
 
 app.post('/api/v1/movements/inbound', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  const rp = await requirePermission(c, Permission.MOVEMENTS_INBOUND);
   const raw = (await parseJson(c)) as Record<string, unknown>;
   const dto = parseWith(inboundSchema, raw);
   const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
-  if (!canPerform(user(c).assignments, warehouseId, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN)) {
+  if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.MOVEMENTS_INBOUND)) {
     throw forbidden('Out of warehouse scope');
   }
   let expiryDateMs: number | null = null;
@@ -662,12 +884,12 @@ app.post('/api/v1/movements/inbound', async (c) => {
 });
 
 app.post('/api/v1/movements/consumption', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const raw = (await parseJson(c)) as Record<string, unknown>;
   const dto = parseWith(consumptionSchema, raw);
   if (dto.locationId !== undefined) {
     const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
-    if (!canPerform(user(c).assignments, warehouseId, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN)) {
+    if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
       throw forbidden('Out of warehouse scope');
     }
   }
@@ -691,10 +913,10 @@ app.post('/api/v1/movements/consumption', async (c) => {
 // ------------------------------------------------------- マイナス在庫承認
 
 app.post('/api/v1/negative-approvals', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  const rp = await requirePermission(c, Permission.NEGATIVE_REQUEST);
   const dto = parseWith(createApprovalSchema, await parseJson(c));
   const warehouseId = await warehouseIdOfStock(c, dto.stockId);
-  if (!canPerform(user(c).assignments, warehouseId, RoleCode.INVENTORY_STAFF, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN)) {
+  if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.NEGATIVE_REQUEST)) {
     throw forbidden('Out of warehouse scope');
   }
   const now = Date.now();
@@ -731,12 +953,12 @@ app.get('/api/v1/negative-approvals', async (c) => {
 });
 
 app.post('/api/v1/negative-approvals/:id/decide', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  const rp = await requirePermission(c, Permission.NEGATIVE_DECIDE);
   const id = Number(c.req.param('id'));
   const dto = parseWith(decideApprovalSchema, await parseJson(c));
   const approval = await approvalRow(c, id);
   const warehouseId = await warehouseIdOfStock(c, approval.stock_id);
-  if (!canPerform(user(c).assignments, warehouseId, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN)) {
+  if (!canPerformPermission(user(c).assignments, rp, warehouseId, Permission.NEGATIVE_DECIDE)) {
     throw forbidden('Out of warehouse scope');
   }
   if (approval.requested_by === user(c).userId) {
@@ -785,7 +1007,7 @@ async function approvalRow(c: AppContext, id: number): Promise<ApprovalDbRow> {
 // ---------------------------------------------------------------- 棚卸し
 
 app.post('/api/v1/stocktakes', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  await requirePermission(c, Permission.STOCKTAKES_MANAGE);
   const envelope = await coordinator(c).startStocktake({ actorId: user(c).userId });
   return respond(c, envelope);
 });
@@ -800,7 +1022,7 @@ app.get('/api/v1/stocktakes', async (c) => {
 });
 
 app.post('/api/v1/stocktakes/:id/finish', async (c) => {
-  requireRole(c, RoleCode.INVENTORY_MANAGER, RoleCode.SYSTEM_ADMIN);
+  await requirePermission(c, Permission.STOCKTAKES_MANAGE);
   const envelope = await coordinator(c).finishStocktake({
     actorId: user(c).userId,
     stocktakeId: Number(c.req.param('id')),
@@ -816,7 +1038,7 @@ interface AlertRow extends StockViewRow {
 }
 
 app.get('/api/v1/alerts', async (c) => {
-  assertHasAssignments(user(c));
+  await requirePermission(c, Permission.ALERTS_READ);
   const reachable = reachableWarehouseIds(user(c).assignments);
   if (reachable !== null && reachable.length === 0) return c.json([]);
   let sql = `SELECT s.id, s.location_id, s.lot_id, s.quantity, s.version,
@@ -856,6 +1078,179 @@ app.get('/api/v1/alerts', async (c) => {
     if (r.quantity >= 0 && r.quantity <= r.safety_stock) alerts.push({ type: 'LOW_STOCK', ...base });
   }
   return c.json(alerts);
+});
+
+// ---------------------------------------------------------------- 管理 (権限・ユーザー)
+
+// ロール一覧 (roles テーブルが空なら既知の 5 ロールで代替)
+async function listRoles(c: AppContext): Promise<{ code: string; name: string }[]> {
+  try {
+    const { results } = await c.env.DB.prepare('SELECT code, name FROM roles ORDER BY code ASC').all<{
+      code: string;
+      name: string;
+    }>();
+    if (results.length > 0) return results;
+  } catch {
+    // roles 未投入の環境ではフォールバックする
+  }
+  return ALL_ROLE_CODES.map((code) => ({ code, name: code }));
+}
+
+const rolePermissionsBodySchema = z.object({
+  permissions: z.array(z.string().min(1)),
+});
+
+const userRolesBodySchema = z.object({
+  assignments: z.array(
+    z.object({
+      roleCode: z.string().min(1),
+      warehouseId: z.union([z.number().int().positive(), z.null()]),
+    }),
+  ),
+});
+
+app.get('/api/v1/admin/permissions', async (c) => {
+  assertHasAssignments(user(c));
+  const rp = await loadRolePermissions(c);
+  if (
+    !hasPermission(user(c).assignments, rp, Permission.ADMIN_PERMISSIONS) &&
+    !hasPermission(user(c).assignments, rp, Permission.ADMIN_USERS)
+  ) {
+    throw forbidden('Insufficient permission');
+  }
+  // カタログは DB が正。未投入ならコード側カタログを返す
+  let catalog: readonly { key: string; label: string; description: string | null }[] = PERMISSION_CATALOG;
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT key, label, description FROM permissions ORDER BY rowid ASC',
+    ).all<{ key: string; label: string; description: string | null }>();
+    if (results.length > 0) catalog = results;
+  } catch {
+    // permissions 未適用の環境ではカタログ定数を使う
+  }
+  const roles = await listRoles(c);
+  const matrix: Record<string, string[]> = {};
+  for (const role of roles) {
+    matrix[role.code] = [...(rp.get(role.code as RoleCode) ?? [])].sort();
+  }
+  return c.json({ permissions: catalog, roles, matrix });
+});
+
+app.put('/api/v1/admin/role-permissions/:roleCode', async (c) => {
+  await requirePermission(c, Permission.ADMIN_PERMISSIONS);
+  const roleCode = c.req.param('roleCode');
+  const roles = await listRoles(c);
+  if (!roles.some((r) => r.code === roleCode)) throw notFound('Role not found');
+  const dto = parseWith(rolePermissionsBodySchema, await parseJson(c));
+  const keys = [...new Set(dto.permissions)];
+  const unknown = keys.filter((k) => !PERMISSION_KEYS.has(k));
+  if (unknown.length > 0) {
+    throw new ApiError(422, 'UNKNOWN_PERMISSION', `Unknown permission keys: ${unknown.join(', ')}`);
+  }
+  // 締め出し防止: 権限管理そのものを失う変更は誰も自分を救えなくなるため拒否する
+  if (roleCode === RoleCode.SYSTEM_ADMIN && !keys.includes(Permission.ADMIN_PERMISSIONS)) {
+    throw new ApiError(
+      422,
+      'LOCKOUT_PREVENTION',
+      'SYSTEM_ADMIN must keep admin.permissions (lockout prevention)',
+    );
+  }
+  const now = Date.now();
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare('DELETE FROM role_permissions WHERE role_code = ?1').bind(roleCode),
+    ...keys.map((k) =>
+      c.env.DB
+        .prepare('INSERT INTO role_permissions (role_code, permission_key) VALUES (?1, ?2)')
+        .bind(roleCode, k),
+    ),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
+         VALUES (?1, 'role_permissions.update', 'role', ?2, ?3, ?4)`,
+      )
+      .bind(user(c).userId, roleCode, JSON.stringify({ permissions: keys }), now),
+  ];
+  await c.env.DB.batch(stmts);
+  return c.json({ roleCode, permissions: keys });
+});
+
+app.get('/api/v1/admin/users', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const { results: users } = await c.env.DB.prepare(
+    `SELECT id, external_id AS externalId, email, display_name AS displayName, status
+       FROM users ORDER BY id ASC`,
+  ).all<{
+    id: number;
+    externalId: string;
+    email: string;
+    displayName: string;
+    status: string;
+  }>();
+  const { results: roleRows } = await c.env.DB.prepare(
+    'SELECT user_id AS userId, role_code AS roleCode, warehouse_id AS warehouseId FROM user_roles ORDER BY id ASC',
+  ).all<{ userId: number; roleCode: string; warehouseId: number | null }>();
+  const byUser = new Map<number, { roleCode: string; warehouseId: number | null }[]>();
+  for (const r of roleRows) {
+    const list = byUser.get(r.userId) ?? [];
+    list.push({ roleCode: r.roleCode, warehouseId: r.warehouseId });
+    byUser.set(r.userId, list);
+  }
+  return c.json(users.map((u) => ({ ...u, assignments: byUser.get(u.id) ?? [] })));
+});
+
+app.put('/api/v1/admin/users/:userId/roles', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const userId = Number(c.req.param('userId'));
+  if (!Number.isInteger(userId) || userId <= 0) throw notFound('User not found');
+  const target = await c.env.DB.prepare('SELECT id FROM users WHERE id = ?1')
+    .bind(userId)
+    .first<{ id: number }>();
+  if (!target) throw notFound('User not found');
+  const dto = parseWith(userRolesBodySchema, await parseJson(c));
+  const roles = await listRoles(c);
+  const knownRoles = new Set(roles.map((r) => r.code));
+  for (const a of dto.assignments) {
+    if (!knownRoles.has(a.roleCode)) {
+      throw new ApiError(422, 'UNKNOWN_ROLE', `Unknown role: ${a.roleCode}`);
+    }
+  }
+  // 重複割当を除く (SQLite の UNIQUE は NULL スコープを区別しないためアプリ層でも担保)
+  const seen = new Set<string>();
+  const assignments = dto.assignments.filter((a) => {
+    const key = `${a.roleCode}:${a.warehouseId ?? 'null'}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  for (const a of assignments) {
+    if (a.warehouseId !== null) {
+      const wh = await c.env.DB.prepare(
+        'SELECT id FROM warehouses WHERE id = ?1 AND deleted_at IS NULL',
+      )
+        .bind(a.warehouseId)
+        .first<{ id: number }>();
+      if (!wh) {
+        throw new ApiError(422, 'WAREHOUSE_NOT_FOUND', `Warehouse not found: ${a.warehouseId}`);
+      }
+    }
+  }
+  const now = Date.now();
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare('DELETE FROM user_roles WHERE user_id = ?1').bind(userId),
+    ...assignments.map((a) =>
+      c.env.DB
+        .prepare('INSERT INTO user_roles (user_id, role_code, warehouse_id) VALUES (?1, ?2, ?3)')
+        .bind(userId, a.roleCode, a.warehouseId),
+    ),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, created_at)
+         VALUES (?1, 'user_roles.update', 'user', ?2, ?3, ?4)`,
+      )
+      .bind(user(c).userId, String(userId), JSON.stringify({ assignments }), now),
+  ];
+  await c.env.DB.batch(stmts);
+  return c.json({ userId, assignments });
 });
 
 // ------------------------------------------------------- リアルタイム (WS)

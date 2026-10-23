@@ -99,7 +99,7 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 | メソッド | パス | 備考 |
 |---|---|---|
 | GET | `/api/v1/health` | 認証不要 |
-| GET/POST | `/api/v1/master/products`、`/api/v1/products` | 作成は管理者・在庫管理者 |
+| GET/POST | `/api/v1/master/products`、`/api/v1/products` | 参照は `master.read`、作成は `master.write` (下記「権限」参照) |
 | GET/POST | `/api/v1/master/warehouses`、`/api/v1/warehouses` | 同上 |
 | GET/POST | `/api/v1/master/locations`、`/api/v1/locations` | 同上（倉庫スコープ検証あり） |
 | GET/POST | `/api/v1/master/lots`、`/api/v1/lots` | 同上 |
@@ -109,7 +109,7 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 | POST | `/api/v1/movements/consumption` | FEFO。`department` / `purpose` 必須。`negativeApprovalId` 任意 |
 | POST | `/api/v1/negative-approvals` | 申請（理由必須） |
 | GET | `/api/v1/negative-approvals` | 一覧（スコープ内） |
-| POST | `/api/v1/negative-approvals/:id/decide` | 承認/却下。在庫管理者・管理者のみ。自己承認は 422 |
+| POST | `/api/v1/negative-approvals/:id/decide` | 承認/却下 (`negative.decide`)。自己承認は 422 |
 | POST | `/api/v1/stocktakes` | 開始（全 stocks の帳簿数スナップショット） |
 | GET | `/api/v1/stocktakes` | 一覧 |
 | POST | `/api/v1/stocktakes/:id/finish` | 終了（confirmed） |
@@ -120,6 +120,73 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 クレーム (sub / email / name) から `users` へ自動同期されますが、**ロールの割当
 (`user_roles`) は自動では付かない**ため、後述の方法で管理者が付与してください。
 割当が 1 件も無いユーザーは業務 API がすべて 403 になります。
+
+## 権限 (ロールごとに DB で自由に設定可能)
+
+ロールは「権限の束」にすぎません。実効権限は D1 の `role_permissions` を正として
+リクエストごとに解決し、各エンドポイントはロール名ではなく権限キーで判定します
+(判定は「権限 AND 倉庫スコープ」。スコープは従来どおり `user_roles.warehouse_id`)。
+変更は再デプロイなしで即時反映されます。
+
+### 権限カタログ
+
+| キー | 内容 | 主な対象 |
+|---|---|---|
+| `stocks.read` | 在庫参照 | GET /stocks、/stocks/:id |
+| `alerts.read` | アラート参照 | GET /alerts |
+| `movements.inbound` | 入庫 | POST /movements/inbound |
+| `movements.consume` | 消費 | POST /movements/consumption |
+| `master.read` | マスタ参照 | GET /master/* (products / warehouses / locations / lots) |
+| `master.write` | マスタ登録・編集 | POST /master/* |
+| `negative.request` | マイナス在庫申請 | POST /negative-approvals |
+| `negative.decide` | マイナス在庫承認 | POST /negative-approvals/:id/decide |
+| `stocktakes.manage` | 棚卸し管理 | POST /stocktakes、/stocktakes/:id/finish |
+| `admin.users` | ユーザー管理 | GET /admin/users、PUT /admin/users/:id/roles |
+| `admin.permissions` | 権限管理 | PUT /admin/role-permissions/:roleCode |
+
+権限キーで判定していない読み取りもあります: 承認一覧 (GET /negative-approvals)、
+棚卸し一覧 (GET /stocktakes)、リアルタイム接続 (GET /realtime) は従来どおり
+「割当が 1 件以上あること」が条件です (表示範囲は倉庫スコープで絞られます)。
+
+### 既定マトリクス
+
+`migrations/0003_permissions.sql` の seed であり、`role_permissions` が空
+(マイグレーション未適用・未投入) の環境では `src/lib/access.ts` の
+`DEFAULT_ROLE_PERMISSIONS` がフォールバックとして使われます (どちらも同一内容)。
+内容は権限キー導入前の各エンドポイントの許可ロールを忠実に移行したものです。
+
+| ロール | 既定の権限 |
+|---|---|
+| SYSTEM_ADMIN | 全権限 |
+| INVENTORY_MANAGER | stocks.read / alerts.read / movements.inbound / movements.consume / master.read / master.write / negative.request / negative.decide / stocktakes.manage |
+| INVENTORY_STAFF | stocks.read / alerts.read / movements.inbound / movements.consume / master.read / negative.request |
+| VIEWER | stocks.read / alerts.read / master.read |
+| AUDITOR | stocks.read / alerts.read / master.read |
+
+### 管理 API (いずれも認証必須)
+
+| メソッド | パス | 必要な権限 | 備考 |
+|---|---|---|---|
+| GET | `/api/v1/admin/permissions` | `admin.permissions` または `admin.users` | カタログ・ロール一覧・現在のマトリクスを返す |
+| PUT | `/api/v1/admin/role-permissions/:roleCode` | `admin.permissions` | body `{ permissions: string[] }` で置き換え。未知のキーは 422、存在しないロールは 404 |
+| GET | `/api/v1/admin/users` | `admin.users` | ユーザー一覧と各自のロール割当を返す |
+| PUT | `/api/v1/admin/users/:userId/roles` | `admin.users` | body `{ assignments: [{ roleCode, warehouseId }] }` で置き換え。未知のロール・存在しない倉庫は 422、存在しないユーザーは 404 |
+
+マトリクスとロール付与の変更はすべて `audit_logs` に記録されます
+(action は `role_permissions.update` / `user_roles.update`)。
+
+**締め出し防止**: SYSTEM_ADMIN から `admin.permissions` を外す変更は 422
+(`LOCKOUT_PREVENTION`) で拒否されます。権限管理権限を持つロールが消えると
+誰もマトリクスを直せなくなるためです。それ以外の変更は自由に行えますが、
+変更は即時反映されるため、付与漏れに注意してください。
+
+### 管理画面
+
+`/admin/permissions` に最小の管理画面があります (トップページからもリンク)。
+`/login` と同じく localStorage の ID トークンで管理 API を呼びます。
+
+- ロール × 権限のチェックボックスマトリクス (保存ボタンで全ロール分を PUT)
+- ユーザー一覧と、ユーザーごとのロール割当の追加・削除・保存 (倉庫ID 空欄 = 全倉庫)
 
 ## デプロイ手順
 
@@ -193,6 +260,11 @@ npx wrangler d1 execute inventory-system --remote \
   --command "INSERT INTO user_roles (user_id, role_code, warehouse_id) VALUES (<users.id>, 'SYSTEM_ADMIN', NULL)"
 ```
 
+最初の管理者が付けば、以降のロール付与と権限マトリクスの変更は管理画面
+(`/admin/permissions`) または管理 API から行えます (「権限」の章を参照)。
+権限マトリクスは `0003_permissions.sql` の適用が前提です。未適用でも既定
+マトリクスで動作しますが、その場合は変更を保存できません。
+
 ## ローカル開発・テスト
 
 ```bash
@@ -202,9 +274,12 @@ npm test          # vitest (@cloudflare/vitest-pool-workers): 純粋ロジック
 npm run typecheck
 ```
 
-テストは 4 ファイル・23 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
+テストは 6 ファイル・36 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
 マイグレーションを適用し、Coordinator の RPC 経由で入庫→冪等リプレイ→消費→
 在庫不足 409→マイナス承認消費→棚卸し 423 を通す結合テストです。
+`test/permissions.spec.ts` はテスト用 OIDC トークンで HTTP 経路を通し、
+権限の付け外しによる可否の変化・締め出し防止・ロール付与 API を検証します。
+`test/access.spec.ts` は権限解決 (DB が正、空なら既定へフォールバック) の単体テストです。
 
 > メモ: `@cloudflare/vitest-pool-workers` は `@cloudflare/vitest-plugin` へ改名が
 > 予告されています（現行版で動作確認済み。移行は将来のメンテナンス時に）。
