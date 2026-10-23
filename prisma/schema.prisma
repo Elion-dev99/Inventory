@@ -1,0 +1,274 @@
+// 在庫管理システム ER (基本設計 v0.1 / 3章に対応)
+// 方針:
+// - ID は BigInt (PostgreSQL bigint IDENTITY)。時刻は UTC 保存 (timestamptz)。
+// - 列挙値は PostgreSQL enum を使わず String + アプリ/DB CHECK で管理する (設計規約)。
+// - CHECK 制約 (quantity >= 0 等) や棚卸しの部分ユニークインデックスは Prisma で表現できないため、
+//   マイグレーション SQL で追加すること (README「DB制約の注意」参照)。
+// - 引当 (reservation) は MVP 範囲外: stocks に reserved 列は持たない。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id          BigInt    @id @default(autoincrement())
+  externalId  String    @unique @map("external_id") // IdP の sub クレーム
+  email       String    @unique
+  displayName String    @map("display_name")
+  status      String    @default("active") // CHECK: active / disabled
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  userRoles               UserRole[]
+  movements               StockMovement[]           @relation("MovementActor")
+  requestedApprovals      NegativeStockApproval[]   @relation("ApprovalRequester")
+  decidedApprovals        NegativeStockApproval[]   @relation("ApprovalDecider")
+  auditLogs               AuditLog[]                @relation("AuditActor")
+  idempotencyKeys         IdempotencyKey[]
+
+  @@map("users")
+}
+
+model Role {
+  code String @id // SYSTEM_ADMIN / INVENTORY_MANAGER / INVENTORY_STAFF / VIEWER / AUDITOR
+  name String
+
+  userRoles UserRole[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  id          BigInt  @id @default(autoincrement())
+  userId      BigInt  @map("user_id")
+  roleCode    String  @map("role_code")
+  // 倉庫スコープ: NULL = 全倉庫。独立テーブルにはせず割当と一体で持つ (基本設計 3章の判断)。
+  warehouseId BigInt? @map("warehouse_id")
+
+  user      User       @relation(fields: [userId], references: [id])
+  role      Role       @relation(fields: [roleCode], references: [code])
+  warehouse Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  // NOTE: PostgreSQL の UNIQUE は NULL を区別するため、NULL スコープの重複防止はアプリ層でも検証する。
+  @@unique([userId, roleCode, warehouseId])
+  @@index([warehouseId])
+  @@map("user_roles")
+}
+
+model Warehouse {
+  id        BigInt    @id @default(autoincrement())
+  code      String    @unique
+  name      String
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  locations Location[]
+  userRoles UserRole[]
+
+  @@map("warehouses")
+}
+
+model Location {
+  id          BigInt    @id @default(autoincrement())
+  warehouseId BigInt    @map("warehouse_id")
+  code        String
+  name        String
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  stocks    Stock[]
+
+  @@unique([warehouseId, code])
+  @@map("locations")
+}
+
+model Product {
+  id              BigInt    @id @default(autoincrement())
+  sku             String    @unique
+  name            String
+  unit            String
+  barcode         String?
+  safetyStock     Int       @default(0) @map("safety_stock")
+  requiresExpiry  Boolean   @default(false) @map("requires_expiry")
+  expiryAlertDays Int?      @map("expiry_alert_days")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  deletedAt       DateTime? @map("deleted_at")
+
+  lots Lot[]
+
+  @@map("products")
+}
+
+model Lot {
+  id         BigInt    @id @default(autoincrement())
+  productId  BigInt    @map("product_id")
+  lotCode    String    @map("lot_code")
+  expiryDate DateTime? @map("expiry_date") @db.Date // 期限管理対象は NOT NULL (アプリ + CHECK で担保)
+  receivedAt DateTime  @default(now()) @map("received_at") // FEFO 同期限時のタイブレーカー
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id])
+  stocks  Stock[]
+
+  @@unique([productId, lotCode])
+  @@index([expiryDate])
+  @@map("lots")
+}
+
+model Stock {
+  id         BigInt   @id @default(autoincrement())
+  locationId BigInt   @map("location_id")
+  lotId      BigInt   @map("lot_id")
+  // CHECK (quantity >= 0) をマイグレーションで追加。マイナスは承認フロー経由の例外操作でのみ発生しうるため、
+  // 例外を許す場合は CHECK を外すのではなく、承認レコードと連動させる設計を詳細設計で確定する。
+  quantity   Int
+  version    Int      @default(1) // 楽観的ロック
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  location   Location                @relation(fields: [locationId], references: [id])
+  lot        Lot                     @relation(fields: [lotId], references: [id])
+  movements  StockMovement[]
+  takeLines  StocktakeLine[]
+  approvals  NegativeStockApproval[]
+
+  // 在庫の一意キー: SKU は lot 経由で決まるため (location_id, lot_id) が一意 = SKU x 保管場所 x ロット
+  @@unique([locationId, lotId])
+  @@index([lotId])
+  @@map("stocks")
+}
+
+model StockMovement {
+  id             BigInt   @id @default(autoincrement())
+  documentId     String   @map("document_id") @db.Uuid // 1業務操作 (伝票) を束ねる ID
+  stockId        BigInt   @map("stock_id")
+  // CHECK: IN / OUT / TRANSFER_OUT / TRANSFER_IN / ADJUST / CANCEL
+  type           String
+  quantityChange Int      @map("quantity_change")
+  quantityBefore Int      @map("quantity_before")
+  quantityAfter  Int      @map("quantity_after")
+  actorId        BigInt   @map("actor_id")
+  department     String? // 社内消費の用途 (部署・目的)
+  purpose        String?
+  reason         String?
+  createdAt      DateTime @default(now()) @map("created_at")
+  // 追記専用: updated_at は持たない。訂正は取消/調整伝票で行う。
+
+  stock Stock @relation(fields: [stockId], references: [id])
+  actor User  @relation("MovementActor", fields: [actorId], references: [id])
+
+  @@index([stockId, createdAt])
+  @@index([documentId])
+  @@map("stock_movements")
+}
+
+model Stocktake {
+  id          BigInt    @id @default(autoincrement())
+  // CHECK: in_progress / confirmed / cancelled
+  status      String    @default("in_progress")
+  startedBy   BigInt    @map("started_by")
+  startedAt   DateTime  @default(now()) @map("started_at")
+  confirmedAt DateTime? @map("confirmed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  lines StocktakeLine[]
+
+  // 同時 in_progress は 1 件のみ: 部分ユニークインデックスをマイグレーションで追加する。
+  @@map("stocktakes")
+}
+
+model StocktakeLine {
+  id              BigInt @id @default(autoincrement())
+  stocktakeId     BigInt @map("stocktake_id")
+  stockId         BigInt @map("stock_id")
+  bookQuantity    Int    @map("book_quantity")
+  countedQuantity Int?   @map("counted_quantity")
+
+  stocktake Stocktake @relation(fields: [stocktakeId], references: [id])
+  stock     Stock     @relation(fields: [stockId], references: [id])
+
+  @@unique([stocktakeId, stockId])
+  @@map("stocktake_lines")
+}
+
+model NegativeStockApproval {
+  id          BigInt    @id @default(autoincrement())
+  stockId     BigInt    @map("stock_id")
+  quantity    Int // マイナスを許容する数量
+  reason      String
+  // CHECK: pending / approved / rejected
+  status      String    @default("pending")
+  requestedBy BigInt    @map("requested_by")
+  approvedBy  BigInt?   @map("approved_by")
+  decidedAt   DateTime? @map("decided_at")
+  movementId  BigInt?   @map("movement_id") // 確定時に発行された伝票 (stock_movements) への参照 (FK は張らない)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  stock     Stock @relation(fields: [stockId], references: [id])
+  requester User  @relation("ApprovalRequester", fields: [requestedBy], references: [id])
+  approver  User? @relation("ApprovalDecider", fields: [approvedBy], references: [id])
+
+  // 自己承認禁止: アプリ層で必須検証するほか、DB でも
+  // CHECK (approved_by IS NULL OR approved_by <> requested_by) をマイグレーションで追加可能 (基本設計では DB CHECK でも担保)。
+  @@index([stockId, status])
+  @@map("negative_stock_approvals")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    BigInt?  @map("actor_id") // NULL = システム
+  action     String
+  targetType String   @map("target_type")
+  targetId   String   @map("target_id")
+  payload    Json?
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id])
+
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model IdempotencyKey {
+  id             BigInt    @id @default(autoincrement())
+  key            String
+  userId         BigInt    @map("user_id")
+  endpoint       String
+  requestHash    String    @map("request_hash")
+  responseStatus Int?      @map("response_status")
+  responseBody   Json?     @map("response_body")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  expiresAt      DateTime? @map("expires_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([key, userId])
+  @@map("idempotency_keys")
+}
+
+model OutboxEvent {
+  id            BigInt    @id @default(autoincrement())
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id")
+  eventType     String    @map("event_type")
+  payload       Json
+  createdAt     DateTime  @default(now()) @map("created_at")
+  publishedAt   DateTime? @map("published_at")
+
+  @@index([publishedAt, id])
+  @@map("outbox_events")
+}
