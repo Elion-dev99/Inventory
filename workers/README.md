@@ -66,7 +66,8 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
   をブロードキャストします。**再送保証はありません**: 切断中に起きた変更は届かないため、
   クライアントは再接続時に必ず REST (`GET /api/v1/stocks`) で再同期してください。
   ブラウザの WebSocket は Authorization ヘッダを付けられないため、`/realtime` では
-  `?access_token=<JWT>` クエリでも認証できます。
+  `?access_token=<JWT>` クエリでも認証できます。また Cookie セッション
+  (後述) でも認証でき、`/app` はそちらを使います。
 - `outbox_events` テーブルは作っていません。NestJS 版の Outbox は「DB 確定とイベント
   発行の原子性」のための仕組みですが、本版では確定とブロードキャストが同じ DO の
   処理内で直結しているため不要と判断しました。再送保証が必要になったら Phase 2 で
@@ -114,12 +115,52 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 | GET | `/api/v1/stocktakes` | 一覧 |
 | POST | `/api/v1/stocktakes/:id/finish` | 終了（confirmed） |
 | GET | `/api/v1/alerts` | `LOW_STOCK` / `EXPIRING` / `EXPIRED` / `NEGATIVE_STOCK` |
+| GET | `/api/v1/movements` (`productId` / `type` / `skip` / `take`) | 入出庫履歴 (`stocks.read`、倉庫スコープで絞り込み) |
+| GET | `/api/v1/me` | 自分の id / email / 割当 / 実効権限キー一覧 |
+| POST | `/api/v1/auth/logout` | Cookie セッションを破棄 |
 | GET | `/api/v1/realtime` | WebSocket アップグレード |
 
 認証: `Authorization: Bearer <OIDC アクセストークン>`。ユーザーは初回アクセス時に
 クレーム (sub / email / name) から `users` へ自動同期されますが、**ロールの割当
 (`user_roles`) は自動では付かない**ため、後述の方法で管理者が付与してください。
 割当が 1 件も無いユーザーは業務 API がすべて 403 になります。
+Bearer が無いリクエストは、後述の Cookie セッションでも認証できます (Bearer が優先)。
+
+## セッション認証とフロントエンド (/app)
+
+ブラウザ向けには、Google ログイン (認可コードフロー) の成功時にログイン
+セッションを発行します (`migrations/0004_sessions.sql`、`src/lib/session.ts`)。
+
+- `/auth/login` → Google で認証 → `/auth/callback` がコード交換・ID トークン
+  検証・`users` 同期まで行い、結果ページに「アプリを開く」リンクを出します。
+  このとき Cookie `session` (HttpOnly / Secure / SameSite=Lax、有効期限 8 時間)
+  が発行されます。DB の `sessions` にはトークン本体ではなく SHA-256 ハッシュ
+  のみを保存します。
+- 以後の API と WebSocket (`/api/v1/realtime`) は Cookie で認証できます。
+  ログアウトは `POST /api/v1/auth/logout` でセッション行を削除し Cookie を失効させます。
+- セッション経由では `users` を新規作成しません (行が無い・無効化済み・期限切れは 401)。
+
+### 画面 (/app)
+
+Worker から配信する SPA です (`src/app/`。追加のビルド基盤なしで wrangler の
+バンドルに載ります)。未ログインで開くと Google ログインへの導線が出ます。
+
+| 画面 | 内容 |
+|---|---|
+| ダッシュボード | アラート件数と内訳、在庫レコード数・総数量、期限が近い在庫、棚卸し実施中バナー |
+| 在庫一覧 | キーワード検索、倉庫・保管場所フィルタ、期限切れ/接近の色分け |
+| 入庫 | 商品・ロット・場所・数量・期限を入力して登録 (`Idempotency-Key` は自動付与) |
+| 消費 | FEFO で消費し、どのロットから引かれたかを表示。マイナス在庫承認 ID の指定も可 |
+| 履歴 | 入出庫履歴 (種別・変化量・数量の前後・部署/用途) |
+| マスタ管理 | 商品・倉庫・保管場所・ロットの一覧と追加フォーム |
+| マイナス在庫 | 例外申請フォームと承認待ち一覧 (承認/却下) |
+| 棚卸し | 開始・終了と履歴。実施中は他操作が 423 になる旨を表示 |
+| アラート | 期限切れ・期限接近・在庫不足・マイナス在庫の一覧 |
+
+メニューとボタンは `/api/v1/me` の実効権限で出し分けます (サーバー側でも
+403 になるため、出し分けは UX 改善として)。在庫変更のブロードキャスト
+(`stock.changed` など) を WebSocket で受けると表示中データを再取得し、
+再接続時も REST で再同期します。
 
 ## 権限 (ロールごとに DB で自由に設定可能)
 
@@ -274,11 +315,13 @@ npm test          # vitest (@cloudflare/vitest-pool-workers): 純粋ロジック
 npm run typecheck
 ```
 
-テストは 6 ファイル・36 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
+テストは 7 ファイル・42 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
 マイグレーションを適用し、Coordinator の RPC 経由で入庫→冪等リプレイ→消費→
 在庫不足 409→マイナス承認消費→棚卸し 423 を通す結合テストです。
 `test/permissions.spec.ts` はテスト用 OIDC トークンで HTTP 経路を通し、
 権限の付け外しによる可否の変化・締め出し防止・ロール付与 API を検証します。
+`test/session.spec.ts` は /auth/callback (トークン交換は fetch 差し替えで模擬) の
+セッション発行から、Cookie での API・WebSocket 認証、ログアウトでの無効化までを通します。
 `test/access.spec.ts` は権限解決 (DB が正、空なら既定へフォールバック) の単体テストです。
 
 > メモ: `@cloudflare/vitest-pool-workers` は `@cloudflare/vitest-plugin` へ改名が
@@ -293,11 +336,10 @@ npm run typecheck
 - マスタ CRUD の完全版（取得 1 件・更新・削除、商品バーコード検索など）
 - 倉庫間・場所間の移動 (transfer) API
 - 棚卸しの実数入力 API と差異の承認フロー（現状は開始＝スナップショット、
-  終了＝confirmed のみ。差異の ADJUST 反映は未実装）
-- フロントエンド（画面は NestJS 版含め未着手）
+  終了＝confirmed のみ。差異の ADJUST 反映は未実装。/app の棚卸し画面も開始・終了のみ）
+- フロントエンドの本格的な作り込み（/app は実務に耐える最小構成。NestJS 版には画面なし）
 - リアルタイム配信の再送保証（Outbox 相当）。切断中の変更は再接続時の REST 再同期で吸収する前提
 - IdP の amr クレーム検証（Face ID / パスキー MFA の必須化チェック）
-- ユーザー管理 API（ロール割当の付与・変更は当面 D1 への直接操作）
 - アラートの materialize / 通知（現状は stocks からの導出のみ、上限 1000 件）
 - 在庫一覧の本格的な検索（SKU 部分一致・期限ソート等）とページネーションの総件数返却
 - CI、負荷テスト、D1 のバックアップ運用手順

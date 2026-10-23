@@ -22,6 +22,7 @@ import {
   PERMISSION_CATALOG,
   PERMISSION_KEYS,
   Permission,
+  permissionsOf,
   reachableWarehouseIds,
   resolveRolePermissions,
   RoleCode,
@@ -29,6 +30,13 @@ import {
   type RoleAssignment,
   type RolePermissionMap,
 } from './lib/access';
+import {
+  clearSessionCookieHeader,
+  createSession,
+  destroySession,
+  sessionCookieHeader,
+} from './lib/session';
+import { APP_HTML } from './app/page';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
@@ -75,12 +83,17 @@ app.get('/', (c) =>
 <li>ヘルスチェック: <a href="/api/v1/health">/api/v1/health</a></li>
 <li>API ベースパス: <code>/api/v1</code> (業務 API は認証が必要です)</li>
 </ul>
+<p><a href="/app">アプリを開く</a> (在庫管理の画面。ログインが必要です)</p>
 <p><a href="/login">Google でログイン</a> (業務 API の動作確認用ページ)</p>
 <p><a href="/admin/permissions">権限管理</a> (管理者用: ロールごとの権限とユーザーのロール付与)</p>
-<p>画面 (フロントエンド) は Phase 2 で提供予定です。</p>
 </body>
 </html>`),
 );
+
+// ------------------------------------------------------------ フロントエンド SPA
+// /app で配信する単一ページアプリ (src/app/)。認証は Cookie セッションで、
+// 未ログイン時はアプリ側が /api/v1/me の 401 を見てログイン導線を出す。
+app.get('/app', (c) => c.html(APP_HTML));
 
 // ------------------------------------------------------------ ログイン (動作確認用)
 // Google Identity Services で ID トークンを取得し、業務 API を呼ぶ最小ページ。
@@ -452,10 +465,15 @@ ${body}
     authUser.assignments.length > 0
       ? '<p>このまま業務 API を利用できます。</p>'
       : '<p>アカウントは作成されましたが、権限はまだ付いていません。この画面が出たことをチャットで教えてください。管理者ロールを付与します。</p>';
-  return page(
+  // ブラウザ向けにログインセッションを発行する (Cookie は HttpOnly)。
+  // 以後の API / WebSocket はこのセッションで認証できる。
+  const sessionToken = await createSession(c.env.DB, authUser.userId);
+  const res = page(
     'ログインしました',
-    `<p>メールアドレス: ${authUser.email}</p><p>ユーザー ID: ${authUser.userId}</p><p>現在のロール: ${roles}</p>${note}`,
+    `<p>メールアドレス: ${authUser.email}</p><p>ユーザー ID: ${authUser.userId}</p><p>現在のロール: ${roles}</p>${note}<p><a href="/app">アプリを開く</a></p>`,
   );
+  res.headers.append('Set-Cookie', sessionCookieHeader(sessionToken));
+  return res;
 });
 
 // ---------------------------------------------------------------- 認証
@@ -580,6 +598,73 @@ async function warehouseIdOfStock(c: AppContext, stockId: number): Promise<numbe
   if (!row) throw notFound('Stock not found');
   return row.warehouse_id;
 }
+
+// ------------------------------------------------- セッション / 自分自身 / 履歴
+
+/** 自分の情報と実効権限。/app の初期表示と権限出し分けに使う */
+app.get('/api/v1/me', async (c) => {
+  const rp = await loadRolePermissions(c);
+  const me = user(c);
+  return c.json({
+    id: me.userId,
+    email: me.email,
+    displayName: me.displayName,
+    assignments: me.assignments,
+    permissions: [...permissionsOf(me.assignments, rp)].sort(),
+  });
+});
+
+/** ログアウト: Cookie セッションを破棄し、Cookie 自体も失効させる */
+app.post('/api/v1/auth/logout', async (c) => {
+  try {
+    await destroySession(c.env.DB, c.req.raw);
+  } catch {
+    // sessions テーブル未適用の環境では破棄するものが無い
+  }
+  return c.json({ loggedOut: true }, 200, { 'Set-Cookie': clearSessionCookieHeader() });
+});
+
+/** 入出庫履歴 (stock_movements の参照)。スコープ外倉庫の履歴は出さない */
+app.get('/api/v1/movements', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const reachable = reachableWarehouseIds(user(c).assignments);
+  if (reachable !== null && reachable.length === 0) return c.json([]);
+  const conditions: string[] = [];
+  const params: (number | string)[] = [];
+  if (reachable !== null) {
+    conditions.push(`loc.warehouse_id IN (${reachable.map(() => '?').join(',')})`);
+    params.push(...reachable);
+  }
+  const productId = c.req.query('productId');
+  if (productId !== undefined) {
+    conditions.push('l.product_id = ?');
+    params.push(Number(productId));
+  }
+  const type = c.req.query('type');
+  if (type !== undefined) {
+    conditions.push('mv.type = ?');
+    params.push(type);
+  }
+  const skip = Number(c.req.query('skip') ?? 0);
+  const take = Math.min(Number(c.req.query('take') ?? 50), 200);
+  const sql =
+    `SELECT mv.id, mv.document_id AS documentId, mv.stock_id AS stockId, mv.type,
+            mv.quantity_change AS quantityChange, mv.quantity_before AS quantityBefore,
+            mv.quantity_after AS quantityAfter, mv.actor_id AS actorId,
+            mv.department, mv.purpose, mv.reason, mv.created_at AS createdAt,
+            s.location_id AS locationId, loc.warehouse_id AS warehouseId,
+            l.product_id AS productId, l.lot_code AS lotCode, p.sku
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN locations loc ON loc.id = s.location_id
+       JOIN lots l ON l.id = s.lot_id
+       JOIN products p ON p.id = l.product_id` +
+    (conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '') +
+    ' ORDER BY mv.id DESC LIMIT ? OFFSET ?';
+  params.push(take, skip);
+  const { results } = await c.env.DB.prepare(sql).bind(...params).all();
+  return c.json(results);
+});
 
 // ---------------------------------------------------------------- マスタ
 

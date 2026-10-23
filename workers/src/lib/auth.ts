@@ -2,6 +2,7 @@ import { createRemoteJWKSet, jwtVerify, type JWTPayload } from 'jose';
 import type { Env } from '../env';
 import type { RoleAssignment, RoleCode } from './access';
 import { ApiError, unauthorized } from './errors';
+import { resolveSessionUser } from './session';
 
 type Jwks = ReturnType<typeof createRemoteJWKSet>;
 
@@ -13,6 +14,8 @@ type Jwks = ReturnType<typeof createRemoteJWKSet>;
  * - 多要素認証 (Face ID / パスキー) は IdP 側で担保される (amr クレームで確認可能。
  *   検証の必須化は Phase 2)。
  * - OIDC_ISSUER_URL 未設定なら業務 API はすべて 401 (ヘルスチェックのみ公開)。
+ * - Bearer が無いリクエストは Cookie のログインセッションでも認証できる
+ *   (lib/session.ts。/auth/callback が Google ログイン成功時に発行する)。
  */
 
 const jwksCache = new Map<string, Jwks>();
@@ -116,10 +119,6 @@ export async function syncUserFromPayload(env: Env, payload: JWTPayload): Promis
 }
 
 export async function authenticate(request: Request, env: Env): Promise<AuthUser> {
-  const issuer = env.OIDC_ISSUER_URL ?? '';
-  if (!issuer) {
-    throw new ApiError(401, 'OIDC_NOT_CONFIGURED', 'OIDC is not configured (OIDC_ISSUER_URL)');
-  }
   const url = new URL(request.url);
   const header = request.headers.get('authorization');
   // WebSocket はブラウザから Authorization ヘッダを付けられないため、
@@ -128,10 +127,26 @@ export async function authenticate(request: Request, env: Env): Promise<AuthUser
   const token = header?.startsWith('Bearer ')
     ? header.slice('Bearer '.length)
     : queryToken ?? undefined;
-  if (!token) throw unauthorized('Bearer token is required');
+  if (token) {
+    const payload = await verifyToken(env, token);
+    return syncUserFromPayload(env, payload);
+  }
 
-  const payload = await verifyToken(env, token);
-  return syncUserFromPayload(env, payload);
+  // Bearer が無い場合は Cookie のログインセッションを引く (/auth/callback で
+  // 発行。ブラウザは Cookie を自動送信するため /app と WebSocket で使える)。
+  // sessions テーブル未適用の環境では例外を握って未認証に倒す。
+  try {
+    const sessionUser = await resolveSessionUser(env.DB, request);
+    if (sessionUser) return sessionUser;
+  } catch {
+    // テーブル未作成など。セッション経路を諦めて従来のエラーにする
+  }
+
+  const issuer = env.OIDC_ISSUER_URL ?? '';
+  if (!issuer) {
+    throw new ApiError(401, 'OIDC_NOT_CONFIGURED', 'OIDC is not configured (OIDC_ISSUER_URL)');
+  }
+  throw unauthorized('Bearer token is required');
 }
 
 /** ロール割当が 1 件も無いユーザーは業務 API を使えない */
