@@ -38,6 +38,7 @@ import {
   sessionCookieHeader,
 } from './lib/session';
 import { APP_HTML } from './app/page';
+import { APP_CSS } from './app/styles';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
@@ -190,45 +191,57 @@ document.getElementById('logout').onclick = function () {
 </html>`);
 });
 
-// ------------------------------------------------------------ 権限管理画面 (最小)
-// 静的ページ。/login と同様に localStorage の idToken を Authorization に使って
-// 管理 API を呼ぶ。権限が無い場合は API が 403 を返し、画面にエラー表示する。
+// ------------------------------------------------------------ 権限管理画面
+// /app と同じ Cookie セッションで管理 API を呼ぶ (Bearer トークンが localStorage に
+// あれば併用する)。スタイルも /app と共通 (APP_CSS)。
 app.get('/admin/permissions', (c) =>
   c.html(`<!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>権限管理 | 在庫管理システム</title></head>
-<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.6;">
-<h1>権限管理</h1>
-<p id="who"></p>
-<p id="status" style="color: #27632a;"></p>
-<p id="error" style="color: #b00020; white-space: pre-wrap;"></p>
+<title>権限管理 | 在庫管理システム</title>
+<style>${APP_CSS}
+td.perm-cell { text-align: center; }
+td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
+</style></head>
+<body>
+<header class="app-header">
+  <h1>権限管理</h1>
+  <span class="spacer"></span>
+  <span id="who" class="ws-label"></span>
+  <a href="/app">アプリへ戻る</a>
+</header>
+<main>
+<p id="status" style="color: var(--ok);"></p>
+<p id="error" style="color: var(--danger); white-space: pre-wrap;"></p>
+<div id="loginGuide" style="display:none; background:#fff; border:1px solid var(--line); border-radius:8px; padding:1rem;">
+  <p>ログインが必要です（セッションの有効期限は8時間です）。</p>
+  <p><a class="btn" href="/auth/login">Google でログインする</a></p>
+</div>
 
 <h2>ロール × 権限マトリクス</h2>
-<div id="matrix">読み込み中…</div>
-<button id="saveMatrix" style="padding: 0.5rem 1rem; margin-top: 0.5rem;">マトリクスを保存</button>
+<div class="table-wrap"><div id="matrix">読み込み中…</div></div>
+<button id="saveMatrix" class="btn" style="margin-top: 0.75rem;">マトリクスを保存</button>
 
 <h2>ユーザーとロール付与</h2>
 <div id="users">読み込み中…</div>
+</main>
 
 <script>
 function getToken() {
-  return localStorage.getItem('idToken') || sessionStorage.getItem('idToken') || '';
-}
-function decodeJwt(t) {
-  const p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-  return JSON.parse(decodeURIComponent(escape(atob(p))));
+  try { return localStorage.getItem('idToken') || sessionStorage.getItem('idToken') || ''; } catch (e) { return ''; }
 }
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 function setError(msg) { document.getElementById('error').textContent = msg; }
 async function api(path, opts) {
+  const headers = { 'Content-Type': 'application/json', ...((opts && opts.headers) || {}) };
   const t = getToken();
-  if (!t) throw new Error('未ログインです。先に /login でログインしてください。');
-  const res = await fetch(path, {
-    ...(opts || {}),
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + t, ...((opts && opts.headers) || {}) },
-  });
+  if (t) headers.Authorization = 'Bearer ' + t;
+  const res = await fetch(path, { credentials: 'same-origin', ...(opts || {}), headers });
   const text = await res.text();
+  if (res.status === 401) {
+    document.getElementById('loginGuide').style.display = '';
+    throw new Error('未ログインです。下のボタンからログインしてください。');
+  }
   if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text);
   return text ? JSON.parse(text) : null;
 }
@@ -241,14 +254,14 @@ let userList = [];
 function renderMatrix() {
   const el = document.getElementById('matrix');
   if (roleList.length === 0) { el.textContent = 'ロールがありません。'; return; }
-  let html = '<table border="1" cellspacing="0" cellpadding="4"><thead><tr><th>権限</th>';
+  let html = '<table><thead><tr><th>権限</th>';
   for (const r of roleList) html += '<th>' + r.code + '<br><small>' + r.name + '</small></th>';
   html += '</tr></thead><tbody>';
   for (const p of catalog) {
     html += '<tr><td><code>' + p.key + '</code><br><small>' + (p.label || '') + '</small></td>';
     for (const r of roleList) {
       const checked = (matrix[r.code] || []).includes(p.key) ? ' checked' : '';
-      html += '<td style="text-align:center"><input type="checkbox" data-role="' + r.code + '" data-perm="' + p.key + '"' + checked + '></td>';
+      html += '<td class="perm-cell"><input type="checkbox" data-role="' + r.code + '" data-perm="' + p.key + '"' + checked + '></td>';
     }
     html += '</tr>';
   }
@@ -281,8 +294,7 @@ function renderUsers() {
   el.innerHTML = '';
   for (const u of userList) {
     const box = document.createElement('div');
-    box.style.border = '1px solid #ccc';
-    box.style.padding = '0.75rem';
+    box.className = 'card';
     box.style.marginBottom = '0.75rem';
     const roleOptions = roleList.map((r) => '<option value="' + r.code + '">' + r.code + '</option>').join('');
     let rows = '';
@@ -341,18 +353,16 @@ async function onUserAction(act, userId, idx) {
 }
 
 async function loadAll() {
-  const t = getToken();
-  if (!t) {
-    document.getElementById('who').textContent = '未ログインです。';
-    setError('先に /login でログインしてください。');
+  try {
+    const me = await api('/api/v1/me');
+    document.getElementById('who').textContent = (me.user && me.user.email ? me.user.email : '') + ' でログイン中';
+  } catch (e) {
+    document.getElementById('who').textContent = '未ログイン';
     document.getElementById('matrix').textContent = '';
     document.getElementById('users').textContent = '';
+    setError(String(e && e.message ? e.message : e));
     return;
   }
-  try {
-    const d = decodeJwt(t);
-    document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub);
-  } catch (e) {}
   try {
     const data = await api('/api/v1/admin/permissions');
     catalog = data.permissions;
