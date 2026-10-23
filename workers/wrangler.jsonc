@@ -1,0 +1,42 @@
+{
+  // 在庫管理システム — Cloudflare Workers + D1 版 (無料・PCレス運用版)
+  // 手順書は同ディレクトリの README.md を参照。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inventory-system-workers",
+  "main": "src/index.ts",
+  // ローカルの workerd (1.20260815) が受理できる上限に合わせている。定期的に引き上げること
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "inventory-system",
+      // プレースホルダ。`wrangler d1 create inventory-system` の出力 ID に差し替える (README 手順参照)
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "INVENTORY_COORDINATOR",
+        "class_name": "InventoryCoordinator"
+      }
+    ]
+  },
+  // Durable Object クラスの宣言 (exports 形式。旧来の migrations とは併用しない)
+  "exports": {
+    "InventoryCoordinator": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "vars": {
+    // 非秘密の既定値。OIDC_ISSUER_URL / OIDC_JWKS_URL は Secret で登録する
+    "OIDC_AUDIENCE": "inventory-system",
+    "OIDC_CLIENT_ID": "inventory-system"
+  }
+}
