@@ -90,21 +90,31 @@ app.get('/login', (c) => {
 <div id="gbtn"></div>
 <p><a id="fallback" href="/auth/login" style="display:inline-block; padding: 0.5rem 1rem; border: 1px solid #888; border-radius: 6px; text-decoration: none;">Google でログイン (ボタンが出ない場合はこちら)</a></p>
 <p id="who"></p>
-<button id="apitest" style="display:none; padding: 0.5rem 1rem;">API をテストする (在庫一覧)</button>
-<button id="logout" style="display:none; padding: 0.5rem 1rem;">ログアウト</button>
+<button id="apitest" style="padding: 0.5rem 1rem;">API をテストする (在庫一覧)</button>
+<button id="logout" style="padding: 0.5rem 1rem;">ログアウト</button>
 <pre id="out" style="white-space: pre-wrap; background: #f4f4f4; padding: 1rem;"></pre>
 <script>
 function decodeJwt(t) {
   const p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
   return JSON.parse(decodeURIComponent(escape(atob(p))));
 }
+function getToken() {
+  return localStorage.getItem('idToken') || sessionStorage.getItem('idToken') || '';
+}
 function refresh() {
-  const t = sessionStorage.getItem('idToken');
-  document.getElementById('apitest').style.display = t ? '' : 'none';
-  document.getElementById('logout').style.display = t ? '' : 'none';
+  const t = getToken();
   if (t) {
     try { const d = decodeJwt(t); document.getElementById('who').textContent = 'ログイン中: ' + (d.email || d.sub); } catch (e) {}
-  } else { document.getElementById('who').textContent = ''; }
+  } else { document.getElementById('who').textContent = '未ログインです。'; }
+}
+async function runApiTest() {
+  const t = getToken();
+  if (!t) {
+    document.getElementById('out').textContent = '先に Google でログインしてください。';
+    return;
+  }
+  const r = await fetch('/api/v1/stocks', { headers: { Authorization: 'Bearer ' + t } });
+  document.getElementById('out').textContent = 'HTTP ' + r.status + '\n' + (await r.text());
 }
 window.onload = function () {
   let tries = 0;
@@ -115,9 +125,11 @@ window.onload = function () {
       google.accounts.id.initialize({
         client_id: '${clientId}',
         callback: function (res) {
+          localStorage.setItem('idToken', res.credential);
           sessionStorage.setItem('idToken', res.credential);
-          document.getElementById('out').textContent = 'ログインしました。「API をテストする」を押してください。';
+          document.getElementById('out').textContent = 'ログインしました。自動で API をテストします。';
           refresh();
+          runApiTest();
         },
       });
       google.accounts.id.renderButton(document.getElementById('gbtn'), { theme: 'outline', size: 'large' });
@@ -127,13 +139,11 @@ window.onload = function () {
     }
   }, 200);
   refresh();
+  if (getToken()) runApiTest();
 };
-document.getElementById('apitest').onclick = async function () {
-  const t = sessionStorage.getItem('idToken');
-  const r = await fetch('/api/v1/stocks', { headers: { Authorization: 'Bearer ' + t } });
-  document.getElementById('out').textContent = 'HTTP ' + r.status + '\n' + (await r.text());
-};
+document.getElementById('apitest').onclick = runApiTest;
 document.getElementById('logout').onclick = function () {
+  localStorage.removeItem('idToken');
   sessionStorage.removeItem('idToken');
   if (window.google && google.accounts && google.accounts.id) google.accounts.id.disableAutoSelect();
   document.getElementById('out').textContent = 'ログアウトしました。';
@@ -191,6 +201,7 @@ app.get('/auth/callback', (c) =>
     const expected = sessionStorage.getItem('oauthNonce') || cookieNonce;
     if (expected && payload.nonce !== expected) { msg.textContent = 'nonce が一致しません。もう一度ログインしてください。'; return; }
   } catch (e) { msg.textContent = 'トークンの形式が不正です。'; return; }
+  localStorage.setItem('idToken', token);
   sessionStorage.setItem('idToken', token);
   location.replace('/login');
 })();
