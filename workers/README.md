@@ -41,8 +41,13 @@ D1 (SQLite) — stocks / stock_movements / negative_stock_approvals / stocktakes
 ### 整合性設計（要点）
 
 - D1 には対話的トランザクションが無いので、在庫の全書き込みは単一の Durable Object
-  `InventoryCoordinator` を経由させます。DO はリクエストを直列に処理するため、
-  「読み取り → FEFO 配分 → 条件付き UPDATE → 台帳記録」を競合なく実行できます。
+  `InventoryCoordinator` を経由させます。書き込み系の公開メソッドはすべて
+  直列化キューを通して 1 件ずつ実行するため、「読み取り → FEFO 配分 →
+  条件付き UPDATE → 台帳記録」を競合なく実行できます（DO のハンドラは
+  D1 への await を跨いで他の RPC とインターリーブしうるため、キューによる
+  直列化が前提です。これが無いと、条件付き UPDATE が 0 件でもガードが
+  他者の更新後の状態と偶然一致して batch が確定し、台帳だけが記録される
+  事故が起きます。`test/concurrency.spec.ts` が回帰防止です）。
   Coordinator 以外は `stocks` / `stock_movements` へ書き込みません。
 - 更新は D1 の `batch()` で原子的に実行します。在庫の条件付き UPDATE
   （`quantity >= 必要数 AND version = 期待値`、version は +1）、`stock_movements` への
@@ -208,10 +213,11 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 | 消費 | FEFO で消費し、どのロットから引かれたかを表示。マイナス在庫承認 ID の指定も可 |
 | 移動 | 移動元・移動先・商品・数量 (ロット指定任意) を入力し、FEFO の内訳を表示 |
 | 履歴 | 入出庫履歴 (種別・変化量・数量の前後・部署/用途)。移動・調整は専用バッジで表示 |
-| マスタ管理 | 商品・倉庫・保管場所・ロットの一覧、追加・編集・削除フォーム、商品 CSV インポート |
+| マスタ管理 | 商品・倉庫・保管場所・ロットの一覧、追加フォーム、編集 (モーダルフォーム)・削除、商品 CSV インポート |
 | マイナス在庫 | 例外申請フォームと承認待ち一覧 (承認/却下) |
 | 棚卸し | 開始・実数入力・差異表示・承認/差し戻しと履歴。実施中・承認待ちは他操作が 423 になる旨を表示 |
 | アラート | 期限切れ・期限接近・在庫不足・マイナス在庫の一覧 |
+| 監査ログ | 監査ログの検索 (実行者・アクション・期間) とページング、データエクスポート (JSON) のダウンロード (`admin.users` がある場合のみ表示) |
 
 メニューとボタンは `/api/v1/me` の実効権限で出し分けます (サーバー側でも
 403 になるため、出し分けは UX 改善として)。在庫変更のブロードキャスト
@@ -269,6 +275,8 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 | PUT | `/api/v1/admin/role-permissions/:roleCode` | `admin.permissions` | body `{ permissions: string[] }` で置き換え。未知のキーは 422、存在しないロールは 404 |
 | GET | `/api/v1/admin/users` | `admin.users` | ユーザー一覧と各自のロール割当を返す |
 | PUT | `/api/v1/admin/users/:userId/roles` | `admin.users` | body `{ assignments: [{ roleCode, warehouseId }] }` で置き換え。未知のロール・存在しない倉庫は 422、存在しないユーザーは 404 |
+| GET | `/api/v1/admin/audit-logs` | `admin.users` | 監査ログを新しい順に返す。クエリ: `actor` (ユーザーID)、`action` (完全一致)、`from` / `to` (created_at の ms 範囲)、`limit` (既定 50、最大 200) / `offset`。応答は `{ items, total, limit, offset }`、`payload` は JSON として解釈した値 |
+| GET | `/api/v1/admin/export.json` | `admin.users` | 主要 15 テーブルの全データを JSON で返す (下記「バックアップとデータエクスポート」参照) |
 
 マトリクスとロール付与の変更はすべて `audit_logs` に記録されます
 (action は `role_permissions.update` / `user_roles.update`)。
@@ -285,6 +293,61 @@ Worker から配信する SPA です (`src/app/`。追加のビルド基盤な�
 
 - ロール × 権限のチェックボックスマトリクス (保存ボタンで全ロール分を PUT)
 - ユーザー一覧と、ユーザーごとのロール割当の追加・削除・保存 (倉庫ID 空欄 = 全倉庫)
+
+## バックアップとデータエクスポート
+
+### データエクスポート (export.json)
+
+`GET /api/v1/admin/export.json`（`admin.users`）は、業務データの主要
+15 テーブル（users / roles / user_roles / warehouses / locations / products /
+lots / stocks / stock_movements / stocktakes / stocktake_lines /
+negative_stock_approvals / audit_logs / permissions / role_permissions）の
+全行を `{ exportedAt, tables }` の JSON で返します。`/app` の監査ログ
+ビューからもダウンロードできます。調査・移行・簡易な控えに使えますが、
+スキーマを含まないため、復旧の正本は下記の SQL エクスポートです。
+
+含めないテーブルと理由:
+
+| テーブル | 理由 |
+|---|---|
+| `sessions` | ログインセッションのトークンハッシュ（認証情報）。復旧にも不要で、復旧後は再ログインで足りる |
+| `idempotency_keys` | 冪等リプレイ用の配送状態であり、業務データそのものではない |
+| `write_guards` | batch 原子性を担保するための内部の一時状態。通常は空で、復旧対象ではない |
+
+### バックアップ (D1 の SQL エクスポート)
+
+```bash
+npx wrangler d1 export inventory-system --remote --output=backup-YYYYMMDD.sql
+```
+
+- 推奨頻度は週 1 回を目安に、棚卸しの前・権限やマスタの大きな変更の前にも
+  取得します。保管先はアクセス権の管理された社内ストレージ等に日付つきで
+  世代を残してください（メールアドレス等の個人情報を含みます）。
+- 自動バックアップは実装していません。定期実行が必要なら、運用担当の
+  カレンダー運用か、別途 Cron Triggers 等での自動化を検討してください。
+
+### 復旧の考え方
+
+新しい D1 データベースを作ってバックアップ SQL を流し込み、`wrangler.jsonc`
+の `database_id` を差し替えて再デプロイするのが基本形です（既存 DB への
+上書き import は切り戻しができないため推奨しません）。セッションは
+引き継がれないため全員が再ログインし、バックアップ時点より後の変更は
+失われる前提で実績と突き合わせてから運用を再開します。
+具体的なコマンドは [管理者ガイド](docs/admin-guide.md) を参照してください。
+
+### 無料枠の監視
+
+Cloudflare ダッシュボードの Workers & Pages → 対象 Worker の Metrics
+（リクエスト数・エラー）と、D1 → 対象 DB の画面（読み書き行数・保存容量）で
+無料枠に対する使用量を確認できます。上限値と考え方は管理者ガイドの
+「無料枠の監視と有料移行の判断」を参照してください。
+
+## ドキュメント
+
+- [利用者マニュアル](docs/user-manual.md): ログイン、在庫の見方、入庫・消費・
+  移動、棚卸し、マイナス在庫、アラート、よくあるエラー
+- [管理者ガイド](docs/admin-guide.md): ユーザーとロール付与、権限マトリクス、
+  監査ログ、エクスポート、バックアップと復旧、無料枠と有料移行、IdP 設定
 
 ## デプロイ手順
 
@@ -377,9 +440,16 @@ npm test          # vitest (@cloudflare/vitest-pool-workers): 純粋ロジック
 npm run typecheck
 ```
 
-テストは 8 ファイル・56 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
+テストは 10 ファイル・67 件です。`test/coordinator.spec.ts` は実 D1 (miniflare) に
 マイグレーションを適用し、Coordinator の RPC 経由で入庫→冪等リプレイ→消費→
 在庫不足 409→マイナス承認消費→棚卸し 423 を通す結合テストです。
+`test/concurrency.spec.ts` は同時実行の必須観点です: 同一 Idempotency-Key の
+並行リクエスト（二重送信）が 1 回だけ適用されること、異なるキーの並行消費が
+在庫総量を超えないこと、疑似乱数の操作列の後も「stocks.quantity = 台帳の
+quantity_change 累計」が全行で一致しマイナスにならないこと、楽観ロック
+（version 条件 + write_guards）の SQL 契約を検証します。
+`test/admin-ops.spec.ts` は監査ログ閲覧（フィルタ・ページング）と
+データエクスポート（対象 15 テーブルと除外の確認）の結合テストです。
 `test/business.spec.ts` は 0005 適用後の環境で、移動 (FEFO / lot 指定 / 409 / 403 /
 423 / 冪等)、棚卸しの実数入力→差異承認→ADJUST 反映と差し戻し、マスタ CRUD、
 CSV エクスポート / インポートを通す結合テストです。
@@ -394,6 +464,13 @@ CSV エクスポート / インポートを通す結合テストです。
 > また `compatibility_date` は同梱 workerd が受理できる上限 (2026-08-01) に
 > 合わせています。定期的に引き上げてください。
 
+### CI
+
+GitHub Actions の `.github/workflows/workers-ci.yml` が、`workers/` への
+push / pull_request で `npm ci` → 型チェック (`tsc --noEmit`) → `npm test` →
+`wrangler deploy --dry-run` を実行します（Node 22）。本番デプロイは CI では
+行いません。
+
 ## 未実装・Phase 2 送り
 
 正直な一覧です。本版の Phase 1 では以下を意図的に省いています。
@@ -404,4 +481,5 @@ CSV エクスポート / インポートを通す結合テストです。
 - IdP の amr クレーム検証（Face ID / パスキー MFA の必須化チェック）
 - アラートの materialize / 通知（現状は stocks からの導出のみ、上限 1000 件）
 - 在庫一覧の本格的な検索（SKU 部分一致・期限ソート等）とページネーションの総件数返却
-- CI、負荷テスト、D1 のバックアップ運用手順
+- 負荷テスト（無料枠内での実測ベンチマーク）と、バックアップの自動実行
+  （手順自体は「バックアップとデータエクスポート」の節と管理者ガイドに記載）

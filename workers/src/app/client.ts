@@ -182,6 +182,7 @@ var VIEWS = [
   { id: 'negative', label: 'マイナス在庫', visible: function () { return can('negative.request') || can('negative.decide'); } },
   { id: 'stocktakes', label: '棚卸し', visible: function () { return true; } },
   { id: 'alerts', label: 'アラート', visible: function () { return can('alerts.read'); } },
+  { id: 'audit', label: '監査ログ', visible: function () { return can('admin.users'); } },
 ];
 function buildNav() {
   var h = '';
@@ -210,6 +211,7 @@ function showView(id) {
     negative: loadNegative,
     stocktakes: loadStocktakes,
     alerts: loadAlerts,
+    audit: loadAudit,
   };
   var fn = loaders[id];
   if (fn) fn();
@@ -558,8 +560,32 @@ function loadHistory() {
 }
 
 /* ---------------- master ---------------- */
-function askValue(label, current) {
-  return window.prompt(label, current === null || current === undefined ? '' : String(current));
+/* 編集はモーダル内のフォームで行う (prompt は使わない) */
+function closeModal() {
+  el('modalOverlay').style.display = 'none';
+  el('modalBox').innerHTML = '';
+}
+function fieldHtml(label, inputHtml) {
+  return '<div><label>' + esc(label) + '</label>' + inputHtml + '</div>';
+}
+/* submitFn は保存処理を行い、完了メッセージ文字列を resolve する Promise を返す */
+function openModal(title, fieldsHtml, submitFn) {
+  el('modalBox').innerHTML = '<h3>' + esc(title) + '</h3><div id="mdMsg"></div>' +
+    '<form class="grid" id="mdForm">' + fieldsHtml +
+    '<div><label>&nbsp;</label><span><button class="btn" type="submit">保存</button> ' +
+    '<button class="btn secondary" type="button" id="mdCancel">キャンセル</button></span></div></form>';
+  el('modalOverlay').style.display = '';
+  el('mdCancel').onclick = closeModal;
+  el('mdForm').onsubmit = function (ev) {
+    ev.preventDefault();
+    el('mdMsg').innerHTML = '';
+    submitFn().then(function (flash) {
+      closeModal();
+      masterDone(flash);
+    }).catch(function (e) {
+      el('mdMsg').innerHTML = msgHtml('error', errMsg(e));
+    });
+  };
 }
 function masterDone(flash) {
   state.flash = flash;
@@ -581,37 +607,49 @@ function onMasterAction(act, id) {
   if (kind === 'product') {
     var p = productOf(id);
     if (!p) return;
-    var name = askValue('商品名', p.name); if (name === null || name === '') return;
-    var unit = askValue('単位', p.unit); if (unit === null || unit === '') return;
-    var safety = askValue('安全在庫', p.safetyStock); if (safety === null) return;
-    var exp = askValue('有効期限 (1=必須, 0=不要)', p.requiresExpiry ? '1' : '0'); if (exp === null) return;
-    var days = askValue('アラート日数 (空欄で解除)', p.expiryAlertDays); if (days === null) return;
-    var body = {
-      name: name,
-      unit: unit,
-      safetyStock: Number(safety || 0),
-      requiresExpiry: exp === '1',
-      expiryAlertDays: days === '' ? null : Number(days),
-    };
-    api(base, { method: 'PUT', body: body }).then(function () { masterDone('商品を更新しました。'); }).catch(masterFail);
+    var pFields =
+      fieldHtml('商品名', '<input id="edName" required value="' + esc(p.name) + '">') +
+      fieldHtml('単位', '<input id="edUnit" required value="' + esc(p.unit) + '">') +
+      fieldHtml('バーコード (任意)', '<input id="edBarcode" value="' + esc(p.barcode || '') + '">') +
+      fieldHtml('安全在庫', '<input id="edSafety" type="number" min="0" step="1" value="' + p.safetyStock + '">') +
+      fieldHtml('有効期限', '<select id="edExpiry"><option value="">不要</option><option value="1"' + (p.requiresExpiry ? ' selected' : '') + '>必須</option></select>') +
+      fieldHtml('アラート日数 (空欄で解除)', '<input id="edDays" type="number" min="0" step="1" value="' + (p.expiryAlertDays === null || p.expiryAlertDays === undefined ? '' : p.expiryAlertDays) + '">');
+    openModal('商品を編集: ' + p.sku, pFields, function () {
+      var body = {
+        name: el('edName').value,
+        unit: el('edUnit').value,
+        barcode: el('edBarcode').value === '' ? null : el('edBarcode').value,
+        safetyStock: Number(el('edSafety').value || 0),
+        requiresExpiry: el('edExpiry').value === '1',
+        expiryAlertDays: el('edDays').value === '' ? null : Number(el('edDays').value),
+      };
+      return api(base, { method: 'PUT', body: body }).then(function () { return '商品を更新しました。'; });
+    });
     return;
   }
   if (kind === 'warehouse' || kind === 'location') {
     var row = kind === 'warehouse' ? warehouseOf(id) : locationOf(id);
     if (!row) return;
-    var code = askValue('コード', row.code); if (code === null || code === '') return;
-    var wname = askValue('名前', row.name); if (wname === null || wname === '') return;
-    api(base, { method: 'PUT', body: { code: code, name: wname } })
-      .then(function () { masterDone('更新しました。'); }).catch(masterFail);
+    var wFields =
+      fieldHtml('コード', '<input id="edCode" required value="' + esc(row.code) + '">') +
+      fieldHtml('名前', '<input id="edWName" required value="' + esc(row.name) + '">');
+    openModal((kind === 'warehouse' ? '倉庫' : '保管場所') + 'を編集', wFields, function () {
+      return api(base, { method: 'PUT', body: { code: el('edCode').value, name: el('edWName').value } })
+        .then(function () { return '更新しました。'; });
+    });
     return;
   }
   if (kind === 'lot') {
     var lot = lotOf(id);
     if (!lot) return;
-    var lotCode = askValue('ロット番号', lot.lotCode); if (lotCode === null || lotCode === '') return;
-    var expiry = askValue('有効期限 YYYY-MM-DD (空欄で期限なし)', lot.expiryDate); if (expiry === null) return;
-    api(base, { method: 'PUT', body: { lotCode: lotCode, expiryDate: expiry === '' ? null : expiry } })
-      .then(function () { masterDone('ロットを更新しました。'); }).catch(masterFail);
+    var lFields =
+      fieldHtml('ロット番号', '<input id="edLotCode" required value="' + esc(lot.lotCode) + '">') +
+      fieldHtml('有効期限 (空欄で期限なし)', '<input id="edLotExpiry" type="date" value="' + esc(lot.expiryDate || '') + '">');
+    openModal('ロットを編集', lFields, function () {
+      var exp = el('edLotExpiry').value;
+      return api(base, { method: 'PUT', body: { lotCode: el('edLotCode').value, expiryDate: exp === '' ? null : exp } })
+        .then(function () { return 'ロットを更新しました。'; });
+    });
   }
 }
 function onCsvImport() {
@@ -997,6 +1035,89 @@ function loadAlerts() {
     }).catch(function (e) {
       el('view').innerHTML = '<h2>アラート</h2>' + msgHtml('error', errMsg(e));
     });
+  });
+}
+
+/* ---------------- audit logs (admin) ---------------- */
+var auditState = { limit: 50, offset: 0, total: 0 };
+function loadAudit() {
+  el('view').innerHTML =
+    '<h2>監査ログ</h2>' +
+    '<div class="toolbar">' +
+    '<div><label>実行者 (ユーザーID)</label><input id="auActor" type="number" min="1"></div>' +
+    '<div><label>アクション</label><input id="auAction" type="text" placeholder="例: role_permissions.update"></div>' +
+    '<div><label>開始 (日時)</label><input id="auFrom" type="datetime-local"></div>' +
+    '<div><label>終了 (日時)</label><input id="auTo" type="datetime-local"></div>' +
+    '<div><label>&nbsp;</label><button class="btn" id="auSearch">検索</button></div>' +
+    '<div><label>&nbsp;</label><button class="btn secondary" id="auExport">データをエクスポート (JSON)</button></div>' +
+    '</div>' +
+    '<div id="auMsg"></div><div id="auBody"><p class="muted">読み込み中…</p></div>' +
+    '<div class="toolbar">' +
+    '<div><button class="btn secondary" id="auPrev">前へ</button></div>' +
+    '<div><span id="auPage" class="small muted"></span></div>' +
+    '<div><button class="btn secondary" id="auNext">次へ</button></div>' +
+    '</div>';
+  auditState.offset = 0;
+  el('auSearch').onclick = function () { auditState.offset = 0; fetchAudit(); };
+  el('auExport').onclick = downloadExport;
+  el('auPrev').onclick = function () {
+    if (auditState.offset > 0) { auditState.offset -= auditState.limit; fetchAudit(); }
+  };
+  el('auNext').onclick = function () {
+    if (auditState.offset + auditState.limit < auditState.total) { auditState.offset += auditState.limit; fetchAudit(); }
+  };
+  fetchAudit();
+}
+function fetchAudit() {
+  var q = '?limit=' + auditState.limit + '&offset=' + auditState.offset;
+  var actor = el('auActor').value;
+  if (actor) q += '&actor=' + encodeURIComponent(actor);
+  var action = el('auAction').value;
+  if (action) q += '&action=' + encodeURIComponent(action);
+  var from = el('auFrom').value;
+  if (from) q += '&from=' + new Date(from).getTime();
+  var to = el('auTo').value;
+  if (to) q += '&to=' + new Date(to).getTime();
+  api('/api/v1/admin/audit-logs' + q).then(function (r) {
+    auditState.total = r.total;
+    el('auPage').textContent = r.total === 0
+      ? '0 件'
+      : (r.offset + 1) + ' - ' + Math.min(r.offset + r.items.length, r.total) + ' / ' + r.total + ' 件';
+    el('auPrev').disabled = r.offset <= 0;
+    el('auNext').disabled = r.offset + r.items.length >= r.total;
+    if (!r.items.length) {
+      el('auBody').innerHTML = '<p class="muted">該当する監査ログがありません。</p>';
+      return;
+    }
+    var h = '<div class="table-wrap"><table><thead><tr><th>日時</th><th>ID</th><th>実行者</th><th>アクション</th><th>対象</th><th>内容</th></tr></thead><tbody>';
+    for (var i = 0; i < r.items.length; i++) {
+      var a = r.items[i];
+      h += '<tr><td>' + fmtDateTime(a.createdAt) + '</td><td>' + a.id + '</td><td>' +
+        (a.actorId === null ? '-' : a.actorId) + '</td><td>' + esc(a.action) + '</td><td>' +
+        esc(a.targetType + ' #' + a.targetId) + '</td><td>' +
+        esc(a.payload === null ? '' : JSON.stringify(a.payload)) + '</td></tr>';
+    }
+    h += '</tbody></table></div>';
+    el('auBody').innerHTML = h;
+  }).catch(function (e) {
+    el('auBody').innerHTML = msgHtml('error', errMsg(e));
+  });
+}
+function downloadExport() {
+  el('auMsg').innerHTML = '';
+  api('/api/v1/admin/export.json').then(function (data) {
+    var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'inventory-export.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    el('auMsg').innerHTML = msgHtml('success', 'エクスポートをダウンロードしました。');
+  }).catch(function (e) {
+    el('auMsg').innerHTML = msgHtml('error', errMsg(e));
   });
 }
 

@@ -101,6 +101,28 @@ interface ApprovalRow {
 }
 
 export class InventoryCoordinator extends DurableObject<Env> {
+  /**
+   * 書き込み系 RPC の直列化キュー。
+   * Durable Object のハンドラは D1 への await を跨いで他の RPC と
+   * インターリーブしうるため、「候補を読む -> 配分を計画 -> 条件付き UPDATE +
+   * ガード + 台帳を batch で確定」という一連が他の書き込みと混ざらないよう、
+   * 公開メソッドはすべてこのキューを通して 1 件ずつ実行する。
+   * これが崩れると、条件付き UPDATE が 0 件でもガードが「他者の更新後の状態」と
+   * 偶然一致して batch が確定し、台帳だけが記録される事故が起きる
+   * (test/concurrency.spec.ts が回帰防止)。
+   * WebSocket の fetch / メッセージ処理は書き込みをしないため対象外。
+   */
+  private writeQueue: Promise<void> = Promise.resolve();
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(fn);
+    this.writeQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   // ---------------------------------------------------------------- WebSocket
 
   override async fetch(request: Request): Promise<Response> {
@@ -260,11 +282,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
   // ------------------------------------------------------------------ 入庫
 
   async inbound(input: InboundInput): Promise<Envelope> {
-    try {
-      return await this.inboundInternal(input);
-    } catch (e) {
-      return this.errorEnvelope(e);
-    }
+    return this.runExclusive(async () => {
+      try {
+        return await this.inboundInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
   }
 
   private async inboundInternal(input: InboundInput): Promise<Envelope> {
@@ -410,11 +434,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
   // ------------------------------------------------------------------ 消費
 
   async consume(input: ConsumeInput): Promise<Envelope> {
-    try {
-      return await this.consumeInternal(input);
-    } catch (e) {
-      return this.errorEnvelope(e);
-    }
+    return this.runExclusive(async () => {
+      try {
+        return await this.consumeInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
   }
 
   private async consumeInternal(input: ConsumeInput): Promise<Envelope> {
@@ -609,11 +635,13 @@ export class InventoryCoordinator extends DurableObject<Env> {
   // ------------------------------------------------------------------ 移動
 
   async transfer(input: TransferInput): Promise<Envelope> {
-    try {
-      return await this.transferInternal(input);
-    } catch (e) {
-      return this.errorEnvelope(e);
-    }
+    return this.runExclusive(async () => {
+      try {
+        return await this.transferInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
   }
 
   /**
@@ -830,6 +858,16 @@ export class InventoryCoordinator extends DurableObject<Env> {
   // ---------------------------------------------------------------- 棚卸し
 
   async startStocktake(input: { actorId: number }): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.startStocktakeInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  private async startStocktakeInternal(input: { actorId: number }): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
@@ -901,6 +939,16 @@ export class InventoryCoordinator extends DurableObject<Env> {
    * 未入力 (counted_quantity IS NULL) の lines は帳簿どおりとして差異に数えない。
    */
   async finishStocktake(input: { actorId: number; stocktakeId: number }): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.finishStocktakeInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  private async finishStocktakeInternal(input: { actorId: number; stocktakeId: number }): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
@@ -992,6 +1040,20 @@ export class InventoryCoordinator extends DurableObject<Env> {
    * 差し戻し: 実数は保持したまま in_progress に戻す。
    */
   async decideStocktake(input: {
+    actorId: number;
+    stocktakeId: number;
+    approve: boolean;
+  }): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.decideStocktakeInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  private async decideStocktakeInternal(input: {
     actorId: number;
     stocktakeId: number;
     approve: boolean;

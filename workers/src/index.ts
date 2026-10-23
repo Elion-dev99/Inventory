@@ -1850,6 +1850,133 @@ app.put('/api/v1/admin/users/:userId/roles', async (c) => {
   return c.json({ userId, assignments });
 });
 
+// ------------------------------------------------------- 監査ログ / エクスポート
+
+interface AuditLogRow {
+  id: number;
+  actor_id: number | null;
+  action: string;
+  target_type: string;
+  target_id: string;
+  payload: string | null;
+  created_at: number;
+}
+
+function auditLogJson(r: AuditLogRow): Record<string, unknown> {
+  let payload: unknown = null;
+  if (r.payload !== null) {
+    try {
+      payload = JSON.parse(r.payload);
+    } catch {
+      payload = r.payload;
+    }
+  }
+  return {
+    id: r.id,
+    actorId: r.actor_id,
+    action: r.action,
+    targetType: r.target_type,
+    targetId: r.target_id,
+    payload,
+    createdAt: r.created_at,
+  };
+}
+
+/**
+ * 監査ログの閲覧 (admin.users)。新しい順にページングして返す。
+ * クエリ: actor (actor_id), action (完全一致), from / to (created_at の ms 範囲),
+ * limit (既定 50、最大 200) / offset (既定 0)。
+ */
+app.get('/api/v1/admin/audit-logs', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const conditions: string[] = [];
+  const params: (number | string)[] = [];
+  const actor = c.req.query('actor');
+  if (actor !== undefined && actor !== '') {
+    const actorId = Number(actor);
+    if (!Number.isInteger(actorId)) throw badRequest('actor must be a user id (integer)');
+    conditions.push('actor_id = ?');
+    params.push(actorId);
+  }
+  const action = c.req.query('action');
+  if (action !== undefined && action !== '') {
+    conditions.push('action = ?');
+    params.push(action);
+  }
+  const from = c.req.query('from');
+  if (from !== undefined && from !== '') {
+    const fromMs = Number(from);
+    if (!Number.isFinite(fromMs)) throw badRequest('from must be a millisecond timestamp');
+    conditions.push('created_at >= ?');
+    params.push(fromMs);
+  }
+  const to = c.req.query('to');
+  if (to !== undefined && to !== '') {
+    const toMs = Number(to);
+    if (!Number.isFinite(toMs)) throw badRequest('to must be a millisecond timestamp');
+    conditions.push('created_at <= ?');
+    params.push(toMs);
+  }
+  const limitRaw = Number(c.req.query('limit') ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 200) : 50;
+  const offsetRaw = Number(c.req.query('offset') ?? 0);
+  const offset = Number.isFinite(offsetRaw) ? Math.max(Math.trunc(offsetRaw), 0) : 0;
+  const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
+
+  const totalRow = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM audit_logs${where}`)
+    .bind(...params)
+    .first<{ n: number }>();
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, actor_id, action, target_type, target_id, payload, created_at
+       FROM audit_logs${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+  )
+    .bind(...params, limit, offset)
+    .all<AuditLogRow>();
+  return c.json({ items: results.map(auditLogJson), total: totalRow?.n ?? 0, limit, offset });
+});
+
+/**
+ * データエクスポート (admin.users)。業務データの主要テーブルを丸ごと JSON で返す。
+ * sessions (認証情報)、idempotency_keys と write_guards (配送・整合性担保の内部状態)
+ * は含めない (README「バックアップとデータエクスポート」参照)。
+ */
+const EXPORT_TABLES = [
+  'users',
+  'roles',
+  'user_roles',
+  'warehouses',
+  'locations',
+  'products',
+  'lots',
+  'stocks',
+  'stock_movements',
+  'stocktakes',
+  'stocktake_lines',
+  'negative_stock_approvals',
+  'audit_logs',
+  'permissions',
+  'role_permissions',
+] as const;
+
+app.get('/api/v1/admin/export.json', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const tables: Record<string, unknown[]> = {};
+  for (const table of EXPORT_TABLES) {
+    try {
+      const { results } = await c.env.DB.prepare(`SELECT * FROM ${table} ORDER BY rowid ASC`).all();
+      tables[table] = results;
+    } catch {
+      // マイグレーション未適用で存在しないテーブルは空配列にする
+      tables[table] = [];
+    }
+  }
+  return c.json(
+    { exportedAt: Date.now(), tables },
+    200,
+    { 'Content-Disposition': 'attachment; filename="inventory-export.json"' },
+  );
+});
+
 // ------------------------------------------------------- リアルタイム (WS)
 
 app.get('/api/v1/realtime', async (c) => {

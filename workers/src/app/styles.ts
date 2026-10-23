@@ -101,4 +101,18 @@ form.grid input, form.grid select, form.grid textarea {
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
 .section-box { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2.5rem 1rem;
+  z-index: 50;
+  overflow-y: auto;
+}
+.modal { background: #fff; border-radius: 8px; padding: 1rem 1.25rem; width: 100%; max-width: 520px; }
+.modal h3 { margin-top: 0; }
+.modal form.grid { border: none; padding: 0; background: transparent; }
 `;

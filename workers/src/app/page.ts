@@ -42,6 +42,10 @@ export const APP_HTML = `<!doctype html>
   <main id="view"></main>
 </div>
 
+<div id="modalOverlay" class="modal-overlay" style="display:none">
+  <div class="modal" id="modalBox"></div>
+</div>
+
 <script>${APP_JS}</script>
 </body>
 </html>`;
