@@ -23,6 +23,7 @@ export const FEATURE_CATALOG: readonly FeatureDef[] = [
   { key: 'purchase_orders', label: '発注・仕入先', default: true },
   { key: 'analytics', label: '分析レポート', default: true },
   { key: 'barcode_scan', label: 'バーコードスキャン', default: true },
+  { key: 'announcements', label: 'お知らせ', default: true },
 ];
 
 export const FEATURE_KEYS: ReadonlySet<string> = new Set(FEATURE_CATALOG.map((f) => f.key));

@@ -73,6 +73,7 @@ export const Permission = {
   ADMIN_USERS: 'admin.users',
   ADMIN_PERMISSIONS: 'admin.permissions',
   PLATFORM_ADMIN: 'platform.admin',
+  ANNOUNCEMENTS_WRITE: 'announcements.write',
 } as const;
 
 export type PermissionKey = (typeof Permission)[keyof typeof Permission];
@@ -83,7 +84,7 @@ export interface PermissionDef {
   description: string;
 }
 
-/** 権限カタログ (migrations/0003_permissions.sql / 0005 / 0007 の seed と一致させること) */
+/** 権限カタログ (migrations/0003_permissions.sql / 0005 / 0007 / 0013 の seed と一致させること) */
 export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.STOCKS_READ, label: '在庫参照', description: '在庫一覧・詳細の参照' },
   { key: Permission.ALERTS_READ, label: 'アラート参照', description: '期限・不足・マイナス在庫アラートの参照' },
@@ -100,6 +101,7 @@ export const PERMISSION_CATALOG: readonly PermissionDef[] = [
   { key: Permission.ADMIN_USERS, label: 'ユーザー管理', description: 'ユーザー一覧の参照とロール付与の変更' },
   { key: Permission.ADMIN_PERMISSIONS, label: '権限管理', description: 'ロール×権限マトリクスの変更' },
   { key: Permission.PLATFORM_ADMIN, label: '全体管理', description: 'システム全体 (全店舗) の管理。店舗ロールの権限解決には含めず、全体管理者かどうかは割当 (SYSTEM_ADMIN かつ store_id NULL) で判定する' },
+  { key: Permission.ANNOUNCEMENTS_WRITE, label: 'お知らせ投稿', description: 'お知らせの投稿・編集・削除' },
 ];
 
 export const PERMISSION_KEYS: ReadonlySet<string> = new Set(PERMISSION_CATALOG.map((p) => p.key));
@@ -140,6 +142,7 @@ export const DEFAULT_ROLE_PERMISSIONS: Readonly<Record<RoleCode, readonly Permis
     Permission.STOCKTAKES_MANAGE,
     Permission.PURCHASES_READ,
     Permission.PURCHASES_WRITE,
+    Permission.ANNOUNCEMENTS_WRITE,
   ],
   [RoleCode.INVENTORY_STAFF]: [
     Permission.STOCKS_READ,

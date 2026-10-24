@@ -58,3 +58,47 @@ export function iconResponse(name: string): Response | null {
   if (name === 'apple-touch-icon.png') return pngResponse(ICON_APPLE);
   return null;
 }
+
+/**
+ * Web Push 用 Service Worker (/sw.js)。
+ * push イベントで通知を表示し、クリックで /app を開く (既に開いていれば前面化)。
+ * ペイロードは lib/push.ts が送る JSON ({ title, body, url, announcementId })。
+ */
+export const SERVICE_WORKER_JS = `self.addEventListener('push', function (event) {
+  var data = {};
+  if (event.data) {
+    try { data = event.data.json(); } catch (e) { data = { title: 'お知らせ', body: event.data.text() }; }
+  }
+  var title = data.title || 'お知らせ';
+  var options = {
+    body: data.body || '',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    tag: data.announcementId ? 'announcement-' + data.announcementId : 'announcement',
+    data: { url: data.url || '/app', announcementId: data.announcementId || null }
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+self.addEventListener('notificationclick', function (event) {
+  event.notification.close();
+  var target = (event.notification.data && event.notification.data.url) || '/app';
+  event.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].url.indexOf('/app') !== -1 && 'focus' in list[i]) return list[i].focus();
+      }
+      if (clients.openWindow) return clients.openWindow(target);
+      return undefined;
+    })
+  );
+});
+`;
+
+export function serviceWorkerResponse(): Response {
+  return new Response(SERVICE_WORKER_JS, {
+    headers: {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}

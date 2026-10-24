@@ -44,6 +44,11 @@ import {
   type MaintenanceWindowRow,
 } from '../../workers/src/lib/maintenance';
 import { ApiError, badRequest, forbidden, notFound, unauthorized } from '../../workers/src/lib/errors';
+import {
+  announcementAdminJson,
+  type AnnouncementRow,
+} from '../../workers/src/lib/announcements';
+import { maybeSendAnnouncementPush } from '../../workers/src/lib/push';
 import { CONSOLE_HTML } from './console';
 
 /**
@@ -1728,6 +1733,8 @@ const PLATFORM_EXPORT_TABLES = [
   'purchase_orders',
   'purchase_order_lines',
   'platform_settings',
+  'announcements',
+  'announcement_reads',
 ] as const;
 
 app.get('/api/platform/export.json', async (c) => {
@@ -1744,6 +1751,150 @@ app.get('/api/platform/export.json', async (c) => {
   return c.json({ exportedAt: Date.now(), tables }, 200, {
     'Content-Disposition': 'attachment; filename="inventory-platform-export.json"',
   });
+});
+
+// ---------------------------------------------------------------- お知らせ
+// 店舗アプリと同じ announcements テーブルへの CRUD。全店舗宛・店舗宛のどちらも
+// 作れる (店舗アプリ側の投稿は自店舗宛 + SYSTEM_ADMIN の全店舗宛に制限される)。
+// 既読数 (readCount) と対象ユーザー数 (targetUsers) を付けて返す。
+// プッシュは workers 側 lib/push.ts を共有し、掲載中なら作成・更新時に即時送信する。
+// push_subscriptions は認証情報を含むためエクスポート対象には含めない (上記参照)。
+
+const platformAnnouncementBodySchema = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(5000),
+  priority: z.enum(['normal', 'important']).optional(),
+  /** 省略時・null は全店舗宛 */
+  storeId: z.number().int().positive().nullable().optional(),
+  /** 省略時は即時掲載 (現在時刻) */
+  startsAt: z.number().int().positive().optional(),
+  /** 省略時・null は無期限 */
+  endsAt: z.number().int().positive().nullable().optional(),
+  push: z.boolean().optional(),
+});
+
+async function platformAnnouncementRow(c: AppContext, id: number): Promise<AnnouncementRow> {
+  const row = await c.env.DB.prepare('SELECT * FROM announcements WHERE id = ?1')
+    .bind(id)
+    .first<AnnouncementRow>();
+  if (!row) throw notFound('Announcement not found');
+  return row;
+}
+
+app.get('/api/platform/announcements', async (c) => {
+  requirePlatformAdmin(c);
+  const { results } = await c.env.DB
+    .prepare('SELECT * FROM announcements ORDER BY created_at DESC, id DESC')
+    .all<AnnouncementRow>();
+  const items: Awaited<ReturnType<typeof announcementAdminJson>>[] = [];
+  for (const row of results) items.push(await announcementAdminJson(c.env.DB, row));
+  return c.json({ items });
+});
+
+app.post('/api/platform/announcements', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(platformAnnouncementBodySchema, await parseJson(c));
+  const storeId = dto.storeId ?? null;
+  if (storeId !== null) await storeRow(c, storeId); // 存在しない店舗は 404
+  const now = Date.now();
+  const startsAt = dto.startsAt ?? now;
+  const endsAt = dto.endsAt ?? null;
+  if (endsAt !== null && endsAt <= startsAt) {
+    throw new ApiError(422, 'INVALID_PERIOD', 'endsAt must be after startsAt');
+  }
+  const res = await c.env.DB
+    .prepare(
+      `INSERT INTO announcements
+         (store_id, title, body, priority, starts_at, ends_at, push, push_sent_at, created_by, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?9)`,
+    )
+    .bind(
+      storeId,
+      dto.title,
+      dto.body,
+      dto.priority ?? 'normal',
+      startsAt,
+      endsAt,
+      dto.push ? 1 : 0,
+      user(c).userId,
+      now,
+    )
+    .run();
+  const id = Number(res.meta.last_row_id);
+  await platformAudit(
+    c,
+    'platform.announcement.create',
+    'announcement',
+    String(id),
+    { title: dto.title, storeId, priority: dto.priority ?? 'normal', push: dto.push === true },
+    storeId,
+  );
+  const row = await platformAnnouncementRow(c, id);
+  // 掲載中なら即時プッシュ (VAPID 未設定環境ではスキップされる)
+  await maybeSendAnnouncementPush(c.env.DB, c.env, row, now);
+  return c.json(await announcementAdminJson(c.env.DB, await platformAnnouncementRow(c, id)), 201);
+});
+
+app.put('/api/platform/announcements/:id', async (c) => {
+  requirePlatformAdmin(c);
+  const row = await platformAnnouncementRow(c, Number(c.req.param('id')));
+  const dto = parseWith(platformAnnouncementBodySchema, await parseJson(c));
+  const storeId = dto.storeId === undefined ? row.store_id : dto.storeId;
+  if (storeId !== null) await storeRow(c, storeId);
+  const now = Date.now();
+  const startsAt = dto.startsAt ?? row.starts_at;
+  const endsAt = dto.endsAt === undefined ? row.ends_at : dto.endsAt;
+  if (endsAt !== null && endsAt <= startsAt) {
+    throw new ApiError(422, 'INVALID_PERIOD', 'endsAt must be after startsAt');
+  }
+  await c.env.DB
+    .prepare(
+      `UPDATE announcements
+          SET store_id = ?1, title = ?2, body = ?3, priority = ?4, starts_at = ?5,
+              ends_at = ?6, push = ?7, updated_at = ?8
+        WHERE id = ?9`,
+    )
+    .bind(
+      storeId,
+      dto.title,
+      dto.body,
+      dto.priority ?? row.priority,
+      startsAt,
+      endsAt,
+      dto.push === undefined ? row.push : dto.push ? 1 : 0,
+      now,
+      row.id,
+    )
+    .run();
+  await platformAudit(
+    c,
+    'platform.announcement.update',
+    'announcement',
+    String(row.id),
+    { title: dto.title, storeId, priority: dto.priority ?? row.priority },
+    storeId,
+  );
+  const fresh = await platformAnnouncementRow(c, row.id);
+  await maybeSendAnnouncementPush(c.env.DB, c.env, fresh, now);
+  return c.json(await announcementAdminJson(c.env.DB, await platformAnnouncementRow(c, row.id)));
+});
+
+app.delete('/api/platform/announcements/:id', async (c) => {
+  requirePlatformAdmin(c);
+  const row = await platformAnnouncementRow(c, Number(c.req.param('id')));
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM announcement_reads WHERE announcement_id = ?1').bind(row.id),
+    c.env.DB.prepare('DELETE FROM announcements WHERE id = ?1').bind(row.id),
+  ]);
+  await platformAudit(
+    c,
+    'platform.announcement.delete',
+    'announcement',
+    String(row.id),
+    { title: row.title, storeId: row.store_id },
+    row.store_id,
+  );
+  return c.json({ deleted: true });
 });
 
 // ---------------------------------------------------------------- エラー

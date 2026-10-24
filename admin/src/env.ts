@@ -14,4 +14,11 @@ export interface AdminEnv {
   OIDC_CLIENT_ID?: string;
   /** Google OAuth のクライアントシークレット (Secret)。認可コード交換でのみ使用 */
   GOOGLE_CLIENT_SECRET?: string;
+  /**
+   * Web Push (VAPID) 用 (workers と同じ値を設定する)。
+   * 未設定ならプッシュ送信はスキップされ、お知らせ自体は通常どおり動く。
+   */
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY_JWK?: string;
+  VAPID_SUBJECT?: string;
 }

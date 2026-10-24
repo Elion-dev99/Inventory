@@ -13,7 +13,9 @@ import sessionScopeSql from '../../workers/migrations/0009_session_scope.sql?raw
 import platformSettingsSql from '../../workers/migrations/0010_platform_settings.sql?raw';
 import maintenanceWindowsSql from '../../workers/migrations/0011_maintenance_windows.sql?raw';
 import maintenanceExtrasSql from '../../workers/migrations/0012_maintenance_extras.sql?raw';
+import announcementsSql from '../../workers/migrations/0013_announcements.sql?raw';
 import { createSession } from '../../workers/src/lib/session';
+import { base64UrlDecode, base64UrlEncode } from '../../workers/src/lib/push';
 
 /**
  * 全体管理 Worker (inventory-admin-workers) の結合テスト。
@@ -35,10 +37,16 @@ const STAFF_NONCE = 'nonce-staff-1';
 
 interface TestEnv {
   DB: D1Database;
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY_JWK?: string;
+  VAPID_SUBJECT?: string;
 }
 const testEnv = env as unknown as TestEnv;
 
 let adminCookie = '';
+
+/** お知らせプッシュの送信先 (fetch 差し替えで捕捉する) */
+const capturedPushUrls: string[] = [];
 
 async function mintToken(
   sub: string,
@@ -126,6 +134,10 @@ beforeAll(async () => {
         headers: { 'Content-Type': 'application/json' },
       });
     }
+    if (url.startsWith('https://push.example.com/')) {
+      capturedPushUrls.push(url);
+      return new Response('', { status: 201 });
+    }
     return realFetch(input, init);
   }) as typeof fetch;
 
@@ -142,6 +154,7 @@ beforeAll(async () => {
     ...statementsOf(platformSettingsSql),
     ...statementsOf(maintenanceWindowsSql),
     ...statementsOf(maintenanceExtrasSql),
+    ...statementsOf(announcementsSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -1065,5 +1078,180 @@ describe('メンテナンスウィンドウ', () => {
     expect(removed.status).toBe(200);
     expect((removed.body.presets as { name: string }[]).map((p) => p.name)).not.toContain('テストプリセット');
     expect((removed.body.presets as unknown[]).length).toBe(4);
+  });
+});
+
+/**
+ * お知らせ (migration 0013) の全体管理 API:
+ * CRUD・既読集計 (readCount / targetUsers)・監査・プッシュ即時送信。
+ * セッションは platform スコープで直接発行する (ログイン検証は前段の
+ * describe が担う)。VAPID 鍵はテスト用を env に差し込む。
+ */
+describe('お知らせ (全体管理 API)', () => {
+  let adminSess = '';
+  let staffSess = '';
+  let firstId = 0;
+
+  interface AnnItem {
+    id: number;
+    storeId: number | null;
+    title: string;
+    readCount?: number;
+    targetUsers?: number;
+    pushSentAt: number | null;
+  }
+
+  beforeAll(async () => {
+    adminSess = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    staffSess = await createSession(testEnv.DB, 2, { scope: 'platform' });
+    // VAPID テスト鍵 (ES256) を生成して差し込む
+    const pair = await generateKeyPair('ES256', { extractable: true });
+    const privateJwk = await exportJWK(pair.privateKey);
+    const publicJwk = await exportJWK(pair.publicKey);
+    testEnv.VAPID_PRIVATE_KEY_JWK = JSON.stringify(privateJwk);
+    const raw = new Uint8Array(65);
+    raw[0] = 0x04;
+    raw.set(base64UrlDecode(publicJwk.x!), 1);
+    raw.set(base64UrlDecode(publicJwk.y!), 33);
+    testEnv.VAPID_PUBLIC_KEY = base64UrlEncode(raw);
+    testEnv.VAPID_SUBJECT = 'mailto:test@example.com';
+  });
+
+  it('未認証は 401、全体管理者でないユーザーは 403', async () => {
+    const anon = await api('/api/platform/announcements');
+    expect(anon.status).toBe(401);
+    const staff = await api('/api/platform/announcements', { cookie: staffSess });
+    expect(staff.status).toBe(403);
+    const staffPost = await api('/api/platform/announcements', {
+      cookie: staffSess,
+      method: 'POST',
+      body: { title: '権限なし', body: '本文' },
+    });
+    expect(staffPost.status).toBe(403);
+  });
+
+  it('全店舗宛・店舗宛を作成でき、targetUsers が付く', async () => {
+    const all = await api('/api/platform/announcements', {
+      cookie: adminSess,
+      method: 'POST',
+      body: { title: '全体へのお知らせ', body: '全店舗向け本文', storeId: null, priority: 'important' },
+    });
+    expect(all.status).toBe(201);
+    expect(all.body.storeId).toBeNull();
+    expect(all.body.readCount).toBe(0);
+    // 有効な全ユーザー (1, 2, 3) の 3 人
+    expect(all.body.targetUsers).toBe(3);
+    firstId = Number(all.body.id);
+
+    const store = await api('/api/platform/announcements', {
+      cookie: adminSess,
+      method: 'POST',
+      body: { title: '店舗1へのお知らせ', body: '店舗1向け本文', storeId: 1 },
+    });
+    expect(store.status).toBe(201);
+    // 店舗1の所属はユーザー 2 のみ
+    expect(store.body.targetUsers).toBe(1);
+
+    const audit = await testEnv.DB.prepare(
+      `SELECT COUNT(*) AS n FROM audit_logs WHERE action = 'platform.announcement.create'`,
+    ).first<{ n: number }>();
+    expect(audit?.n).toBe(2);
+  });
+
+  it('存在しない店舗への投稿は 404、期間不正は 422', async () => {
+    const missing = await api('/api/platform/announcements', {
+      cookie: adminSess,
+      method: 'POST',
+      body: { title: '無い店舗', body: '本文', storeId: 999 },
+    });
+    expect(missing.status).toBe(404);
+
+    const now = Date.now();
+    const bad = await api('/api/platform/announcements', {
+      cookie: adminSess,
+      method: 'POST',
+      body: { title: '期間不正', body: '本文', startsAt: now, endsAt: now - 1 },
+    });
+    expect(bad.status).toBe(422);
+    expect(bad.body.error).toBe('INVALID_PERIOD');
+  });
+
+  it('既読数が集計され、更新・削除ができる', async () => {
+    // ユーザー 2 が既読にしたことにする
+    await testEnv.DB.prepare(
+      'INSERT INTO announcement_reads (announcement_id, user_id, read_at) VALUES (?1, 2, ?2)',
+    )
+      .bind(firstId, Date.now())
+      .run();
+
+    const list = await api('/api/platform/announcements', { cookie: adminSess });
+    expect(list.status).toBe(200);
+    const items = (list.body.items ?? []) as AnnItem[];
+    expect(items.length).toBe(2);
+    const first = items.find((i) => i.id === firstId);
+    expect(first?.readCount).toBe(1);
+    expect(first?.targetUsers).toBe(3);
+
+    const updated = await api(`/api/platform/announcements/${firstId}`, {
+      cookie: adminSess,
+      method: 'PUT',
+      body: { title: '全体へのお知らせ (改)', body: '差し替え本文', storeId: null },
+    });
+    expect(updated.status).toBe(200);
+    expect(updated.body.title).toBe('全体へのお知らせ (改)');
+    expect(updated.body.readCount).toBe(1);
+
+    const del = await api(`/api/platform/announcements/${firstId}`, {
+      cookie: adminSess,
+      method: 'DELETE',
+    });
+    expect(del.status).toBe(200);
+    const after = await api('/api/platform/announcements', { cookie: adminSess });
+    const afterItems = (after.body.items ?? []) as AnnItem[];
+    expect(afterItems.some((i) => i.id === firstId)).toBe(false);
+    const reads = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM announcement_reads WHERE announcement_id = ?1',
+    )
+      .bind(firstId)
+      .first<{ n: number }>();
+    expect(reads?.n).toBe(0);
+  });
+
+  it('push=1 の掲載中は作成時に即送信され push_sent_at が記録される', async () => {
+    // ユーザー 2 の購読を用意する (暗号化の検証自体は workers 側テストで実施)
+    const pair = (await crypto.subtle.generateKey(
+      { name: 'ECDH', namedCurve: 'P-256' },
+      true,
+      ['deriveBits'],
+    )) as CryptoKeyPair;
+    const rawPub = new Uint8Array(
+      (await crypto.subtle.exportKey('raw', pair.publicKey)) as ArrayBuffer,
+    );
+    const now = Date.now();
+    await testEnv.DB.prepare(
+      `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent, created_at, updated_at)
+       VALUES (2, 'https://push.example.com/admin-ok', ?1, ?2, 'test', ?3, ?3)`,
+    )
+      .bind(base64UrlEncode(rawPub), base64UrlEncode(crypto.getRandomValues(new Uint8Array(16))), now)
+      .run();
+
+    capturedPushUrls.length = 0;
+    const res = await api('/api/platform/announcements', {
+      cookie: adminSess,
+      method: 'POST',
+      body: { title: 'プッシュ付きお知らせ', body: '本文', storeId: 1, push: true },
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.pushSentAt).not.toBeNull();
+    expect(capturedPushUrls).toEqual(['https://push.example.com/admin-ok']);
+  });
+
+  it('コンソール画面にお知らせセクションが含まれる', async () => {
+    const page = await SELF.fetch('https://example.com/');
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('data-sec="announce"');
+    expect(html).toContain('id="sec-announce"');
+    expect(html).toContain('/api/platform/announcements');
   });
 });

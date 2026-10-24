@@ -2,7 +2,7 @@ import { APP_CSS } from '../../workers/src/app/styles';
 
 /**
  * 全体管理コンソール画面 (GET /)。
- * 左サイドバー + 5 セクション (概要 / 店舗 / ユーザー / 監査 / システム) の
+ * 左サイドバー + 6 セクション (概要 / 店舗 / ユーザー / 監査 / お知らせ / システム) の
  * 単一ページ。デザインは店舗アプリの APP_CSS を流用し、サイドバー等の
  * 不足分だけ EXTRA_CSS で補う (フラットな単色と影のみ)。
  * 認証は admin_session Cookie (platform スコープのセッション) のみで、
@@ -78,6 +78,7 @@ export const CONSOLE_HTML = `<!doctype html>
     <button class="side-btn" data-sec="stores">店舗</button>
     <button class="side-btn" data-sec="users">ユーザー</button>
     <button class="side-btn" data-sec="audit">監査</button>
+    <button class="side-btn" data-sec="announce">お知らせ</button>
     <button class="side-btn" data-sec="system">システム</button>
   </aside>
   <main class="console-main">
@@ -132,6 +133,36 @@ export const CONSOLE_HTML = `<!doctype html>
   </div></div>
   <p class="small muted" id="auditTotal"></p>
   <div id="auditList"><div class="skl skl-row"></div></div>
+</section>
+
+<section id="sec-announce" class="console-sec" style="display:none;">
+  <h2>お知らせ</h2>
+  <p class="small muted">全店舗または店舗を指定して投稿できます。掲載期間を過ぎたお知らせは店舗アプリに表示されません。プッシュ通知は購読登録したユーザーへ届きます (掲載開始が未来のものは、店舗アプリ側の定期実行で送信されます)。</p>
+  <h3>投稿</h3>
+  <div class="group">
+    <div class="group-row static">
+      <input id="annTitle" type="text" placeholder="タイトル" style="flex:1;" maxlength="200">
+    </div>
+    <div class="group-row static">
+      <textarea id="annBody" rows="4" placeholder="本文" style="flex:1;"></textarea>
+    </div>
+    <div class="group-row static">
+      <label>重要度 <select id="annPriority">
+        <option value="normal">通常</option>
+        <option value="important">重要</option>
+      </select></label>
+      <label>対象 <select id="annStore"></select></label>
+      <label><input type="checkbox" id="annPush"> プッシュ通知を送る</label>
+    </div>
+    <div class="group-row static">
+      <label>掲載開始 <input id="annStart" type="datetime-local"></label>
+      <label>掲載終了 <input id="annEnd" type="datetime-local"></label>
+      <span class="small muted">終了を空にすると無期限</span>
+      <button class="btn small" id="annCreateBtn">投稿</button>
+    </div>
+  </div>
+  <h3>一覧</h3>
+  <div id="annList"><div class="skl skl-row"></div></div>
 </section>
 
 <section id="sec-system" class="console-sec" style="display:none;">
@@ -275,6 +306,7 @@ function showSection(name) {
   if (name === 'overview') loadOverview();
   if (name === 'users') loadUsers();
   if (name === 'audit') loadAudit();
+  if (name === 'announce') loadAnnouncements();
   if (name === 'system') loadSystem();
 }
 document.querySelectorAll('.side-btn').forEach((btn) => {
@@ -1081,6 +1113,107 @@ async function revokeAllSessions() {
   }
 }
 
+/* ---------------- お知らせ ---------------- */
+function toLocalInput(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function fillAnnounceStores() {
+  const sel = el('annStore');
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = '';
+  const all = document.createElement('option');
+  all.value = '';
+  all.textContent = '全店舗';
+  sel.appendChild(all);
+  for (const s of storeList) {
+    const opt = document.createElement('option');
+    opt.value = String(s.id);
+    opt.textContent = s.name + ' (' + s.code + ')';
+    sel.appendChild(opt);
+  }
+  if (current) sel.value = current;
+}
+function announceStateOf(a) {
+  const now = Date.now();
+  if (a.startsAt > now) return '<span class="badge">掲載前</span>';
+  if (a.endsAt && a.endsAt <= now) return '<span class="badge">終了</span>';
+  return '<span class="badge badge-ok">掲載中</span>';
+}
+async function loadAnnouncements() {
+  fillAnnounceStores();
+  if (!el('annStart').value) {
+    const d = new Date();
+    d.setSeconds(0, 0);
+    el('annStart').value = toLocalInput(d);
+  }
+  try {
+    const data = await api('/api/platform/announcements');
+    const items = data.items || [];
+    const box = el('annList');
+    if (items.length === 0) {
+      box.innerHTML = '<p class="muted">お知らせはまだありません。</p>';
+      return;
+    }
+    let html = '<div class="group">';
+    for (const a of items) {
+      html += '<div class="group-row static"><span class="row-label">' + esc(a.title) +
+        '<span class="small muted" style="display:block">' +
+        esc(storeName(a.storeId)) + ' ・ ' + fmtDate(a.startsAt) + ' 〜 ' + (a.endsAt ? fmtDate(a.endsAt) : '無期限') +
+        ' ・ 既読 ' + (a.readCount || 0) + '/' + (a.targetUsers || 0) + ' 人' +
+        (a.priority === 'important' ? ' ・ 重要' : '') +
+        (a.push ? ' ・ プッシュ' + (a.pushSentAt ? '送信済み' : '予定') : '') +
+        '</span></span>' + announceStateOf(a) +
+        '<button class="btn small secondary" data-ann-del="' + a.id + '">削除</button></div>';
+    }
+    box.innerHTML = html + '</div>';
+    box.querySelectorAll('button[data-ann-del]').forEach((btn) => {
+      btn.onclick = () => deleteAnnouncement(Number(btn.dataset.annDel));
+    });
+  } catch (e) {
+    setError(errText(e));
+  }
+}
+async function createAnnouncement() {
+  setError(''); setStatus('');
+  const title = el('annTitle').value.trim();
+  const body = el('annBody').value;
+  if (!title || !body) { setError('タイトルと本文を入力してください。'); return; }
+  const storeVal = el('annStore').value;
+  const payload = {
+    title: title,
+    body: body,
+    priority: el('annPriority').value,
+    storeId: storeVal === '' ? null : Number(storeVal),
+    startsAt: el('annStart').value ? new Date(el('annStart').value).getTime() : undefined,
+    endsAt: el('annEnd').value ? new Date(el('annEnd').value).getTime() : null,
+    push: el('annPush').checked,
+  };
+  try {
+    await api('/api/platform/announcements', { method: 'POST', body: JSON.stringify(payload) });
+    setStatus('お知らせを投稿しました。');
+    el('annTitle').value = '';
+    el('annBody').value = '';
+    el('annEnd').value = '';
+    el('annPush').checked = false;
+    loadAnnouncements();
+  } catch (e) {
+    setError(errText(e));
+  }
+}
+async function deleteAnnouncement(id) {
+  if (!confirm('このお知らせを削除しますか？')) return;
+  setError(''); setStatus('');
+  try {
+    await api('/api/platform/announcements/' + id, { method: 'DELETE' });
+    setStatus('お知らせ #' + id + ' を削除しました。');
+    loadAnnouncements();
+  } catch (e) {
+    setError(errText(e));
+  }
+}
+
 /* ---------------- 起動 ---------------- */
 async function loadAll() {
   let me;
@@ -1127,6 +1260,7 @@ el('auditSearchBtn').onclick = loadAudit;
 el('mntStartBtn').onclick = startMaintenanceNow;
 el('mntAddBtn').onclick = addWindow;
 el('revokeAllBtn').onclick = revokeAllSessions;
+el('annCreateBtn').onclick = createAnnouncement;
 loadAll();
 </script>
 </body>

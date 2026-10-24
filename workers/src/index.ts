@@ -50,7 +50,7 @@ import {
 } from './lib/session';
 import { APP_HTML } from './app/page';
 import { APP_CSS } from './app/styles';
-import { PWA_HEAD, manifestResponse, iconResponse } from './pwa';
+import { PWA_HEAD, manifestResponse, iconResponse, serviceWorkerResponse } from './pwa';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
@@ -90,6 +90,18 @@ import {
   resolvedMaintenanceMessage,
   type MaintenanceResolution,
 } from './lib/maintenance';
+import {
+  announcementAdminJson,
+  announcementJson,
+  getVisibleAnnouncement,
+  listVisibleAnnouncements,
+  markAnnouncementRead,
+  type AnnouncementRow,
+} from './lib/announcements';
+import {
+  maybeSendAnnouncementPush,
+  runScheduledAnnouncementPushes,
+} from './lib/push';
 
 export { InventoryCoordinator };
 
@@ -145,6 +157,8 @@ app.get('/app', (c) => c.html(APP_HTML));
 // PWA: ホーム画面追加でブラウザのバーを出さずにフルスクリーン起動する
 app.get('/manifest.webmanifest', () => manifestResponse());
 app.get('/icons/:name', (c) => iconResponse(c.req.param('name')) ?? c.notFound());
+// Web Push 用 Service Worker (push で通知表示、クリックで /app を開く)
+app.get('/sw.js', () => serviceWorkerResponse());
 
 // ------------------------------------------------------------ ログイン (動作確認用)
 // Google Identity Services で ID トークンを取得し、業務 API を呼ぶ最小ページ。
@@ -3244,6 +3258,297 @@ app.get('/api/v1/admin/export.json', async (c) => {
 });
 
 
+// ------------------------------------------------------------ お知らせ / Web プッシュ
+// 閲覧は全ログインユーザー (現在店舗で見える掲載中のみ)、投稿管理は
+// announcements.write 権限。機能フラグ announcements が OFF の店舗では
+// 閲覧・管理とも 403 FEATURE_DISABLED。プッシュ購読はフラグ対象外
+// (鍵未設定の環境でも購読 UI 側の出し分けで扱う)。
+
+const announcementBodySchema = z.object({
+  title: z.string().min(1).max(200),
+  body: z.string().min(1).max(5000),
+  priority: z.enum(['normal', 'important']).optional(),
+  /** 省略時は現在店舗宛。null は全店舗宛 (SYSTEM_ADMIN のみ) */
+  storeId: z.number().int().positive().nullable().optional(),
+  /** 省略時は即時掲載 (現在時刻) */
+  startsAt: z.number().int().positive().optional(),
+  /** 省略時・null は無期限 */
+  endsAt: z.number().int().positive().nullable().optional(),
+  push: z.boolean().optional(),
+});
+
+const pushSubscribeSchema = z.object({
+  endpoint: z.string().url().max(2048),
+  keys: z.object({
+    p256dh: z.string().min(1).max(256),
+    auth: z.string().min(1).max(128),
+  }),
+  userAgent: z.string().max(512).optional(),
+});
+
+const pushUnsubscribeSchema = z.object({ endpoint: z.string().min(1).max(2048) });
+
+async function loadAnnouncementRow(c: AppContext, id: number): Promise<AnnouncementRow> {
+  const row = await c.env.DB.prepare('SELECT * FROM announcements WHERE id = ?1')
+    .bind(id)
+    .first<AnnouncementRow>();
+  if (!row) throw notFound('Announcement not found');
+  return row;
+}
+
+/** 全店舗宛 (store_id NULL) を扱えるか: 全体管理者、または現在店舗の SYSTEM_ADMIN */
+function canPostToAllStores(ctx: StoreContext): boolean {
+  return (
+    ctx.isPlatformAdmin || ctx.assignments.some((a) => a.roleCode === RoleCode.SYSTEM_ADMIN)
+  );
+}
+
+/** このお知らせを管理 (編集・削除) できるか */
+function canManageAnnouncement(ctx: StoreContext, row: AnnouncementRow): boolean {
+  if (row.store_id === ctx.store.id) return true;
+  if (row.store_id === null) return canPostToAllStores(ctx);
+  return false;
+}
+
+async function announcementAudit(
+  c: AppContext,
+  action: string,
+  row: AnnouncementRow,
+  auditStoreId: number,
+): Promise<void> {
+  await c.env.DB
+    .prepare(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+       VALUES (?1, ?2, 'announcement', ?3, ?4, ?5, ?6)`,
+    )
+    .bind(
+      user(c).userId,
+      action,
+      String(row.id), // target_id は TEXT。数値のままだと D1 が "7.0" 形式で保存する
+      JSON.stringify({
+        title: row.title,
+        storeId: row.store_id,
+        priority: row.priority,
+        push: row.push === 1,
+      }),
+      auditStoreId,
+      Date.now(),
+    )
+    .run();
+}
+
+app.get('/api/v1/announcements', async (c) => {
+  const ctx = await storeContext(c);
+  await requireFeature(c, 'announcements');
+  const { items, unreadCount } = await listVisibleAnnouncements(
+    c.env.DB,
+    ctx.store.id,
+    user(c).userId,
+    Date.now(),
+  );
+  return c.json({ items, unreadCount });
+});
+
+app.get('/api/v1/announcements/:id', async (c) => {
+  const ctx = await storeContext(c);
+  await requireFeature(c, 'announcements');
+  const item = await getVisibleAnnouncement(
+    c.env.DB,
+    ctx.store.id,
+    user(c).userId,
+    Number(c.req.param('id')),
+    Date.now(),
+  );
+  if (!item) throw notFound('Announcement not found');
+  return c.json(item);
+});
+
+app.post('/api/v1/announcements/:id/read', async (c) => {
+  const ctx = await storeContext(c);
+  await requireFeature(c, 'announcements');
+  const id = Number(c.req.param('id'));
+  const item = await getVisibleAnnouncement(
+    c.env.DB,
+    ctx.store.id,
+    user(c).userId,
+    id,
+    Date.now(),
+  );
+  if (!item) throw notFound('Announcement not found');
+  await markAnnouncementRead(c.env.DB, id, user(c).userId, Date.now());
+  const { unreadCount } = await listVisibleAnnouncements(
+    c.env.DB,
+    ctx.store.id,
+    user(c).userId,
+    Date.now(),
+  );
+  return c.json({ read: true, unreadCount });
+});
+
+/** 投稿管理の一覧 (掲載前・終了を含む。自店舗宛 + 管理できる全店舗宛) */
+app.get('/api/v1/admin/announcements', async (c) => {
+  await requirePermission(c, Permission.ANNOUNCEMENTS_WRITE);
+  await requireFeature(c, 'announcements');
+  const ctx = await storeContext(c);
+  const { results } = await c.env.DB
+    .prepare(
+      canPostToAllStores(ctx)
+        ? 'SELECT * FROM announcements WHERE store_id = ?1 OR store_id IS NULL ORDER BY created_at DESC, id DESC'
+        : 'SELECT * FROM announcements WHERE store_id = ?1 ORDER BY created_at DESC, id DESC',
+    )
+    .bind(ctx.store.id)
+    .all<AnnouncementRow>();
+  const items: ReturnType<typeof announcementJson>[] = [];
+  for (const row of results) items.push(await announcementAdminJson(c.env.DB, row));
+  return c.json({ items });
+});
+
+app.post('/api/v1/admin/announcements', async (c) => {
+  await requirePermission(c, Permission.ANNOUNCEMENTS_WRITE);
+  await requireFeature(c, 'announcements');
+  const ctx = await storeContext(c);
+  const dto = parseWith(announcementBodySchema, await parseJson(c));
+  const storeId = dto.storeId === undefined ? ctx.store.id : dto.storeId;
+  if (storeId !== null && storeId !== ctx.store.id) {
+    throw forbidden('storeId must be the current store or null');
+  }
+  if (storeId === null && !canPostToAllStores(ctx)) {
+    throw forbidden('Only SYSTEM_ADMIN can post to all stores');
+  }
+  const now = Date.now();
+  const startsAt = dto.startsAt ?? now;
+  const endsAt = dto.endsAt ?? null;
+  if (endsAt !== null && endsAt <= startsAt) {
+    throw new ApiError(422, 'INVALID_PERIOD', 'endsAt must be after startsAt');
+  }
+  const res = await c.env.DB
+    .prepare(
+      `INSERT INTO announcements
+         (store_id, title, body, priority, starts_at, ends_at, push, push_sent_at, created_by, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?9)`,
+    )
+    .bind(
+      storeId,
+      dto.title,
+      dto.body,
+      dto.priority ?? 'normal',
+      startsAt,
+      endsAt,
+      dto.push ? 1 : 0,
+      user(c).userId,
+      now,
+    )
+    .run();
+  const row = await loadAnnouncementRow(c, Number(res.meta.last_row_id));
+  await announcementAudit(c, 'announcement.create', row, ctx.store.id);
+  // 掲載中なら即時プッシュ (未設定環境ではスキップされる)
+  await maybeSendAnnouncementPush(c.env.DB, c.env, row, now);
+  const fresh = await loadAnnouncementRow(c, row.id);
+  return c.json(await announcementAdminJson(c.env.DB, fresh), 201);
+});
+
+app.put('/api/v1/admin/announcements/:id', async (c) => {
+  await requirePermission(c, Permission.ANNOUNCEMENTS_WRITE);
+  await requireFeature(c, 'announcements');
+  const ctx = await storeContext(c);
+  const row = await loadAnnouncementRow(c, Number(c.req.param('id')));
+  if (!canManageAnnouncement(ctx, row)) throw forbidden('Cannot manage this announcement');
+  const dto = parseWith(announcementBodySchema, await parseJson(c));
+  const storeId = dto.storeId === undefined ? row.store_id : dto.storeId;
+  if (storeId !== null && storeId !== ctx.store.id) {
+    throw forbidden('storeId must be the current store or null');
+  }
+  if (storeId === null && !canPostToAllStores(ctx)) {
+    throw forbidden('Only SYSTEM_ADMIN can post to all stores');
+  }
+  const now = Date.now();
+  const startsAt = dto.startsAt ?? row.starts_at;
+  const endsAt = dto.endsAt === undefined ? row.ends_at : dto.endsAt;
+  if (endsAt !== null && endsAt <= startsAt) {
+    throw new ApiError(422, 'INVALID_PERIOD', 'endsAt must be after startsAt');
+  }
+  await c.env.DB
+    .prepare(
+      `UPDATE announcements
+          SET store_id = ?1, title = ?2, body = ?3, priority = ?4, starts_at = ?5,
+              ends_at = ?6, push = ?7, updated_at = ?8
+        WHERE id = ?9`,
+    )
+    .bind(
+      storeId,
+      dto.title,
+      dto.body,
+      dto.priority ?? row.priority,
+      startsAt,
+      endsAt,
+      dto.push === undefined ? row.push : dto.push ? 1 : 0,
+      now,
+      row.id,
+    )
+    .run();
+  const fresh = await loadAnnouncementRow(c, row.id);
+  await announcementAudit(c, 'announcement.update', fresh, ctx.store.id);
+  await maybeSendAnnouncementPush(c.env.DB, c.env, fresh, now);
+  return c.json(await announcementAdminJson(c.env.DB, await loadAnnouncementRow(c, row.id)));
+});
+
+app.delete('/api/v1/admin/announcements/:id', async (c) => {
+  await requirePermission(c, Permission.ANNOUNCEMENTS_WRITE);
+  await requireFeature(c, 'announcements');
+  const ctx = await storeContext(c);
+  const row = await loadAnnouncementRow(c, Number(c.req.param('id')));
+  if (!canManageAnnouncement(ctx, row)) throw forbidden('Cannot manage this announcement');
+  await c.env.DB.batch([
+    c.env.DB.prepare('DELETE FROM announcement_reads WHERE announcement_id = ?1').bind(row.id),
+    c.env.DB.prepare('DELETE FROM announcements WHERE id = ?1').bind(row.id),
+  ]);
+  await announcementAudit(c, 'announcement.delete', row, ctx.store.id);
+  return c.json({ deleted: true });
+});
+
+/** プッシュ購読用の公開鍵。VAPID 未設定なら 503 PUSH_NOT_CONFIGURED */
+app.get('/api/v1/push/public-key', (c) => {
+  const publicKey = c.env.VAPID_PUBLIC_KEY;
+  if (!publicKey) {
+    throw new ApiError(503, 'PUSH_NOT_CONFIGURED', 'Web Push is not configured');
+  }
+  return c.json({ publicKey });
+});
+
+/** 自分の購読を登録 (endpoint で upsert。他ユーザーの endpoint は自分へ付け替える) */
+app.post('/api/v1/push/subscribe', async (c) => {
+  const dto = parseWith(pushSubscribeSchema, await parseJson(c));
+  const now = Date.now();
+  await c.env.DB
+    .prepare(
+      `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+       ON CONFLICT(endpoint) DO UPDATE SET
+         user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+         user_agent = excluded.user_agent, updated_at = excluded.updated_at`,
+    )
+    .bind(
+      user(c).userId,
+      dto.endpoint,
+      dto.keys.p256dh,
+      dto.keys.auth,
+      dto.userAgent ?? c.req.header('user-agent') ?? null,
+      now,
+    )
+    .run();
+  return c.json({ subscribed: true });
+});
+
+/** 自分の購読を解除 */
+app.delete('/api/v1/push/subscribe', async (c) => {
+  const dto = parseWith(pushUnsubscribeSchema, await parseJson(c));
+  await c.env.DB
+    .prepare('DELETE FROM push_subscriptions WHERE endpoint = ?1 AND user_id = ?2')
+    .bind(dto.endpoint, user(c).userId)
+    .run();
+  return c.json({ unsubscribed: true });
+});
+
 // ------------------------------------------------------- リアルタイム (WS)
 
 app.get('/api/v1/realtime', async (c) => {
@@ -3267,4 +3572,16 @@ app.notFound((c) => c.json({ statusCode: 404, error: 'NOT_FOUND', message: 'Rout
 
 // 型参照用 (RPC の表面を保つ)
 export type { RoleAssignment };
-export default app;
+
+/**
+ * scheduled (Cron) ではお知らせプッシュの予約送信を行う
+ * (push=1・未送信・掲載期間に入ったものを送って push_sent_at を記録)。
+ * Cron トリガの登録自体は wrangler 側の設定 (デプロイ時)。
+ */
+const worker: ExportedHandler<Env> = {
+  fetch: (request, env, ctx) => app.fetch(request, env, ctx),
+  scheduled: (_controller, env, ctx) => {
+    ctx.waitUntil(runScheduledAnnouncementPushes(env.DB, env));
+  },
+};
+export default worker;

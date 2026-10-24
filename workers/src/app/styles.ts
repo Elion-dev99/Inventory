@@ -435,6 +435,56 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
   border-radius: 50%;
   background: #ff9500;
 }
+
+/* ---- お知らせ ---- */
+/* ホームタブの未読バッジ */
+.tab-item { position: relative; }
+.tab-badge {
+  position: absolute;
+  top: 0.05rem;
+  right: calc(50% - 1.6rem);
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 980px;
+  background: #ff3b30;
+  color: #fff;
+  font-size: 0.66rem;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+/* ホームのお知らせカード (左帯はヒーローと同じ作法。重要は警告色) */
+.notice-card {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: 0.95rem 1.05rem;
+  margin-bottom: 1rem;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--fg);
+}
+.notice-card.important { border-left-color: var(--warn); }
+.notice-card:active { background: var(--surface-2); }
+.notice-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.notice-head { display: flex; align-items: center; gap: 0.5rem; font-weight: 700; font-size: 0.95rem; }
+.notice-latest { display: block; color: var(--muted); font-size: 0.88rem; margin-top: 0.15rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.notice-latest.unread { color: var(--fg); font-weight: 600; }
+/* 一覧の未読ドット・メタ行、詳細の本文、購読エリア */
+.unread-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+.announce-title-line { display: block; }
+.announce-meta { display: flex; align-items: center; gap: 0.45rem; color: var(--muted); font-size: 0.8rem; margin-top: 0.2rem; }
+.announce-body { white-space: pre-wrap; line-height: 1.7; }
+.push-note { margin-bottom: 1rem; }
+.push-note p { margin: 0.6rem 0 0; }
 .msg.error { background: var(--danger-bg); color: var(--danger); }
 .msg.success { background: var(--ok-bg); color: var(--ok); }
 .msg.info { background: var(--info-bg); color: var(--info-fg); }

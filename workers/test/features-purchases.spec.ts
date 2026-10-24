@@ -185,7 +185,7 @@ describe('機能フラグ', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { features: Record<string, boolean> };
     expect(Object.keys(body.features).sort()).toEqual(
-      ['alerts', 'analytics', 'barcode_scan', 'csv', 'negative_stock', 'purchase_orders', 'stocktakes', 'transfers'].sort(),
+      ['alerts', 'analytics', 'announcements', 'barcode_scan', 'csv', 'negative_stock', 'purchase_orders', 'stocktakes', 'transfers'].sort(),
     );
     expect(Object.values(body.features).every((v) => v === true)).toBe(true);
 
@@ -216,8 +216,9 @@ describe('機能フラグ', () => {
     const list = await api('/api/v1/admin/features', adminToken);
     expect(list.status).toBe(200);
     const listBody = (await list.json()) as { features: { key: string; label: string; enabled: boolean }[] };
-    expect(listBody.features).toHaveLength(8);
+    expect(listBody.features).toHaveLength(9);
     expect(listBody.features.find((f) => f.key === 'transfers')).toMatchObject({ label: '在庫移動', enabled: true });
+    expect(listBody.features.find((f) => f.key === 'announcements')).toMatchObject({ label: 'お知らせ', enabled: true });
 
     await setFeature('transfers', false);
     const audit = await testEnv.DB.prepare(

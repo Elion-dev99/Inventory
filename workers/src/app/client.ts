@@ -277,6 +277,8 @@ var state = {
   masterError: '',
   flash: '',
   refreshTimer: null,
+  /* お知らせの未読数 (ドックのホームバッジと連動) */
+  annUnread: 0,
 };
 function can(p) { return state.perms[p] === true; }
 /* 機能フラグ (管理者がオフにした機能は画面からも消す。サーバー側でも 403 で強制される) */
@@ -440,6 +442,8 @@ var VIEWS = [
   { id: 'purchases', label: '発注', visible: function () { return can('purchases.read') && feat('purchase_orders'); } },
   { id: 'analytics', label: '分析', visible: function () { return can('stocks.read') && feat('analytics'); } },
   { id: 'audit', label: '監査ログ', visible: function () { return can('admin.users'); } },
+  { id: 'announcements', label: 'お知らせ', visible: function () { return feat('announcements'); } },
+  { id: 'announceAdmin', label: 'お知らせ管理', visible: function () { return can('announcements.write') && feat('announcements'); } },
 ];
 function viewDef(id) { for (var i = 0; i < VIEWS.length; i++) { if (VIEWS[i].id === id) return VIEWS[i]; } return null; }
 function viewVisible(id) { var v = viewDef(id); return v ? v.visible() : false; }
@@ -462,6 +466,7 @@ var ICON_PATHS = {
   doc: '<path d="M7 3.8h6.8L18.5 8.5v11a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-14.7a1 1 0 0 1 1-1z"/><path d="M13.8 3.8v4.7h4.7"/>',
   shield: '<path d="M12 3.5 5.5 6v5.2c0 4.6 2.8 7.5 6.5 9.3 3.7-1.8 6.5-4.7 6.5-9.3V6z"/>',
   cart: '<circle cx="9.5" cy="20" r="1.3"/><circle cx="17" cy="20" r="1.3"/><path d="M3 3.5h2.2l2.3 12h10.2l2-8.5H7"/>',
+  mega: '<path d="M3.8 10.8v2.9a.9.9 0 0 0 .9.9h1.7l5 4.6V5.3l-5 4.6H4.7a.9.9 0 0 0-.9.9z"/><path d="M15.2 9.4a3.9 3.9 0 0 1 0 5.7M18 6.7a7.8 7.8 0 0 1 0 11.1"/>',
   chart: '<path d="M4 20.5h16"/><path d="M7.5 20v-6M12 20V6.5M16.5 20v-9.5"/>',
   chevL: '<path d="M14.5 5.5 8 12l6.5 6.5"/>',
   chevR: '<path d="M9.5 5.5 16 12l-6.5 6.5"/>',
@@ -473,7 +478,7 @@ function icon(name, size) {
 
 /* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
 var RECORD_VIEWS = ['inbound', 'consume', 'transfer'];
-var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit'];
+var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin'];
 function tabOf(view) {
   if (view === 'dashboard') return 'dashboard';
   if (view === 'stocks') return 'stocks';
@@ -484,7 +489,8 @@ function tabOf(view) {
 function buildNav() {
   var active = tabOf(state.view);
   var h = '';
-  h += '<button class="tab-item' + (active === 'dashboard' ? ' active' : '') + '" data-tab="dashboard">' + icon('home', 25) + '<span>ホーム</span></button>';
+  var homeBadge = feat('announcements') && state.annUnread > 0 ? '<span class="tab-badge">' + state.annUnread + '</span>' : '';
+  h += '<button class="tab-item' + (active === 'dashboard' ? ' active' : '') + '" data-tab="dashboard">' + icon('home', 25) + '<span>ホーム</span>' + homeBadge + '</button>';
   if (can('stocks.read')) {
     h += '<button class="tab-item' + (active === 'stocks' ? ' active' : '') + '" data-tab="stocks">' + icon('box', 25) + '<span>在庫</span></button>';
   }
@@ -544,6 +550,289 @@ function openSheet() {
   }
 }
 function closeSheet() { el('sheetOverlay').style.display = 'none'; }
+/* ---------------- お知らせ ---------------- */
+function announcePeriodText(a) {
+  var s = fmtDateTime(a.startsAt);
+  return a.endsAt ? s + ' 〜 ' + fmtDateTime(a.endsAt) : s + ' 〜 (無期限)';
+}
+function loadAnnouncements() {
+  viewLoading('お知らせ');
+  getJson('/api/v1/announcements').then(function (data) {
+    state.annUnread = data.unreadCount || 0;
+    buildNav();
+    var h = '<h2>お知らせ</h2>';
+    h += '<div id="pushArea"></div>';
+    var items = data.items || [];
+    if (items.length === 0) {
+      h += '<p class="muted">お知らせはありません。</p>';
+    } else {
+      h += '<div class="group">';
+      for (var i = 0; i < items.length; i++) {
+        var a = items[i];
+        h += '<button class="group-row" data-ann="' + a.id + '">' +
+          (a.read ? '' : '<span class="unread-dot"></span>') +
+          '<span class="row-label"><span class="announce-title-line">' + esc(a.title) + '</span>' +
+          '<span class="announce-meta">' + esc(fmtDateTime(a.startsAt)) +
+          (a.storeId === null ? '<span>全店舗</span>' : '') +
+          (a.priority === 'important' ? '<span class="badge badge-warn">重要</span>' : '') +
+          '</span></span>' +
+          '<span class="chev">' + icon('chevR', 18) + '</span></button>';
+      }
+      h += '</div>';
+    }
+    el('view').innerHTML = h;
+    renderPushArea();
+    var rows = el('view').querySelectorAll('button[data-ann]');
+    for (var j = 0; j < rows.length; j++) {
+      rows[j].onclick = function () { openAnnouncement(Number(this.getAttribute('data-ann'))); };
+    }
+  }).catch(function (e) {
+    el('view').innerHTML = '<h2>お知らせ</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+function openAnnouncement(id) {
+  api('/api/v1/announcements/' + id).then(function (a) {
+    var h = '<h2>' + esc(a.title) + '</h2>';
+    h += '<p class="muted">' + esc(announcePeriodText(a)) + (a.storeId === null ? ' ・ 全店舗' : '') + '</p>';
+    if (a.priority === 'important') h += '<p><span class="badge badge-warn">重要</span></p>';
+    h += '<div class="card announce-body">' + esc(a.body) + '</div>';
+    h += '<p><button class="btn secondary" id="annBack">一覧へ戻る</button></p>';
+    el('view').innerHTML = h;
+    el('annBack').onclick = function () { showView('announcements'); };
+    window.scrollTo(0, 0);
+    /* 開いたら既読化し、ドックのバッジを更新する */
+    if (!a.read) {
+      api('/api/v1/announcements/' + id + '/read', { method: 'POST' }).then(function (r) {
+        state.annUnread = r.unreadCount || 0;
+        buildNav();
+      }).catch(function () {});
+    }
+  }).catch(function (e) {
+    el('view').innerHTML = '<h2>お知らせ</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+
+/* ---- プッシュ通知の購読 ---- */
+function pushSupported() {
+  return ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window);
+}
+function isIosSafariTab() {
+  var ua = navigator.userAgent || '';
+  if (!/iPhone|iPad|iPod/.test(ua)) return false;
+  var standalone = (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+  return !standalone;
+}
+function renderPushArea() {
+  var box = el('pushArea');
+  if (!box) return;
+  if (isIosSafariTab()) {
+    box.innerHTML = '<div class="card push-note">プッシュ通知は、ホーム画面に追加したアプリから開いたときに受け取れます。</div>';
+    return;
+  }
+  if (!pushSupported()) {
+    box.innerHTML = '<div class="card push-note">このブラウザはプッシュ通知に対応していません。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="card push-note"><div>新着のお知らせをプッシュ通知で受け取れます。</div><p><button class="btn" id="pushBtn" type="button">プッシュ通知を受け取る</button></p><div id="pushMsg"></div></div>';
+  el('pushBtn').onclick = subscribePush;
+  navigator.serviceWorker.ready.then(function (reg) {
+    return reg.pushManager.getSubscription();
+  }).then(function (sub) {
+    var cur = el('pushArea');
+    if (!cur || !sub) return;
+    cur.innerHTML = '<div class="card push-note"><div>プッシュ通知は有効です。</div><p><button class="btn secondary" id="pushOffBtn" type="button">通知を解除する</button></p><div id="pushMsg"></div></div>';
+    el('pushOffBtn').onclick = unsubscribePush;
+  }).catch(function () {});
+}
+function urlBase64ToUint8Array(base64String) {
+  var padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  var rawData = window.atob(base64);
+  var outputArray = new Uint8Array(rawData.length);
+  for (var i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+function subscribePush() {
+  var msg = el('pushMsg');
+  function fail(text) { if (msg) msg.innerHTML = msgHtml('error', text); }
+  api('/api/v1/push/public-key').then(function (data) {
+    return Notification.requestPermission().then(function (permission) {
+      if (permission !== 'granted') {
+        fail('通知が許可されませんでした。ブラウザの設定で通知を許可してください。');
+        return null;
+      }
+      return navigator.serviceWorker.ready.then(function (reg) {
+        return reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(data.publicKey),
+        });
+      });
+    });
+  }).then(function (sub) {
+    if (!sub) return;
+    var json = sub.toJSON();
+    return api('/api/v1/push/subscribe', {
+      method: 'POST',
+      body: { endpoint: json.endpoint, keys: json.keys },
+    }).then(function () { renderPushArea(); });
+  }).catch(function (e) {
+    if (e && e.code === 'PUSH_NOT_CONFIGURED') fail('プッシュ通知は未設定です (サーバー側で鍵が設定されていません)。');
+    else fail(errMsg(e));
+  });
+}
+function unsubscribePush() {
+  navigator.serviceWorker.ready.then(function (reg) {
+    return reg.pushManager.getSubscription();
+  }).then(function (sub) {
+    if (!sub) { renderPushArea(); return null; }
+    var endpoint = sub.endpoint;
+    return sub.unsubscribe().then(function () {
+      return api('/api/v1/push/subscribe', { method: 'DELETE', body: { endpoint: endpoint } });
+    }).then(function () { renderPushArea(); });
+  }).catch(function (e) {
+    var msg = el('pushMsg');
+    if (msg) msg.innerHTML = msgHtml('error', errMsg(e));
+  });
+}
+
+/* ---------------- お知らせ管理 ---------------- */
+var announceAdminItems = [];
+var announceEditId = null;
+var announceAdminFlash = '';
+function announceStateLabel(a) {
+  var now = Date.now();
+  if (a.startsAt > now) return '<span class="badge">掲載前</span>';
+  if (a.endsAt && a.endsAt <= now) return '<span class="badge">終了</span>';
+  return '<span class="badge badge-ok">掲載中</span>';
+}
+function toLocalInputValue(ts) {
+  var d = new Date(ts);
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function canPostAllStores() {
+  if (!state.me) return false;
+  if (state.me.isPlatformAdmin) return true;
+  var storeId = state.me.currentStore ? state.me.currentStore.id : null;
+  var list = state.me.assignments || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].storeId === storeId && list[i].roleCode === 'SYSTEM_ADMIN') return true;
+  }
+  return false;
+}
+function loadAnnounceAdmin() {
+  viewLoading('お知らせ管理');
+  api('/api/v1/admin/announcements').then(function (data) {
+    announceAdminItems = data.items || [];
+    var editing = null;
+    if (announceEditId !== null) {
+      for (var ei = 0; ei < announceAdminItems.length; ei++) {
+        if (announceAdminItems[ei].id === announceEditId) editing = announceAdminItems[ei];
+      }
+      if (!editing) announceEditId = null;
+    }
+    var h = '<h2>お知らせ管理</h2>';
+    if (announceAdminFlash) { h += msgHtml('success', announceAdminFlash); announceAdminFlash = ''; }
+    h += '<div id="annAdminMsg"></div>';
+    h += '<form class="grid" id="annForm">' +
+      '<div><label>タイトル</label><input id="annTitle" type="text" required maxlength="200"></div>' +
+      '<div><label>本文</label><textarea id="annBody" rows="5" required></textarea></div>' +
+      '<div><label>重要度</label><select id="annPriority"><option value="normal">通常</option><option value="important">重要</option></select></div>' +
+      '<div><label>対象</label><select id="annStore">' +
+      '<option value="store">現在の店舗 (' + esc(state.me && state.me.currentStore ? state.me.currentStore.name : '') + ')</option>' +
+      (canPostAllStores() ? '<option value="all">全店舗</option>' : '') +
+      '</select></div>' +
+      '<div><label>掲載開始</label><input id="annStart" type="datetime-local"></div>' +
+      '<div><label>掲載終了 (空欄は無期限)</label><input id="annEnd" type="datetime-local"></div>' +
+      '<div><label>プッシュ通知</label><label><input id="annPush" type="checkbox"> 掲載開始時にプッシュ通知を送る</label></div>' +
+      '<div class="sticky-actions"><button class="btn" type="submit" id="annSubmit">' + (editing ? '更新する' : '投稿する') + '</button>' +
+      (editing ? '<button class="btn secondary" type="button" id="annCancelEdit">編集をやめる</button>' : '') +
+      '</div></form>';
+    h += '<h3>投稿済み</h3>';
+    if (announceAdminItems.length === 0) {
+      h += '<p class="muted">まだ投稿がありません。</p>';
+    } else {
+      h += '<div class="group">';
+      for (var i = 0; i < announceAdminItems.length; i++) {
+        var a = announceAdminItems[i];
+        h += '<div class="group-row static"><span class="row-label">' + esc(a.title) +
+          '<span class="small muted" style="display:block">' + announcePeriodText(a) +
+          (a.storeId === null ? ' ・ 全店舗' : '') +
+          ' ・ 既読 ' + (a.readCount || 0) + '/' + (a.targetUsers || 0) + ' 人' +
+          (a.push ? ' ・ プッシュ' + (a.pushSentAt ? '送信済み' : '予定') : '') +
+          '</span></span>' + announceStateLabel(a) +
+          '<button class="btn small secondary" type="button" data-annedit="' + a.id + '">編集</button>' +
+          '<button class="btn small secondary" type="button" data-anndel="' + a.id + '">削除</button></div>';
+      }
+      h += '</div>';
+    }
+    el('view').innerHTML = h;
+    if (editing) {
+      el('annTitle').value = editing.title;
+      el('annBody').value = editing.body;
+      el('annPriority').value = editing.priority;
+      el('annStore').value = editing.storeId === null ? 'all' : 'store';
+      el('annStart').value = toLocalInputValue(editing.startsAt);
+      el('annEnd').value = editing.endsAt ? toLocalInputValue(editing.endsAt) : '';
+      el('annPush').checked = editing.push === true;
+    } else {
+      el('annStart').value = toLocalInputValue(Date.now());
+    }
+    var cancelBtn = el('annCancelEdit');
+    if (cancelBtn) cancelBtn.onclick = function () { announceEditId = null; loadAnnounceAdmin(); };
+    var editBtns = el('view').querySelectorAll('button[data-annedit]');
+    for (var j = 0; j < editBtns.length; j++) {
+      editBtns[j].onclick = function () {
+        announceEditId = Number(this.getAttribute('data-annedit'));
+        loadAnnounceAdmin();
+        window.scrollTo(0, 0);
+      };
+    }
+    var delBtns = el('view').querySelectorAll('button[data-anndel]');
+    for (var k = 0; k < delBtns.length; k++) {
+      delBtns[k].onclick = function () {
+        var id = Number(this.getAttribute('data-anndel'));
+        if (!confirm('このお知らせを削除しますか？')) return;
+        api('/api/v1/admin/announcements/' + id, { method: 'DELETE' }).then(function () {
+          if (announceEditId === id) announceEditId = null;
+          announceAdminFlash = '削除しました。';
+          loadAnnounceAdmin();
+        }).catch(function (e) {
+          el('annAdminMsg').innerHTML = msgHtml('error', errMsg(e));
+        });
+      };
+    }
+    el('annForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      var btn = el('annSubmit');
+      btn.disabled = true;
+      el('annAdminMsg').innerHTML = '';
+      var body = {
+        title: el('annTitle').value.trim(),
+        body: el('annBody').value,
+        priority: el('annPriority').value,
+        storeId: el('annStore').value === 'all' ? null : (state.me.currentStore ? state.me.currentStore.id : null),
+        startsAt: el('annStart').value ? new Date(el('annStart').value).getTime() : undefined,
+        endsAt: el('annEnd').value ? new Date(el('annEnd').value).getTime() : null,
+        push: el('annPush').checked,
+      };
+      var req = announceEditId !== null
+        ? api('/api/v1/admin/announcements/' + announceEditId, { method: 'PUT', body: body })
+        : api('/api/v1/admin/announcements', { method: 'POST', body: body });
+      req.then(function () {
+        announceAdminFlash = announceEditId !== null ? '更新しました。' : '投稿しました。';
+        announceEditId = null;
+        loadAnnounceAdmin();
+      }).catch(function (e) {
+        btn.disabled = false;
+        el('annAdminMsg').innerHTML = msgHtml('error', errMsg(e));
+      });
+    };
+  }).catch(function (e) {
+    el('view').innerHTML = '<h2>お知らせ管理</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+
 /* ---- その他 (iOS 設定風グループリスト) ---- */
 var MORE_ITEMS = [
   { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理', maintKeys: ['master_products', 'master_locations', 'suppliers', 'csv_import'] },
@@ -552,6 +841,8 @@ var MORE_ITEMS = [
   { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し', maintKeys: ['stocktakes'] },
   { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート', maintKeys: ['alerts'] },
   { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫', maintKeys: ['outbound'] },
+  { view: 'announcements', icon: 'mega', color: '#ff9500', label: 'お知らせ', maintKeys: [] },
+  { view: 'announceAdmin', icon: 'mega', color: '#64d2ff', label: 'お知らせ管理', maintKeys: [] },
   { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ', maintKeys: [] },
 ];
 function loadMore() {
@@ -605,6 +896,8 @@ function showView(id) {
     purchases: loadPurchases,
     analytics: loadAnalytics,
     audit: loadAudit,
+    announcements: loadAnnouncements,
+    announceAdmin: loadAnnounceAdmin,
     more: loadMore,
   };
   var fn = loaders[id];
@@ -637,12 +930,16 @@ function loadDashboard() {
   jobs.push(can('purchases.read') && feat('purchase_orders')
     ? getJson('/api/v1/purchase-orders/suggestions').catch(function () { return null; })
     : Promise.resolve(null));
+  jobs.push(feat('announcements')
+    ? getJson('/api/v1/announcements').catch(function () { return null; })
+    : Promise.resolve(null));
   Promise.all(jobs).then(function (r) {
     var alerts = r[0];
     var stocks = r[1];
     var stocktakes = r[2] || [];
     var negApprovals = r[3];
     var suggestions = r[4];
+    var annData = r[5];
     var h = '<h2>ダッシュボード</h2>';
     var active = null;
     for (var i = 0; i < stocktakes.length; i++) {
@@ -668,6 +965,20 @@ function loadDashboard() {
     else if (warnN > 0) { heroCls = 'warn'; heroTitle = '注意 ' + warnN + ' 件'; heroSub = '期限接近・在庫不足'; }
     if (stocks) heroSub = (heroSub ? heroSub + ' ・ ' : '') + '在庫 ' + stocks.length + ' 件 / 総数量 ' + hTotal;
     h += '<div class="hero ' + heroCls + '"><span class="hero-dot"></span><div class="hero-body"><div class="hero-title">' + heroTitle + '</div><div class="hero-sub">' + esc(heroSub) + '</div></div></div>';
+    /* お知らせカード: 未読件数と最新 1 件。重要は警告色の左帯 (notice-card.important) */
+    if (annData) {
+      state.annUnread = annData.unreadCount || 0;
+      buildNav();
+      var annItems = annData.items || [];
+      var latest = annItems.length > 0 ? annItems[0] : null;
+      h += '<button class="notice-card' + (latest && latest.priority === 'important' ? ' important' : '') + '" id="dashAnnounce">' +
+        '<span class="row-icon" style="background:#ff9500">' + icon('mega', 19) + '</span>' +
+        '<span class="notice-main"><span class="notice-head">お知らせ' +
+        (state.annUnread > 0 ? '<span class="count-badge">' + state.annUnread + '</span>' : '') +
+        '</span><span class="notice-latest' + (latest && !latest.read ? ' unread' : '') + '">' +
+        (latest ? esc(latest.title) : 'お知らせはありません') +
+        '</span></span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+    }
     /* 「やること」タスクカード: 件数バッジ付きで、タップすると該当画面へ */
     var tasks = [];
     if (negApprovals) {
@@ -737,6 +1048,8 @@ function loadDashboard() {
       }
     }
     el('view').innerHTML = h;
+    var da = el('dashAnnounce');
+    if (da) da.onclick = function () { showView('announcements'); };
     var b = el('dashToAlerts');
     if (b) b.onclick = function () { showView('alerts'); };
     var tcs = el('view').querySelectorAll('.task-card[data-task]');
@@ -2205,6 +2518,17 @@ function boot() {
     buildNav();
     showView('dashboard');
     connectWs();
+    /* Web Push 用 Service Worker を登録する (未対応ブラウザでは何もしない) */
+    if ('serviceWorker' in navigator) {
+      try { navigator.serviceWorker.register('/sw.js').catch(function () {}); } catch (e) {}
+    }
+    /* お知らせの未読数を先読みしてドックのバッジに反映する */
+    if (feat('announcements')) {
+      getJson('/api/v1/announcements').then(function (d) {
+        state.annUnread = d.unreadCount || 0;
+        buildNav();
+      }).catch(function () {});
+    }
     /* 先読み: よく使うデータを裏で温めて、タブ切り替えを即時にする */
     ensureMaster();
     if (can('alerts.read') && feat('alerts')) getJson('/api/v1/alerts').catch(function () {});
