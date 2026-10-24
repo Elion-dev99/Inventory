@@ -16,10 +16,30 @@ const EXTRA_CSS = `
 .side-btn:hover { background: var(--surface-2); }
 .side-btn.active { background: var(--control); }
 .console-main { flex: 1; min-width: 0; padding: 0 1rem 3rem; }
+.console-main input, .console-main select, .console-main textarea { max-width: 100%; }
 .feed-row { padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
 .feed-row:last-child { border-bottom: 0; }
 .detail-box { margin-top: 1.5rem; }
 .user-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem; }
+/* メンテナンスの対象機能はチップ形式にする (ラベルは文字単位で折り返さない) */
+.mnt-chips { flex-wrap: wrap; }
+.mnt-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.42rem 0.75rem; border: 1px solid var(--line-strong); border-radius: 980px; background: var(--surface-2); color: var(--fg); font-size: 0.92rem; white-space: nowrap; cursor: pointer; }
+.mnt-chip input { margin: 0; flex: none; }
+.mnt-chip:has(input:checked) { background: var(--control); border-color: var(--accent); }
+/* 中幅以下ではフォーム行を 1 カラムに積み、コントロールを全幅にする
+   (.group-row は折り返しなしの flex のため、狭幅ではラベルが潰れ入力欄がはみ出す) */
+@media (max-width: 900px) {
+  .console-main .group-row.static { flex-direction: column; align-items: stretch; gap: 0.6rem; }
+  .console-main .group-row.static > label { display: block; }
+  .console-main .group-row.static > label > input,
+  .console-main .group-row.static > label > select { display: block; width: 100%; margin-top: 0.3rem; }
+  .console-main .group-row.static > input,
+  .console-main .group-row.static > select,
+  .console-main .group-row.static > textarea { width: 100% !important; flex: none !important; }
+  .console-main .group-row.static > .btn { align-self: flex-start; }
+  .console-main .group-row.static.mnt-chips { flex-direction: row; align-items: center; }
+  .console-main .group-row.static.mnt-chips > label { display: inline-flex; }
+}
 @media (max-width: 720px) {
   .console-layout { flex-direction: column; }
   .console-side { position: static; flex-direction: row; flex-wrap: wrap; flex-basis: auto; padding: 0.5rem; }
@@ -119,7 +139,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <input id="mntStartMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
       <button class="btn small" id="mntStartBtn">開始</button>
     </div>
-    <div class="group-row static" id="mntStartFeatures" style="display:none;"></div>
+    <div class="group-row static mnt-chips" id="mntStartFeatures" style="display:none;"></div>
   </div>
   <h4>予定を追加</h4>
   <div class="group">
@@ -150,7 +170,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <label>終了 <input id="mntWeeklyEnd" type="time"></label>
       <span class="small muted">終了が開始より前なら翌日まで</span>
     </div>
-    <div class="group-row static" id="mntFeatures" style="display:none;"></div>
+    <div class="group-row static mnt-chips" id="mntFeatures" style="display:none;"></div>
     <div class="group-row static">
       <input id="mntMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
       <button class="btn small" id="mntAddBtn">予定を追加</button>
@@ -336,7 +356,7 @@ async function openStoreDetail(id) {
   try {
     const data = await api('/api/platform/stores/' + id + '/detail');
     const s = data.store;
-    let html = '<div class="section-box"><div style="display:flex; align-items:center; gap:0.75rem;">' +
+    let html = '<div class="section-box"><div style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">' +
       '<h3 style="margin:0;">店舗詳細: ' + esc(s.name) + ' (' + esc(s.code) + ')</h3>' +
       '<span>' + (s.status === 'suspended' ? '<span class="badge badge-danger">停止中</span>' : '<span class="badge">稼働中</span>') + '</span>' +
       '<button class="btn small secondary" id="detailClose" style="margin-left:auto;">閉じる</button></div>';
@@ -643,7 +663,7 @@ function windowDesc(w) {
 }
 function fillFeatureChecks(boxId) {
   el(boxId).innerHTML = MNT_FEATURE_OPTS.map((o) =>
-    '<label style="margin-right:0.9rem;"><input type="checkbox" value="' + o[0] + '"> ' + o[1] + '</label>'
+    '<label class="mnt-chip"><input type="checkbox" value="' + o[0] + '"> ' + o[1] + '</label>'
   ).join('');
 }
 function checkedFeatures(boxId) {
