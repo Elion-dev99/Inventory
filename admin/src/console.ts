@@ -21,13 +21,24 @@ const EXTRA_CSS = `
 .feed-row:last-child { border-bottom: 0; }
 .detail-box { margin-top: 1.5rem; }
 .user-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.6rem; }
-/* メンテナンスの対象機能はチップ形式にする (ラベルは文字単位で折り返さない) */
-.mnt-chips { flex-wrap: wrap; }
-.mnt-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.42rem 0.75rem; border: 1px solid var(--line-strong); border-radius: 980px; background: var(--surface-2); color: var(--fg); font-size: 0.92rem; white-space: nowrap; cursor: pointer; }
-.mnt-chip input { margin: 0; flex: none; }
-.mnt-chip:has(input:checked) { background: var(--control); border-color: var(--accent); }
-.mnt-chip select { margin: 0; flex: none; max-width: 10em; }
-.mnt-chip.on { background: var(--control); border-color: var(--accent); }
+/* メンテナンスの対象機能は 1機能=1行 + セグメントコントロールで選ぶ
+   (チップ+select は狭幅で重なるため廃止。色は単色のみ、発光・グラデーションなし) */
+.mnt-feat-block { padding: 0.35rem 1rem; border-bottom: 1px solid var(--line); }
+.mnt-feat-row { padding: 0.55rem 0; border-bottom: 1px solid var(--line); }
+.mnt-feat-row:last-child { border-bottom: 0; }
+.mnt-feat-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 0.45rem; }
+.mnt-feat-name { font-weight: 600; }
+.mnt-feat-state { font-size: 0.82rem; color: var(--muted); white-space: nowrap; }
+.mnt-feat-state.stage-write { color: var(--warn); }
+.mnt-feat-state.stage-full { color: var(--danger); }
+.mnt-seg { display: flex; gap: 2px; padding: 2px; background: var(--control); border-radius: var(--r-sm); }
+.mnt-seg button { flex: 1 1 0; min-width: 0; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 0.9rem; font-weight: 600; padding: 0.45rem 0.2rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.mnt-seg button.sel { background: var(--surface); color: var(--fg); box-shadow: var(--shadow); }
+.mnt-seg button.sel.stage-write { background: var(--warn-bg); color: var(--warn); }
+.mnt-seg button.sel.stage-full { background: var(--danger-bg); color: var(--danger); }
+/* プリセットはピル状チップのまま (中身はボタンだけなので重ならない) */
+.mnt-preset-row { flex-wrap: wrap; }
+.mnt-preset-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.42rem 0.75rem; border: 1px solid var(--line-strong); border-radius: 980px; background: var(--surface-2); color: var(--fg); font-size: 0.92rem; white-space: nowrap; }
 .mnt-preset-del { border: 0; background: transparent; color: var(--danger); cursor: pointer; font: inherit; padding: 0 0.1rem; }
 /* 中幅以下ではフォーム行を 1 カラムに積み、コントロールを全幅にする
    (.group-row は折り返しなしの flex のため、狭幅ではラベルが潰れ入力欄がはみ出す) */
@@ -40,8 +51,6 @@ const EXTRA_CSS = `
   .console-main .group-row.static > select,
   .console-main .group-row.static > textarea { width: 100% !important; flex: none !important; }
   .console-main .group-row.static > .btn { align-self: flex-start; }
-  .console-main .group-row.static.mnt-chips { flex-direction: row; align-items: center; }
-  .console-main .group-row.static.mnt-chips > label { display: inline-flex; }
 }
 @media (max-width: 720px) {
   .console-layout { flex-direction: column; }
@@ -132,7 +141,7 @@ export const CONSOLE_HTML = `<!doctype html>
   <div id="mntNow"><div class="skl skl-row"></div></div>
   <h4>プリセット</h4>
   <div class="group">
-    <div class="group-row static mnt-chips" id="mntPresets"></div>
+    <div class="group-row static mnt-preset-row" id="mntPresets"></div>
     <div class="group-row static">
       <input id="mntPresetName" type="text" placeholder="プリセット名" style="flex:1;">
       <button class="btn small secondary" id="mntPresetSaveBtn">現在の入力をプリセットとして保存</button>
@@ -151,7 +160,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <input id="mntStartMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
       <button class="btn small" id="mntStartBtn">開始</button>
     </div>
-    <div class="group-row static mnt-chips" id="mntStartFeatures" style="display:none;"></div>
+    <div class="mnt-feat-block" id="mntStartFeatures" style="display:none;"></div>
     <div class="group-row static">
       <label><input type="checkbox" id="mntStartEmergency"> 緊急</label>
       <label id="mntStartDurationWrap" style="display:none;">終了 <select id="mntStartDuration">
@@ -192,7 +201,7 @@ export const CONSOLE_HTML = `<!doctype html>
       <label>終了 <input id="mntWeeklyEnd" type="time"></label>
       <span class="small muted">終了が開始より前なら翌日まで</span>
     </div>
-    <div class="group-row static mnt-chips" id="mntFeatures" style="display:none;"></div>
+    <div class="mnt-feat-block" id="mntFeatures" style="display:none;"></div>
     <div class="group-row static">
       <label><input type="checkbox" id="mntEmergency"> 緊急</label>
       <input id="mntReason" type="text" placeholder="緊急の理由 (緊急時は必須)" style="flex:1; display:none;">
@@ -710,34 +719,52 @@ function reportText(w) {
   parts.push('拒否 ' + (r.rejections || 0) + '件');
   return ' [' + parts.join(' / ') + ']';
 }
-/* 機能ごとに「対象外 / 書込停止 / 全停止」の3択 (write 不可は2択) を並べる */
+/* 機能ごとに「対象外 / 書込停止 / 全停止」を 1行 + セグメントで選ぶ (write 不可は2択) */
+const MNT_STAGE_LABELS = { '': '対象外', write: '書込停止', full: '全停止' };
 function fillFeatureChecks(boxId) {
   el(boxId).innerHTML = MNT_FEATURE_OPTS.map((o) => {
-    let opts = '<option value="">対象外</option>';
-    if (o[2]) opts += '<option value="write">書込停止</option>';
-    opts += '<option value="full">全停止</option>';
-    return '<label class="mnt-chip">' + o[1] + ' <select data-mnt-feature="' + o[0] + '">' + opts + '</select></label>';
+    const stages = o[2] ? ['', 'write', 'full'] : ['', 'full'];
+    const btns = stages.map((st) =>
+      '<button type="button" data-mnt-stage="' + st + '"' + (st === '' ? ' class="sel"' : '') + '>' +
+      MNT_STAGE_LABELS[st] + '</button>'
+    ).join('');
+    return '<div class="mnt-feat-row" data-mnt-feature="' + o[0] + '">' +
+      '<div class="mnt-feat-head"><span class="mnt-feat-name">' + o[1] + '</span>' +
+      '<span class="mnt-feat-state">対象外</span></div>' +
+      '<div class="mnt-seg">' + btns + '</div></div>';
   }).join('');
-  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
-    sel.onchange = () => {
-      sel.closest('.mnt-chip').classList.toggle('on', sel.value !== '');
-      schedulePreview(boxId === 'mntStartFeatures' ? 'start' : 'add');
-    };
+  el(boxId).querySelectorAll('.mnt-feat-row').forEach((row) => {
+    row.querySelectorAll('button[data-mnt-stage]').forEach((btn) => {
+      btn.onclick = () => {
+        setFeatureRow(row, btn.dataset.mntStage);
+        schedulePreview(boxId === 'mntStartFeatures' ? 'start' : 'add');
+      };
+    });
   });
 }
-/* 選択された機能を { key: stage } マップで返す */
+/* 1行分の選択状態を反映する (選択ボタンの色と右上の状態ラベル) */
+function setFeatureRow(row, stage) {
+  row.querySelectorAll('button[data-mnt-stage]').forEach((b) => {
+    b.className = b.dataset.mntStage === stage ? 'sel' + (stage ? ' stage-' + stage : '') : '';
+  });
+  const label = row.querySelector('.mnt-feat-state');
+  label.textContent = MNT_STAGE_LABELS[stage];
+  label.className = 'mnt-feat-state' + (stage ? ' stage-' + stage : '');
+}
+/* 選択された機能を { key: stage } マップで返す (対象外は含めない) */
 function checkedFeatures(boxId) {
   const map = {};
-  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
-    if (sel.value) map[sel.dataset.mntFeature] = sel.value;
+  el(boxId).querySelectorAll('.mnt-feat-row').forEach((row) => {
+    const sel = row.querySelector('button.sel');
+    const stage = sel ? sel.dataset.mntStage : '';
+    if (stage) map[row.dataset.mntFeature] = stage;
   });
   return map;
 }
 function setFeatureSelectors(boxId, features) {
-  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
-    const v = features && features[sel.dataset.mntFeature] ? features[sel.dataset.mntFeature] : '';
-    sel.value = v;
-    sel.closest('.mnt-chip').classList.toggle('on', v !== '');
+  el(boxId).querySelectorAll('.mnt-feat-row').forEach((row) => {
+    const v = features && features[row.dataset.mntFeature] ? features[row.dataset.mntFeature] : '';
+    setFeatureRow(row, v);
   });
 }
 function fillStoreSelect(selId) {
@@ -795,8 +822,8 @@ function renderPresets() {
   const box = el('mntPresets');
   if (mntPresets.length === 0) { box.innerHTML = '<span class="small muted">プリセットはありません。</span>'; return; }
   box.innerHTML = mntPresets.map((p, i) =>
-    '<label class="mnt-chip"><button type="button" data-preset="' + i + '" style="border:0;background:transparent;font:inherit;cursor:pointer;padding:0;">' +
-    esc(p.name) + '</button><button type="button" class="mnt-preset-del" data-preset-del="' + p.id + '" aria-label="削除">×</button></label>'
+    '<span class="mnt-preset-chip"><button type="button" data-preset="' + i + '" style="border:0;background:transparent;font:inherit;cursor:pointer;padding:0;">' +
+    esc(p.name) + '</button><button type="button" class="mnt-preset-del" data-preset-del="' + p.id + '" aria-label="削除">×</button></span>'
   ).join('');
   box.querySelectorAll('button[data-preset]').forEach((b) => {
     b.onclick = () => applyPreset(mntPresets[Number(b.dataset.preset)]);
