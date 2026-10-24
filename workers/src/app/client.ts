@@ -3206,7 +3206,7 @@ function loadNegative() {
               '<button class="btn small danger" data-decide="rejected" data-id="' + a.id + '">却下</button>';
           }
           h += '<tr><td>' + a.id + '</td><td>' + a.stockId + '</td><td>' + a.quantity + '</td><td>' + esc(a.reason) + '</td><td>' +
-            statusBadge(a.status) + '</td><td>' + a.requestedBy + '</td><td>' + fmtDateTime(a.createdAt) + '</td><td>' + decide + '</td></tr>';
+            statusBadge(a.status) + '</td><td>' + (a.requestedBy === null || a.requestedBy === undefined ? '-' : a.requestedBy) + '</td><td>' + fmtDateTime(a.createdAt) + '</td><td>' + decide + '</td></tr>';
         });
         h += '</tbody></table></div>';
       }
@@ -3291,7 +3291,7 @@ function loadStocktakes() {
         var scopeLabel = t.scopeType === 'locations' ? '場所 ' + (t.locationIds ? t.locationIds.length : 0) + '件' : '全件';
         h += '<tr><td>' + t.id + '</td><td>' + stocktakeStatusBadge(t.status) +
           '</td><td>' + scopeLabel + (t.blind ? ' <span class="badge">盲検</span>' : '') +
-          '</td><td>' + t.startedBy + '</td><td>' + fmtDateTime(t.startedAt) + '</td><td>' + fmtDateTime(t.confirmedAt) + '</td></tr>';
+          '</td><td>' + (t.startedBy === null || t.startedBy === undefined ? '-' : t.startedBy) + '</td><td>' + fmtDateTime(t.startedAt) + '</td><td>' + fmtDateTime(t.confirmedAt) + '</td></tr>';
       });
       h += '</tbody></table></div>';
     }
@@ -4428,7 +4428,7 @@ function fetchAudit() {
     for (var i = 0; i < r.items.length; i++) {
       var a = r.items[i];
       h += '<tr><td>' + fmtDateTime(a.createdAt) + '</td><td>' + a.id + '</td><td>' +
-        (a.actorId === null ? '-' : a.actorId) + '</td><td>' + esc(a.action) + '</td><td>' +
+        (a.actorLabel ? esc(a.actorLabel) : (a.actorId === null ? '-' : a.actorId)) + '</td><td>' + esc(a.action) + '</td><td>' +
         esc(a.targetType + ' #' + a.targetId) + '</td><td>' +
         esc(a.payload === null ? '' : JSON.stringify(a.payload)) + '</td></tr>';
     }

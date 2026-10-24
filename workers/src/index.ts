@@ -1141,6 +1141,61 @@ async function hasTable(c: AppContext, table: string): Promise<boolean> {
   }
 }
 
+// ------------------------------------------------- 全体管理者の匿名化
+// 全体管理者 (全体割当 = SYSTEM_ADMIN かつ store_id IS NULL を持つユーザー) は
+// 店舗側の管理対象ではなく、その名前・メールアドレス・ID を店舗ユーザーに
+// 見せない。対象は「全体割当を持ち、現在店舗の割当を持たない」ユーザー。
+// 現在店舗の割当も持つ人は、その店舗のメンバーとして通常表示する。
+// 閲覧者自身が全体管理者の場合は何も隠さない (本人の表示・操作は通常通り)。
+// 判定はすべてサーバー側で行う。
+
+/** 匿名化した操作者の表示名 */
+const PLATFORM_ACTOR_LABEL = 'システム管理者';
+
+/** 現在店舗の文脈で素性を隠す全体管理者のユーザー ID 集合 */
+async function hiddenPlatformUserIds(
+  c: AppContext,
+  storeId: number,
+): Promise<ReadonlySet<number>> {
+  if (isPlatformAdmin(user(c).assignments)) return new Set();
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT DISTINCT ur.user_id AS userId
+         FROM user_roles ur
+        WHERE ur.role_code = 'SYSTEM_ADMIN' AND ur.store_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM user_roles s
+             WHERE s.user_id = ur.user_id AND s.store_id = ?1
+          )`,
+    )
+      .bind(storeId)
+      .all<{ userId: number }>();
+    return new Set(results.map((r) => r.userId));
+  } catch {
+    return new Set();
+  }
+}
+
+/** user ID フィールドの匿名化 (対象ユーザーなら null、それ以外はそのまま) */
+function anonymizeUserId(id: number | null, hidden: ReadonlySet<number>): number | null {
+  return id !== null && hidden.has(id) ? null : id;
+}
+
+/** レスポンス JSON の user ID フィールド群を匿名化する */
+function anonymizeUserFields(
+  obj: Record<string, unknown>,
+  hidden: ReadonlySet<number>,
+  fields: readonly string[],
+): Record<string, unknown> {
+  if (hidden.size === 0) return obj;
+  const out = { ...obj };
+  for (const f of fields) {
+    const v = out[f];
+    if (typeof v === 'number' && hidden.has(v)) out[f] = null;
+  }
+  return out;
+}
+
 // ------------------------------------------------------------ ユーティリティ
 
 async function parseJson(c: AppContext): Promise<unknown> {
@@ -1528,7 +1583,11 @@ app.get('/api/v1/movements', async (c) => {
     ' ORDER BY mv.id DESC LIMIT ? OFFSET ?';
   params.push(take, skip);
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
-  return c.json(results);
+  // 全体管理者の操作は actorId を伏せる (誰の操作かは店舗側に出さない)
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    results.map((r) => anonymizeUserFields(r as Record<string, unknown>, hidden, ['actorId'])),
+  );
 });
 
 // ------------------------------------------------------- 検品写真 (R2)
@@ -1601,11 +1660,12 @@ app.get('/api/v1/movements/:id/photos', async (c) => {
   )
     .bind(movementId, ctx.store.id)
     .all<MovementPhotoRow>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   return c.json(
     results.map((r) => ({
       id: r.id,
       movementId: r.movement_id,
-      createdBy: r.created_by,
+      createdBy: anonymizeUserId(r.created_by, hidden),
       createdAt: r.created_at,
     })),
   );
@@ -3100,7 +3160,8 @@ app.get('/api/v1/reservations', async (c) => {
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'reservations'))) return c.json([]);
   const rows = await activeReservationRows(c.env.DB, ctx.store.id, Date.now());
-  return c.json(rows.map(reservationJson));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(rows.map((r) => anonymizeUserFields(reservationJson(r), hidden, ['createdBy'])));
 });
 
 /** 引当の解放 */
@@ -3299,8 +3360,11 @@ app.get('/api/v1/pick-lists', async (c) => {
   )
     .bind(ctx.store.id)
     .all<{ id: number }>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   const out: Record<string, unknown>[] = [];
-  for (const r of results) out.push(await loadPickList(c, r.id, ctx.store.id));
+  for (const r of results) {
+    out.push(anonymizeUserFields(await loadPickList(c, r.id, ctx.store.id), hidden, ['createdBy']));
+  }
   return c.json(out);
 });
 
@@ -3308,7 +3372,14 @@ app.get('/api/v1/pick-lists/:id', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) throw notFound('Pick list not found');
-  return c.json(await loadPickList(c, Number(c.req.param('id')), ctx.store.id));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    anonymizeUserFields(
+      await loadPickList(c, Number(c.req.param('id')), ctx.store.id),
+      hidden,
+      ['createdBy'],
+    ),
+  );
 });
 
 /** 明細の数量修正 (検品の手入力・計画の調整)。open の間だけ変更できる */
@@ -3491,8 +3562,11 @@ app.get('/api/v1/purchase-order-templates', async (c) => {
   )
     .bind(ctx.store.id)
     .all<PoTemplateDbRow>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   const out: Record<string, unknown>[] = [];
-  for (const row of results) out.push(await poTemplateJson(c, row));
+  for (const row of results) {
+    out.push(anonymizeUserFields(await poTemplateJson(c, row), hidden, ['createdBy']));
+  }
   return c.json(out);
 });
 
@@ -3658,7 +3732,13 @@ app.get('/api/v1/negative-approvals', async (c) => {
   }
   sql += ' ORDER BY a.id DESC LIMIT 100';
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
-  return c.json(results);
+  // 申請者・承認者が全体管理者なら ID を伏せる
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    results.map((r) =>
+      anonymizeUserFields(r as Record<string, unknown>, hidden, ['requestedBy', 'approvedBy']),
+    ),
+  );
 });
 
 app.post('/api/v1/negative-approvals/:id/decide', async (c) => {
@@ -3774,6 +3854,14 @@ function stocktakeHeadJson(r: StocktakeHeadRow): Record<string, unknown> {
   };
 }
 
+/** 棚卸しヘッダの startedBy を匿名化する (全体管理者が開始した棚卸し) */
+function anonymizeStocktakeHead(
+  json: Record<string, unknown>,
+  hidden: ReadonlySet<number>,
+): Record<string, unknown> {
+  return anonymizeUserFields(json, hidden, ['startedBy']);
+}
+
 const STOCKTAKE_HEAD_SQL = `SELECT id, status, started_by AS startedBy, started_at AS startedAt,
        confirmed_at AS confirmedAt, scope_type AS scopeType, scope_json AS scopeJson, blind
   FROM stocktakes`;
@@ -3795,7 +3883,8 @@ app.get('/api/v1/stocktakes', async (c) => {
   )
     .bind(ctx.store.id)
     .all<StocktakeHeadRow>();
-  return c.json(results.map(stocktakeHeadJson));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(results.map((r) => anonymizeStocktakeHead(stocktakeHeadJson(r), hidden)));
 });
 
 app.post('/api/v1/stocktakes/:id/finish', async (c) => {
@@ -3883,8 +3972,9 @@ app.get('/api/v1/stocktakes/:id', async (c) => {
   )
     .bind(id)
     .all<StocktakeLineView>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   return c.json({
-    ...stocktakeHeadJson(stocktake),
+    ...anonymizeStocktakeHead(stocktakeHeadJson(stocktake), hidden),
     lines: results.map((r) => applyBlind(stocktakeLineJson(r), stocktake)),
   });
 });
@@ -4099,6 +4189,7 @@ app.get('/api/v1/purchase-orders', async (c) => {
   const { results: orders } = await c.env.DB.prepare(`${await poSelect(c)} WHERE po.store_id = ?1 ORDER BY po.id DESC LIMIT 100`)
     .bind(ctx.store.id)
     .all<PurchaseOrderDbRow>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   const out: Record<string, unknown>[] = [];
   for (const po of orders) {
     const { results: lines } = await c.env.DB.prepare(
@@ -4106,7 +4197,7 @@ app.get('/api/v1/purchase-orders', async (c) => {
     )
       .bind(po.id)
       .all<PurchaseOrderLineDbRow>();
-    out.push(purchaseOrderJson(po, lines));
+    out.push(anonymizeUserFields(purchaseOrderJson(po, lines), hidden, ['createdBy']));
   }
   return c.json(out);
 });
@@ -4753,7 +4844,13 @@ app.get('/api/v1/admin/users', async (c) => {
     list.push({ roleCode: r.roleCode, warehouseId: r.warehouseId });
     byUser.set(r.userId, list);
   }
-  return c.json(users.map((u) => ({ ...u, assignments: byUser.get(u.id) ?? [] })));
+  // 全体管理者 (現在店舗の割当を持たない) は店舗側の管理対象ではないため一覧に出さない
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    users
+      .filter((u) => !hidden.has(u.id))
+      .map((u) => ({ ...u, assignments: byUser.get(u.id) ?? [] })),
+  );
 });
 
 /**
@@ -4769,6 +4866,10 @@ app.put('/api/v1/admin/users/:userId/roles', async (c) => {
     .bind(userId)
     .first<{ id: number }>();
   if (!target) throw notFound('User not found');
+  // 全体管理者は店舗側の管理対象ではない (一覧に出ないユーザーには触れない)
+  if ((await hiddenPlatformUserIds(c, ctx.store.id)).has(userId)) {
+    throw notFound('User not found');
+  }
   const dto = parseWith(userRolesBodySchema, await parseJson(c));
   const roles = await listRoles(c);
   const knownRoles = new Set(roles.map((r) => r.code));
@@ -4836,7 +4937,10 @@ interface AuditLogRow {
   created_at: number;
 }
 
-function auditLogJson(r: AuditLogRow): Record<string, unknown> {
+function auditLogJson(
+  r: AuditLogRow,
+  hidden: ReadonlySet<number> = new Set(),
+): Record<string, unknown> {
   let payload: unknown = null;
   if (r.payload !== null) {
     try {
@@ -4845,9 +4949,12 @@ function auditLogJson(r: AuditLogRow): Record<string, unknown> {
       payload = r.payload;
     }
   }
+  // 全体管理者の操作は行自体を残しつつ、操作者を「システム管理者」に匿名化する
+  const anonymized = r.actor_id !== null && hidden.has(r.actor_id);
   return {
     id: r.id,
-    actorId: r.actor_id,
+    actorId: anonymized ? null : r.actor_id,
+    actorLabel: anonymized ? PLATFORM_ACTOR_LABEL : null,
     action: r.action,
     targetType: r.target_type,
     targetId: r.target_id,
@@ -4908,7 +5015,13 @@ app.get('/api/v1/admin/audit-logs', async (c) => {
   )
     .bind(...params, limit, offset)
     .all<AuditLogRow>();
-  return c.json({ items: results.map(auditLogJson), total: totalRow?.n ?? 0, limit, offset });
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({
+    items: results.map((r) => auditLogJson(r, hidden)),
+    total: totalRow?.n ?? 0,
+    limit,
+    offset,
+  });
 });
 
 /**
@@ -4957,24 +5070,31 @@ const EXPORT_STORE_SCOPES: Record<string, string> = {
 app.get('/api/v1/admin/export.json', async (c) => {
   await requirePermission(c, Permission.ADMIN_USERS);
   const ctx = await storeContext(c);
+  // 全体管理者 (現在店舗の割当を持たない) の users 行と、その全体割当の行は
+  // 店舗側のエクスポートに含めない (名前・メール・外部 ID を出さない)
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   const tables: Record<string, unknown[]> = {};
   for (const table of EXPORT_TABLES) {
     const scope = EXPORT_STORE_SCOPES[table];
+    let rows: Record<string, unknown>[] = [];
     try {
       const stmt = c.env.DB.prepare(
         `SELECT * FROM ${table}${scope ? ` WHERE ${scope}` : ''} ORDER BY rowid ASC`,
       );
       const { results } = await (scope ? stmt.bind(ctx.store.id) : stmt).all();
-      tables[table] = results;
+      rows = results as Record<string, unknown>[];
     } catch {
       // スコープ列が無い環境では無条件で出し、それも無ければ空配列にする
       try {
         const { results } = await c.env.DB.prepare(`SELECT * FROM ${table} ORDER BY rowid ASC`).all();
-        tables[table] = results;
+        rows = results as Record<string, unknown>[];
       } catch {
-        tables[table] = [];
+        rows = [];
       }
     }
+    if (table === 'users') rows = rows.filter((r) => !hidden.has(Number(r.id)));
+    if (table === 'user_roles') rows = rows.filter((r) => !hidden.has(Number(r.user_id)));
+    tables[table] = rows;
   }
   return c.json(
     { exportedAt: Date.now(), storeId: ctx.store.id, tables },
@@ -5072,7 +5192,12 @@ app.get('/api/v1/announcements', async (c) => {
     user(c).userId,
     Date.now(),
   );
-  return c.json({ items, unreadCount });
+  // 全体管理コンソールから投稿されたお知らせは投稿者の ID を店舗側に出さない
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({
+    items: items.map((i) => ({ ...i, createdBy: anonymizeUserId(i.createdBy, hidden) })),
+    unreadCount,
+  });
 });
 
 app.get('/api/v1/announcements/:id', async (c) => {
@@ -5086,7 +5211,8 @@ app.get('/api/v1/announcements/:id', async (c) => {
     Date.now(),
   );
   if (!item) throw notFound('Announcement not found');
-  return c.json(item);
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({ ...item, createdBy: anonymizeUserId(item.createdBy, hidden) });
 });
 
 app.post('/api/v1/announcements/:id/read', async (c) => {
@@ -5124,8 +5250,10 @@ app.get('/api/v1/admin/announcements', async (c) => {
     )
     .bind(ctx.store.id)
     .all<AnnouncementRow>();
-  const items: ReturnType<typeof announcementJson>[] = [];
-  for (const row of results) items.push(await announcementAdminJson(c.env.DB, row));
+  const rawItems: ReturnType<typeof announcementJson>[] = [];
+  for (const row of results) rawItems.push(await announcementAdminJson(c.env.DB, row));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  const items = rawItems.map((i) => ({ ...i, createdBy: anonymizeUserId(i.createdBy, hidden) }));
   return c.json({ items });
 });
 
