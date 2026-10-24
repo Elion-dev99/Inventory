@@ -405,6 +405,36 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
   background: var(--info-bg);
   color: var(--info-fg);
 }
+/* 終了通知も情報色で控えめに出し、閉じるボタンを持つ */
+.maintenance-banner.ended {
+  background: var(--info-bg);
+  color: var(--info-fg);
+}
+.maintenance-banner .mnt-close {
+  float: right;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 0 0.15rem;
+  cursor: pointer;
+}
+/* フォーム見出し下のメンテナンス注記 (停止バッジ・開始直前の帯) */
+.mnt-form-note { margin-bottom: 0.4rem; }
+.mnt-form-note .msg { margin: 0.4rem 0; }
+/* 記録ボタン上の小ドット (記録系機能の停止中を示す) */
+.tab-plus { position: relative; }
+.tab-dot {
+  position: absolute;
+  top: 0.1rem;
+  right: calc(50% - 2.1rem);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ff9500;
+}
 .msg.error { background: var(--danger-bg); color: var(--danger); }
 .msg.success { background: var(--ok-bg); color: var(--ok); }
 .msg.info { background: var(--info-bg); color: var(--info-fg); }

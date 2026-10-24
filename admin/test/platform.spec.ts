@@ -12,6 +12,7 @@ import multiStoreSql from '../../workers/migrations/0008_multi_store.sql?raw';
 import sessionScopeSql from '../../workers/migrations/0009_session_scope.sql?raw';
 import platformSettingsSql from '../../workers/migrations/0010_platform_settings.sql?raw';
 import maintenanceWindowsSql from '../../workers/migrations/0011_maintenance_windows.sql?raw';
+import maintenanceExtrasSql from '../../workers/migrations/0012_maintenance_extras.sql?raw';
 import { createSession } from '../../workers/src/lib/session';
 
 /**
@@ -140,6 +141,7 @@ beforeAll(async () => {
     ...statementsOf(sessionScopeSql),
     ...statementsOf(platformSettingsSql),
     ...statementsOf(maintenanceWindowsSql),
+    ...statementsOf(maintenanceExtrasSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -637,7 +639,7 @@ describe('メンテナンスウィンドウ', () => {
     id: number;
     kind: string;
     level: string;
-    features: string[];
+    features: Record<string, string>;
     storeId: number | null;
     storeName: string | null;
     startsAt: number | null;
@@ -646,6 +648,16 @@ describe('メンテナンスウィンドウ', () => {
     state: string;
     occurrenceStartsAt: number | null;
     occurrenceEndsAt: number | null;
+    emergency: boolean;
+    reason: string | null;
+    extendCount: number;
+    report?: {
+      plannedMinutes: number | null;
+      actualMinutes: number | null;
+      extendCount: number;
+      rejections: number;
+      rejectionsByFeature: Record<string, number>;
+    };
   }
 
   async function listWindows(): Promise<{
@@ -856,5 +868,202 @@ describe('メンテナンスウィンドウ', () => {
     expect(actions).toContain('platform.maintenance.create');
     expect(actions).toContain('platform.maintenance.extend');
     expect(actions).toContain('platform.maintenance.end');
+  });
+
+  it('features は段階マップで保存され、旧配列は展開・正規化される', async () => {
+    const now = Date.now();
+    const mapped = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: {
+        kind: 'once', startsAt: now + HOUR_MS, endsAt: now + 2 * HOUR_MS,
+        level: 'features', features: { transfers: 'full', purchase_orders: 'write' }, storeId: 1,
+      },
+    });
+    expect(mapped.status).toBe(201);
+    expect(mapped.body.features).toEqual({ transfers: 'full', purchase_orders: 'write' });
+
+    const legacy = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: {
+        kind: 'once', startsAt: now + HOUR_MS, endsAt: now + 2 * HOUR_MS,
+        level: 'features', features: ['movements', 'csv'],
+      },
+    });
+    expect(legacy.status).toBe(201);
+    expect(legacy.body.features).toEqual({
+      inbound: 'full', outbound: 'full', csv_export: 'full', csv_import: 'full',
+    });
+  });
+
+  it("write 不可のグループへの 'write' 指定は 422", async () => {
+    const now = Date.now();
+    const res = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: {
+        kind: 'once', startsAt: now + HOUR_MS, endsAt: now + 2 * HOUR_MS,
+        level: 'features', features: { csv_export: 'write' },
+      },
+    });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe('INVALID_WINDOW');
+  });
+
+  it('緊急: 理由なし・weekly・終了なし・4時間超は 422、正しい緊急は作成でき延長が数えられる', async () => {
+    const now = Date.now();
+    const base = {
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR_MS,
+      level: 'full', emergency: true, reason: '障害対応のため',
+    };
+    const noReason = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST', body: { ...base, reason: '' },
+    });
+    expect(noReason.status).toBe(422);
+    expect(noReason.body.error).toBe('INVALID_WINDOW');
+
+    const weekly = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'weekly', weekday: 1, startMinute: 0, endMinute: 60, level: 'full', emergency: true, reason: 'x' },
+    });
+    expect(weekly.status).toBe(422);
+
+    const noEnd = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST', body: { ...base, endsAt: null },
+    });
+    expect(noEnd.status).toBe(422);
+
+    const tooLong = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST', body: { ...base, endsAt: now + 5 * HOUR_MS },
+    });
+    expect(tooLong.status).toBe(422);
+    expect(tooLong.body.error).toBe('INVALID_WINDOW');
+
+    const ok = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST', body: base,
+    });
+    expect(ok.status).toBe(201);
+    expect(ok.body.emergency).toBe(true);
+    expect(ok.body.reason).toBe('障害対応のため');
+    expect(ok.body.extendCount).toBe(0);
+    const okId = ok.body.id as number;
+
+    const ext = await api(`/api/platform/maintenance/windows/${okId}/extend`, {
+      cookie: admin3, method: 'POST', body: { minutes: 60 },
+    });
+    expect(ext.status).toBe(200);
+    expect(ext.body.extendCount).toBe(1);
+
+    // 開始から 4 時間を超える延長は 422 (現在 endsAt = startsAt + 約2時間)
+    const extTooFar = await api(`/api/platform/maintenance/windows/${okId}/extend`, {
+      cookie: admin3, method: 'POST', body: { minutes: 180 },
+    });
+    expect(extTooFar.status).toBe(422);
+    expect(extTooFar.body.error).toBe('EMERGENCY_TOO_LONG');
+
+    await api(`/api/platform/maintenance/windows/${okId}/end`, { cookie: admin3, method: 'POST' });
+  });
+
+  it('レポート: 終了した枠に予定/実績分数・延長回数・拒否件数が付く', async () => {
+    const now = Date.now();
+    const created = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now - 2 * HOUR_MS, endsAt: now - HOUR_MS, level: 'read_only' },
+    });
+    expect(created.status).toBe(201);
+    const id = created.body.id as number;
+    await testEnv.DB.prepare(
+      `INSERT INTO maintenance_rejections (window_id, feature_key, store_id, blocked_count)
+       VALUES (?1, 'transfers', 1, 3), (?1, 'inbound', 1, 2)`,
+    )
+      .bind(id)
+      .run();
+
+    const list = await listWindows();
+    const found = list.recent.find((w) => w.id === id);
+    expect(found?.report?.plannedMinutes).toBe(60);
+    expect(found?.report?.actualMinutes).toBe(60);
+    expect(found?.report?.extendCount).toBe(0);
+    expect(found?.report?.rejections).toBe(5);
+    expect(found?.report?.rejectionsByFeature).toEqual({ transfers: 3, inbound: 2 });
+  });
+
+  it('preview: 影響ユーザー・セッション・直近操作・重なりを返す', async () => {
+    const now = Date.now();
+    await createSession(testEnv.DB, 2);
+    await testEnv.DB.prepare(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+       VALUES (2, 'stock.transfer', 'stock', '1', NULL, 1, ?1)`,
+    )
+      .bind(now)
+      .run();
+    const existing = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now + 90 * 60_000, endsAt: now + 150 * 60_000, level: 'read_only' },
+    });
+    expect(existing.status).toBe(201);
+    const existingId = existing.body.id as number;
+
+    const res = await api('/api/platform/maintenance/preview', {
+      cookie: admin3, method: 'POST',
+      body: {
+        level: 'features', features: { transfers: 'full', stocktakes: 'full' },
+        storeId: 1, startsAt: now + HOUR_MS, endsAt: now + 2 * HOUR_MS,
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.affectedUsers).toBe(1); // 店舗1の割当は user 2 のみ
+    expect((res.body.activeSessions as number) >= 1).toBe(true);
+    const recentOps = res.body.recentOps as Record<string, number>;
+    expect(recentOps.transfers).toBeGreaterThanOrEqual(1);
+    expect(recentOps.stocktakes).toBe(0);
+    const overlaps = res.body.overlaps as { id: number }[];
+    expect(overlaps.map((o) => o.id)).toContain(existingId);
+
+    const allStores = await api('/api/platform/maintenance/preview', {
+      cookie: admin3, method: 'POST',
+      body: { level: 'full', storeId: null, startsAt: now + HOUR_MS, endsAt: now + 2 * HOUR_MS },
+    });
+    expect(allStores.body.affectedUsers).toBe(3); // user_roles を持つ全ユーザー
+
+    // 全体管理者でないセッションは 403
+    const staffPlatform = await createSession(testEnv.DB, 2, { scope: 'platform' });
+    const forbidden = await api('/api/platform/maintenance/preview', {
+      cookie: staffPlatform, method: 'POST', body: { level: 'full' },
+    });
+    expect(forbidden.status).toBe(403);
+  });
+
+  it('presets: 未保存時は既定4件、作成・削除ができ、名前なしは 422', async () => {
+    const initial = await api('/api/platform/maintenance/presets', { cookie: admin3 });
+    expect(initial.status).toBe(200);
+    const initialList = initial.body.presets as { id: string; name: string }[];
+    expect(initialList).toHaveLength(4);
+    expect(initialList.map((p) => p.name)).toEqual(
+      expect.arrayContaining(['月次棚卸し', '日曜深夜の定期', '緊急全面停止', '発注締め処理']),
+    );
+
+    const noName = await api('/api/platform/maintenance/presets', {
+      cookie: admin3, method: 'POST', body: { level: 'full' },
+    });
+    expect(noName.status).toBe(422);
+
+    const created = await api('/api/platform/maintenance/presets', {
+      cookie: admin3, method: 'POST',
+      body: { name: 'テストプリセット', level: 'features', features: { stocktakes: 'full' }, storeId: 1, message: '棚卸し' },
+    });
+    expect(created.status).toBe(201);
+    const createdList = created.body.presets as { id: string; name: string; features: Record<string, string> }[];
+    expect(createdList).toHaveLength(5);
+    const mine = createdList.find((p) => p.name === 'テストプリセット');
+    expect(mine?.features).toEqual({ stocktakes: 'full' });
+
+    const after = await api('/api/platform/maintenance/presets', { cookie: admin3 });
+    expect((after.body.presets as unknown[]).length).toBe(5);
+
+    const removed = await api(`/api/platform/maintenance/presets/${mine?.id}`, {
+      cookie: admin3, method: 'DELETE',
+    });
+    expect(removed.status).toBe(200);
+    expect((removed.body.presets as { name: string }[]).map((p) => p.name)).not.toContain('テストプリセット');
+    expect((removed.body.presets as unknown[]).length).toBe(4);
   });
 });

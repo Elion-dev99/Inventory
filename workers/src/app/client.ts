@@ -24,12 +24,72 @@ function fmtDateTime(ms) {
     ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
 }
 /* ---------------- メンテナンス表示 ---------------- */
-var MAINT_FEATURE_LABELS = { movements: '入庫・消費', transfers: '移動', stocktakes: '棚卸し', purchase_orders: '発注', csv: 'CSV', master: 'マスタ編集', analytics: '分析' };
+var MAINT_FEATURE_LABELS = { inbound: '入庫', outbound: '消費・出庫', transfers: '移動', stocktakes: '棚卸し', purchase_orders: '発注', suppliers: '仕入先', csv_export: 'CSVエクスポート', csv_import: 'CSVインポート', master_products: '商品マスタ', master_locations: '倉庫・保管場所', analytics: '分析', alerts: 'アラート', login: '新規ログイン' };
 function maintFeatureText(features) {
-  if (!features || features.length === 0) return '';
+  if (!features) return '';
+  var keys = Object.keys(features);
+  if (keys.length === 0) return '';
   var parts = [];
-  features.forEach(function (k) { parts.push(MAINT_FEATURE_LABELS[k] || k); });
+  keys.forEach(function (k) { parts.push(MAINT_FEATURE_LABELS[k] || k); });
   return parts.join('・');
+}
+/* 実施中の features 停止で、対象キー群の実効段階を返す ('full' > 'write' > null) */
+function maintStageFor(keys) {
+  var a = state.maintenance && state.maintenance.active;
+  if (!a || a.level !== 'features' || !a.features) return null;
+  var stage = null;
+  keys.forEach(function (k) {
+    var s = a.features[k];
+    if (s === 'full') stage = 'full';
+    else if (s === 'write' && stage !== 'full') stage = 'write';
+  });
+  return stage;
+}
+function maintBadgeHtml(keys) {
+  var stage = maintStageFor(keys);
+  if (!stage) return '';
+  return ' <span class="badge ' + (stage === 'full' ? 'badge-danger' : 'badge-warn') + '">' +
+    (stage === 'full' ? '停止中' : '書込停止中') + '</span>';
+}
+/* 開始 10 分前 (imminent) で対象キーに掛かる予定があれば、その予定を返す */
+function maintImminentFor(keys) {
+  var u = state.maintenance && state.maintenance.upcoming;
+  if (!u || u.phase !== 'imminent' || !u.features) return null;
+  var hit = false;
+  keys.forEach(function (k) { if (u.features[k]) hit = true; });
+  return hit ? u : null;
+}
+/* フォーム見出しの注記 (停止バッジ / 開始直前の保存促し) と送信ボタンの無効化。
+   1 画面に複数フォームがある場合 (マスタ管理) に備えて複数登録できる */
+var currentFormNotes = [];
+function setMaintFormNote(noteId, keys, submitSelectors) {
+  currentFormNotes = currentFormNotes.filter(function (n) { return n.noteId !== noteId; });
+  currentFormNotes.push({ noteId: noteId, keys: keys, submits: submitSelectors || [] });
+  renderMaintFormNote();
+}
+function renderMaintFormNote() {
+  currentFormNotes.forEach(function (cfg) {
+    var note = el(cfg.noteId);
+    var stage = maintStageFor(cfg.keys);
+    if (note) {
+      if (stage) {
+        note.innerHTML = maintBadgeHtml(cfg.keys);
+        note.style.display = '';
+      } else if (maintImminentFor(cfg.keys)) {
+        note.innerHTML = msgHtml('warn', 'まもなくメンテナンスが始まります。入力中の内容を保存してください');
+        note.style.display = '';
+      } else {
+        note.innerHTML = '';
+        note.style.display = 'none';
+      }
+    }
+    if (stage) {
+      cfg.submits.forEach(function (sel) {
+        var btns = document.querySelectorAll(sel);
+        for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+      });
+    }
+  });
 }
 function fmtDayTime(ms) {
   var d = new Date(ms);
@@ -57,13 +117,15 @@ function refreshMaintenance() {
     if (wasFull && !isFull) { location.reload(); return; }
     state.me = me;
     applyMaintenance(me.maintenance);
+    if (state.me.currentStore) { buildNav(); renderMaintFormNote(); }
   }).catch(function () {});
 }
 /* /me の maintenance を画面に反映する。全画面表示にした場合は true を返す */
 function applyMaintenance(m) {
-  state.maintenance = m || { active: null, upcoming: null };
+  state.maintenance = m || { active: null, upcoming: null, lastEnded: null };
   var active = state.maintenance.active;
   var upcoming = state.maintenance.upcoming;
+  var lastEnded = state.maintenance.lastEnded;
   var fullBox = el('maintenanceBox');
   if (active && active.level === 'full') {
     el('loadingBox').style.display = 'none';
@@ -95,9 +157,22 @@ function applyMaintenance(m) {
       var range = fmtDayTime(upcoming.startsAt) + '〜' + (upcoming.endsAt ? fmtDayTime(upcoming.endsAt) : '');
       var scope = upcoming.level === 'full' ? '全面停止' : upcoming.level === 'read_only' ? '書き込み停止' : maintFeatureText(upcoming.features);
       mb.textContent = range + ' メンテナンス予定（' + scope + '）';
-      mb.className = 'maintenance-banner upcoming';
+      /* 開始 60 分前からは警告色に格上げする (既定色が警告色、予定は情報色) */
+      mb.className = upcoming.phase === 'scheduled' ? 'maintenance-banner upcoming' : 'maintenance-banner';
       mb.style.display = '';
       el('appBox').style.marginTop = '2.7rem';
+    } else if (lastEnded && state.maintEndedDismissed !== lastEnded.endsAt) {
+      mb.innerHTML = 'メンテナンスは終了しました（' + fmtDayTime(lastEnded.endsAt) + ' 終了）' +
+        '<button type="button" class="mnt-close" aria-label="閉じる">×</button>';
+      mb.className = 'maintenance-banner ended';
+      mb.style.display = '';
+      el('appBox').style.marginTop = '2.7rem';
+      var closeBtn = mb.querySelector('.mnt-close');
+      if (closeBtn) closeBtn.onclick = function () {
+        state.maintEndedDismissed = lastEnded.endsAt;
+        mb.style.display = 'none';
+        el('appBox').style.marginTop = '';
+      };
     } else {
       mb.style.display = 'none';
       el('appBox').style.marginTop = '';
@@ -134,7 +209,7 @@ function api(path, opts) {
         err.code = data && data.error ? data.error : '';
         err.level = data && data.level ? data.level : '';
         err.endsAt = data && data.endsAt ? data.endsAt : null;
-        err.features = data && data.features ? data.features : [];
+        err.features = data && data.features ? data.features : {};
         throw err;
       }
       if ((opts.method || 'GET') !== 'GET') invalidateCache();
@@ -194,6 +269,7 @@ function msgHtml(kind, text) {
 var state = {
   me: null,
   maintenance: null,
+  maintEndedDismissed: null,
   perms: {},
   features: {},
   view: 'dashboard',
@@ -414,7 +490,9 @@ function buildNav() {
   }
   var anyRecord = RECORD_VIEWS.some(viewVisible) || viewVisible('negative');
   if (anyRecord) {
-    h += '<button class="tab-plus' + (active === 'record' ? ' active' : '') + '" data-tab="record" aria-label="記録する"><span class="plus-circle">' + icon('plus', 26) + '</span><span>記録</span></button>';
+    /* 記録系の機能がメンテナンス停止中なら、記録ボタンに小ドットを出す */
+    var recordDot = maintStageFor(['inbound', 'outbound', 'transfers']) ? '<span class="tab-dot"></span>' : '';
+    h += '<button class="tab-plus' + (active === 'record' ? ' active' : '') + '" data-tab="record" aria-label="記録する"><span class="plus-circle">' + icon('plus', 26) + '</span><span>記録</span>' + recordDot + '</button>';
   }
   if (can('stocks.read')) {
     h += '<button class="tab-item' + (active === 'history' ? ' active' : '') + '" data-tab="history">' + icon('clock', 25) + '<span>履歴</span></button>';
@@ -446,17 +524,17 @@ function updateSubbar() {
 }
 /* ---- 記録アクションシート ---- */
 var SHEET_ITEMS = [
-  { view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する' },
-  { view: 'consume', icon: 'out', color: '#ff9500', label: '消費する' },
-  { view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する' },
-  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫 (申請・承認)' },
+  { view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する', maintKeys: ['inbound'] },
+  { view: 'consume', icon: 'out', color: '#ff9500', label: '消費する', maintKeys: ['outbound'] },
+  { view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する', maintKeys: ['transfers'] },
+  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫 (申請・承認)', maintKeys: ['outbound'] },
 ];
 function openSheet() {
   var h = '<div class="sheet-title">記録する</div>';
   for (var i = 0; i < SHEET_ITEMS.length; i++) {
     var it = SHEET_ITEMS[i];
     if (!viewVisible(it.view)) continue;
-    h += '<button class="sheet-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 18) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+    h += '<button class="sheet-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 18) + '</span><span class="row-label">' + esc(it.label) + '</span>' + maintBadgeHtml(it.maintKeys) + '<span class="chev">' + icon('chevR', 18) + '</span></button>';
   }
   el('sheetBox').innerHTML = h;
   el('sheetOverlay').style.display = '';
@@ -468,13 +546,13 @@ function openSheet() {
 function closeSheet() { el('sheetOverlay').style.display = 'none'; }
 /* ---- その他 (iOS 設定風グループリスト) ---- */
 var MORE_ITEMS = [
-  { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理' },
-  { view: 'purchases', icon: 'cart', color: '#5e5ce6', label: '発注' },
-  { view: 'analytics', icon: 'chart', color: '#0091ff', label: '分析レポート' },
-  { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し' },
-  { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート' },
-  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫' },
-  { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ' },
+  { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理', maintKeys: ['master_products', 'master_locations', 'suppliers', 'csv_import'] },
+  { view: 'purchases', icon: 'cart', color: '#5e5ce6', label: '発注', maintKeys: ['purchase_orders'] },
+  { view: 'analytics', icon: 'chart', color: '#0091ff', label: '分析レポート', maintKeys: ['analytics'] },
+  { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し', maintKeys: ['stocktakes'] },
+  { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート', maintKeys: ['alerts'] },
+  { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫', maintKeys: ['outbound'] },
+  { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ', maintKeys: [] },
 ];
 function loadMore() {
   var h = '<h2>その他</h2>';
@@ -482,7 +560,7 @@ function loadMore() {
   for (var i = 0; i < MORE_ITEMS.length; i++) {
     var it = MORE_ITEMS[i];
     if (!viewVisible(it.view)) continue;
-    h += '<button class="group-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 17) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+    h += '<button class="group-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 17) + '</span><span class="row-label">' + esc(it.label) + '</span>' + maintBadgeHtml(it.maintKeys) + '<span class="chev">' + icon('chevR', 18) + '</span></button>';
   }
   if (can('admin.permissions') || can('admin.users')) {
     h += '<a class="group-row" href="/admin/permissions"><span class="row-icon" style="background:#30b0c7">' + icon('shield', 17) + '</span><span class="row-label">権限管理</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
@@ -511,6 +589,7 @@ function doLogout() {
 }
 function showView(id) {
   state.view = id;
+  currentFormNotes = [];
   buildNav();
   var loaders = {
     dashboard: loadDashboard,
@@ -913,7 +992,7 @@ function loadInbound() {
       el('view').innerHTML = '<h2>入庫</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
       return;
     }
-    var h = '<h2>入庫</h2><div id="inMsg"></div>' +
+    var h = '<h2>入庫</h2><div class="mnt-form-note" id="mntNoteInbound" style="display:none"></div><div id="inMsg"></div>' +
       '<form class="grid" id="inForm">' +
       '<div><label>商品</label><select id="inProduct" required>' +
       optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
@@ -928,6 +1007,7 @@ function loadInbound() {
       '</form>';
     el('view').innerHTML = h;
     bindSteppers();
+    setMaintFormNote('mntNoteInbound', ['inbound'], ['#inSubmit']);
     var updateHint = function () {
       var p = productOf(Number(el('inProduct').value));
       el('inProdHint').textContent = p && p.requiresExpiry ? 'この商品は有効期限が必須です' : '';
@@ -989,7 +1069,7 @@ function loadConsume() {
       el('view').innerHTML = '<h2>消費</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
       return;
     }
-    var h = '<h2>消費 (FEFO: 期限の早いロットから自動で引きます)</h2><div id="coMsg"></div>' +
+    var h = '<h2>消費 (FEFO: 期限の早いロットから自動で引きます)</h2><div class="mnt-form-note" id="mntNoteConsume" style="display:none"></div><div id="coMsg"></div>' +
       '<form class="grid" id="coForm">' +
       '<div><label>商品</label><select id="coProduct" required>' +
       optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
@@ -1004,6 +1084,7 @@ function loadConsume() {
       '</form><div id="coResult"></div>';
     el('view').innerHTML = h;
     bindSteppers();
+    setMaintFormNote('mntNoteConsume', ['outbound'], ['#coSubmit']);
     /* 在庫一覧の行タップから来た場合は対象をプリセットする */
     var coPreset = takeFormPreset('consume');
     if (coPreset) {
@@ -1063,7 +1144,7 @@ function loadTransfer() {
       el('view').innerHTML = '<h2>移動</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
       return;
     }
-    var h = '<h2>在庫移動</h2><div id="trMsg"></div>' +
+    var h = '<h2>在庫移動</h2><div class="mnt-form-note" id="mntNoteTransfer" style="display:none"></div><div id="trMsg"></div>' +
       '<form class="grid" id="trForm">' +
       '<div><label>商品</label><select id="trProduct" required>' +
       optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
@@ -1077,6 +1158,7 @@ function loadTransfer() {
       '</form><div id="trResult"></div>';
     el('view').innerHTML = h;
     bindSteppers();
+    setMaintFormNote('mntNoteTransfer', ['transfers'], ['#trSubmit']);
     var fillLots = function () {
       var pid = Number(el('trProduct').value);
       var lots = m.lots.filter(function (l) { return l.productId === pid; });
@@ -1311,8 +1393,9 @@ function onCsvImport() {
     })
     .catch(function (e) { out.innerHTML = msgHtml('error', errMsg(e)); });
 }
-function masterSection(title, tableHtml, formHtml) {
-  return '<div class="section-box"><h3>' + esc(title) + '</h3>' + tableHtml + formHtml + '</div>';
+function masterSection(title, tableHtml, formHtml, noteId) {
+  var note = noteId ? '<div class="mnt-form-note" id="' + noteId + '" style="display:none"></div>' : '';
+  return '<div class="section-box"><h3>' + esc(title) + '</h3>' + note + tableHtml + formHtml + '</div>';
 }
 function simpleTable(head, rowsHtml) {
   if (!rowsHtml) return '<p class="muted">データがありません。</p>';
@@ -1353,10 +1436,11 @@ function loadMasterView() {
         '<div><label>有効期限</label><select id="mpExpiry"><option value="">不要</option><option value="1">必須</option></select></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">商品を追加</button></div></form>';
     }
-    h += masterSection('商品', simpleTable('<th>SKU</th><th>商品名</th><th>単位</th><th>安全在庫</th><th>単価</th><th>期限</th><th>アラート</th>' + actHead, prow), pform);
+    h += masterSection('商品', simpleTable('<th>SKU</th><th>商品名</th><th>単位</th><th>安全在庫</th><th>単価</th><th>期限</th><th>アラート</th>' + actHead, prow), pform, 'mntNoteMasterProducts');
 
     if (writable && feat('csv')) {
       h += '<div class="section-box"><h3>商品 CSV インポート</h3>' +
+        '<div class="mnt-form-note" id="mntNoteCsvImport" style="display:none"></div>' +
         '<p class="small muted">ヘッダが sku,name,unit,requires_expiry の CSV を読み込みます (任意列: unit_cost)。既存の SKU はスキップされます。</p>' +
         '<input type="file" id="maCsvFile" accept=".csv,text/csv"> ' +
         '<button class="btn" id="maCsvBtn">インポート</button>' +
@@ -1374,7 +1458,7 @@ function loadMasterView() {
         '<div><label>倉庫名</label><input id="mwName" required></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">倉庫を追加</button></div></form>';
     }
-    h += masterSection('倉庫', simpleTable('<th>コード</th><th>名前</th>' + actHead, wrow), wform);
+    h += masterSection('倉庫', simpleTable('<th>コード</th><th>名前</th>' + actHead, wrow), wform, 'mntNoteMasterWarehouses');
 
     var lrow = '';
     m.locations.forEach(function (l) {
@@ -1388,7 +1472,7 @@ function loadMasterView() {
         '<div><label>場所名</label><input id="mlName" required></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">保管場所を追加</button></div></form>';
     }
-    h += masterSection('保管場所', simpleTable('<th>場所</th><th>コード</th>' + actHead, lrow), lform);
+    h += masterSection('保管場所', simpleTable('<th>場所</th><th>コード</th>' + actHead, lrow), lform, 'mntNoteMasterLocations');
 
     var lotrow = '';
     m.lots.forEach(function (l) {
@@ -1403,7 +1487,7 @@ function loadMasterView() {
         '<div><label>有効期限 (任意)</label><input id="mlotExpiry" type="date"></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">ロットを追加</button></div></form>';
     }
-    h += masterSection('ロット', simpleTable('<th>商品</th><th>ロット番号</th><th>期限</th>' + actHead, lotrow), lotform);
+    h += masterSection('ロット', simpleTable('<th>商品</th><th>ロット番号</th><th>期限</th>' + actHead, lotrow), lotform, 'mntNoteMasterLots');
 
     if (feat('purchase_orders')) {
       var srow = '';
@@ -1421,10 +1505,16 @@ function loadMasterView() {
           '<div><label>メモ (任意)</label><input id="msNote"></div>' +
           '<div><label>&nbsp;</label><button class="btn" type="submit">仕入先を追加</button></div></form>';
       }
-      h += masterSection('仕入先', simpleTable('<th>仕入先名</th><th>担当者</th><th>メール</th><th>電話</th><th>メモ</th>' + actHead, srow), sform);
+      h += masterSection('仕入先', simpleTable('<th>仕入先名</th><th>担当者</th><th>メール</th><th>電話</th><th>メモ</th>' + actHead, srow), sform, 'mntNoteMasterSuppliers');
     }
 
     el('view').innerHTML = h;
+    setMaintFormNote('mntNoteMasterProducts', ['master_products'], ['#maProductForm button[type="submit"]', 'button[data-mact="edit-product"]', 'button[data-mact="del-product"]']);
+    setMaintFormNote('mntNoteMasterWarehouses', ['master_locations'], ['#maWarehouseForm button[type="submit"]', 'button[data-mact="edit-warehouse"]', 'button[data-mact="del-warehouse"]']);
+    setMaintFormNote('mntNoteMasterLocations', ['master_locations'], ['#maLocationForm button[type="submit"]', 'button[data-mact="edit-location"]', 'button[data-mact="del-location"]']);
+    setMaintFormNote('mntNoteMasterLots', ['master_locations'], ['#maLotForm button[type="submit"]', 'button[data-mact="edit-lot"]', 'button[data-mact="del-lot"]']);
+    setMaintFormNote('mntNoteMasterSuppliers', ['suppliers'], ['#maSupplierForm button[type="submit"]', 'button[data-mact="edit-supplier"]', 'button[data-mact="del-supplier"]']);
+    setMaintFormNote('mntNoteCsvImport', ['csv_import'], ['#maCsvBtn']);
 
     var actBtns = el('view').querySelectorAll('button[data-mact]');
     for (var bi = 0; bi < actBtns.length; bi++) {
@@ -1490,7 +1580,7 @@ function loadNegative() {
     Promise.all(jobs).then(function (r) {
       var approvals = r[0] || [];
       var stocks = r[1] || [];
-      var h = '<h2>マイナス在庫</h2><div id="ngMsg"></div>';
+      var h = '<h2>マイナス在庫</h2><div class="mnt-form-note" id="mntNoteNegative" style="display:none"></div><div id="ngMsg"></div>';
       if (can('negative.request')) {
         h += '<div class="section-box"><h3>例外申請 (在庫不足でも消費できるようにする申請)</h3>' +
           '<form class="grid" id="ngForm">' +
@@ -1517,6 +1607,7 @@ function loadNegative() {
         h += '</tbody></table></div>';
       }
       el('view').innerHTML = h;
+      setMaintFormNote('mntNoteNegative', ['outbound'], ['#ngForm button[type="submit"]', 'button[data-decide]']);
       var form = el('ngForm');
       if (form) {
         form.onsubmit = function (ev) {
@@ -1563,7 +1654,7 @@ function loadStocktakes() {
       if (t.status === 'in_progress' || t.status === 'pending_approval') active = t;
     });
     var manage = can('stocktakes.manage');
-    var h = '<h2>棚卸し</h2><div id="tkMsg"></div>';
+    var h = '<h2>棚卸し</h2><div class="mnt-form-note" id="mntNoteStocktakes" style="display:none"></div><div id="tkMsg"></div>';
     h += msgHtml('info', '棚卸し実施中・差異承認待ちの間は、入庫・消費・移動などの在庫更新がすべて停止します (API は 423 を返します)。');
     if (active && active.status === 'in_progress') {
       h += msgHtml('warn', '棚卸し #' + active.id + ' が実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。各在庫の実数を入力し、終了してください。');
@@ -1590,6 +1681,7 @@ function loadStocktakes() {
       h += '</tbody></table></div>';
     }
     el('view').innerHTML = h;
+    setMaintFormNote('mntNoteStocktakes', ['stocktakes'], ['#tkStart', '#tkFinish', '#tkApprove', '#tkReject', '#tkDetail button']);
     var start = el('tkStart');
     if (start) start.onclick = function () {
       api('/api/v1/stocktakes', { method: 'POST', body: {} }).then(function () { loadStocktakes(); })
@@ -1650,6 +1742,7 @@ function renderStocktakeDetail(t) {
     }
     h += '</div>';
     box.innerHTML = h;
+    renderMaintFormNote();
     var btns = box.querySelectorAll('button[data-count-line]');
     for (var i = 0; i < btns.length; i++) {
       btns[i].onclick = function () {
@@ -1673,11 +1766,12 @@ function loadAlerts() {
   ensureMaster().then(function () {
     getJson('/api/v1/alerts').then(function (rows) {
       if (!rows || rows.length === 0) {
-        el('view').innerHTML = '<h2>アラート</h2><p class="muted">現在アラートはありません。</p>';
+        el('view').innerHTML = '<h2>アラート</h2><div class="mnt-form-note" id="mntNoteAlerts" style="display:none"></div><p class="muted">現在アラートはありません。</p>';
+        setMaintFormNote('mntNoteAlerts', ['alerts'], []);
         return;
       }
       var order = ['EXPIRED', 'NEGATIVE_STOCK', 'EXPIRING', 'LOW_STOCK'];
-      var h = '<h2>アラート</h2>';
+      var h = '<h2>アラート</h2><div class="mnt-form-note" id="mntNoteAlerts" style="display:none"></div>';
       order.forEach(function (type) {
         var group = rows.filter(function (r) { return r.type === type; });
         if (group.length === 0) return;
@@ -1690,6 +1784,7 @@ function loadAlerts() {
         h += '</tbody></table></div>';
       });
       el('view').innerHTML = h;
+      setMaintFormNote('mntNoteAlerts', ['alerts'], []);
     }).catch(function (e) {
       el('view').innerHTML = '<h2>アラート</h2>' + msgHtml('error', errMsg(e));
     });
@@ -1732,7 +1827,7 @@ function appendPoLine(m, productId, quantity, unitCost) {
 }
 function renderPurchases(m, orders, suggestions) {
   var writable = can('purchases.write');
-  var h = '<h2>発注</h2><div id="poMsg"></div>';
+  var h = '<h2>発注</h2><div class="mnt-form-note" id="mntNotePurchases" style="display:none"></div><div id="poMsg"></div>';
   if (state.flash) { h += msgHtml('success', state.flash); state.flash = ''; }
 
   h += '<div class="section-box"><h3>発注提案 (安全在庫を下回っている商品)</h3>';
@@ -1789,6 +1884,7 @@ function renderPurchases(m, orders, suggestions) {
     h += '</div>';
   });
   el('view').innerHTML = h;
+  setMaintFormNote('mntNotePurchases', ['purchase_orders'], ['#poSubmit', 'form[data-receive] button[type="submit"]', 'button[data-suggest]']);
 
   var sugs = el('view').querySelectorAll('button[data-suggest]');
   for (var si = 0; si < sugs.length; si++) {
@@ -1894,7 +1990,7 @@ function loadAnalytics() {
   ensureMaster().then(function () {
     return api('/api/v1/analytics');
   }).then(function (r) {
-    var h = '<h2>分析レポート</h2>';
+    var h = '<h2>分析レポート</h2><div class="mnt-form-note" id="mntNoteAnalytics" style="display:none"></div>';
     h += '<div class="cards">' +
       '<div class="card"><div class="num">' + yen(r.valuation.totalValue) + '</div><div class="lbl">在庫評価額 (単価設定分)</div></div>' +
       '<div class="card"><div class="num">' + Math.round(r.valuation.coverageRate * 100) + '%</div><div class="lbl">単価設定済み (' + r.valuation.pricedProducts + ' / ' + r.valuation.totalProducts + ' 商品)</div></div>' +
@@ -1923,6 +2019,7 @@ function loadAnalytics() {
       h += '</tbody></table></div>';
     }
     el('view').innerHTML = h;
+    setMaintFormNote('mntNoteAnalytics', ['analytics'], []);
   }).catch(function (e) {
     el('view').innerHTML = '<h2>分析レポート</h2>' + msgHtml('error', errMsg(e));
   });

@@ -12,6 +12,7 @@ import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
 import sessionScopeSql from '../migrations/0009_session_scope.sql?raw';
 import platformSettingsSql from '../migrations/0010_platform_settings.sql?raw';
 import windowsSql from '../migrations/0011_maintenance_windows.sql?raw';
+import extrasSql from '../migrations/0012_maintenance_extras.sql?raw';
 import { createSession } from '../src/lib/session';
 import {
   activeOccurrence,
@@ -42,6 +43,8 @@ const testEnv = env as unknown as TestEnv;
 let storeAdminToken = '';
 let platformToken = '';
 let store2StaffToken = '';
+let staffIdToken = '';
+let platformIdToken = '';
 let idemSeq = 0;
 
 async function mintToken(sub: string, email: string, privateKey: KeyLike): Promise<string> {
@@ -91,6 +94,24 @@ async function inbound(
   });
 }
 
+async function consume(token: string, productId: number, quantity: number): Promise<Response> {
+  idemSeq += 1;
+  return req(token, '/api/v1/movements/consumption', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `mw-test-${idemSeq}` },
+    body: JSON.stringify({ productId, quantity, department: '製造部', purpose: 'テスト消費' }),
+  });
+}
+
+async function transfer(token: string): Promise<Response> {
+  idemSeq += 1;
+  return req(token, '/api/v1/movements/transfer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `mw-test-${idemSeq}` },
+    body: JSON.stringify({ fromLocationId: 1, toLocationId: 2, productId: 1, quantity: 1 }),
+  });
+}
+
 interface WindowInput {
   kind: 'once' | 'weekly';
   startsAt?: number | null;
@@ -99,7 +120,7 @@ interface WindowInput {
   startMinute?: number | null;
   endMinute?: number | null;
   level: 'read_only' | 'features' | 'full';
-  features?: string[];
+  features?: string[] | Record<string, string>;
   storeId?: number | null;
   message?: string | null;
 }
@@ -146,11 +167,18 @@ async function setLegacy(on: boolean, message: string): Promise<void> {
 interface MeMaintenance {
   active: {
     level: string;
-    features: string[];
+    features: Record<string, string>;
     endsAt: number | null;
     message: string;
   } | null;
-  upcoming: { startsAt: number; endsAt: number | null; level: string } | null;
+  upcoming: {
+    startsAt: number;
+    endsAt: number | null;
+    level: string;
+    features: Record<string, string>;
+    phase: string;
+  } | null;
+  lastEnded: { endsAt: number; level: string; features: Record<string, string> } | null;
 }
 
 async function meMaintenance(token: string): Promise<MeMaintenance> {
@@ -170,12 +198,15 @@ function baseWindow(partial: Partial<MaintenanceWindow>): MaintenanceWindow {
     startMinute: null,
     endMinute: null,
     level: 'read_only',
-    features: [],
+    features: {},
     storeId: null,
     message: null,
     createdBy: 1,
     createdAt: 0,
     cancelledAt: null,
+    emergency: false,
+    reason: null,
+    extendCount: 0,
     ...partial,
   };
 }
@@ -189,12 +220,28 @@ beforeAll(async () => {
   storeAdminToken = await mintToken('sub-store-admin', 'sadmin@example.com', privateKey);
   platformToken = await mintToken('sub-platform', 'platform@example.com', privateKey);
   store2StaffToken = await mintToken('sub-store2-staff', 's2staff@example.com', privateKey);
+  staffIdToken = storeAdminToken;
+  platformIdToken = platformToken;
 
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (url === 'https://www.googleapis.com/oauth2/v3/certs') {
       return new Response(JSON.stringify({ keys: [jwk] }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url === 'https://oauth2.googleapis.com/token') {
+      const rawBody = init?.body;
+      const bodyText =
+        typeof rawBody === 'string'
+          ? rawBody
+          : rawBody instanceof URLSearchParams
+            ? rawBody.toString()
+            : '';
+      const code = new URLSearchParams(bodyText).get('code');
+      const idToken = code === 'platform-code' ? platformIdToken : staffIdToken;
+      return new Response(JSON.stringify({ id_token: idToken }), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -213,6 +260,7 @@ beforeAll(async () => {
     ...statementsOf(sessionScopeSql),
     ...statementsOf(platformSettingsSql),
     ...statementsOf(windowsSql),
+    ...statementsOf(extrasSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -421,10 +469,14 @@ describe('メンテナンスウィンドウ強制 (API)', () => {
       body: JSON.stringify({ fromLocationId: 1, toLocationId: 2, productId: 1, quantity: 1 }),
     });
     expect(transfer.status).toBe(503);
-    const tBody = (await transfer.json()) as { error: string; level: string; features: string[] };
+    const tBody = (await transfer.json()) as {
+      error: string;
+      level: string;
+      features: Record<string, string>;
+    };
     expect(tBody.error).toBe('MAINTENANCE');
     expect(tBody.level).toBe('features');
-    expect(tBody.features).toEqual(expect.arrayContaining(['transfers', 'analytics']));
+    expect(tBody.features).toEqual({ transfers: 'full', analytics: 'full' });
 
     const analytics = await req(storeAdminToken, '/api/v1/analytics');
     expect(analytics.status).toBe(503);
@@ -443,7 +495,7 @@ describe('メンテナンスウィンドウ強制 (API)', () => {
 
     const m = await meMaintenance(storeAdminToken);
     expect(m.active?.level).toBe('features');
-    expect(m.active?.features).toEqual(expect.arrayContaining(['transfers', 'analytics']));
+    expect(m.active?.features).toEqual({ transfers: 'full', analytics: 'full' });
   });
 
   it('full: /me と logout 以外すべて 503', async () => {
@@ -519,5 +571,263 @@ describe('メンテナンスウィンドウ強制 (API)', () => {
     await setLegacy(false, '');
     const m2 = await meMaintenance(storeAdminToken);
     expect(m2.active?.level).toBe('features');
+  });
+});
+
+describe('メンテナンス細分化 (0012)', () => {
+  it('旧キーは読み取り時に新キーへ展開される (movements / csv / master)', async () => {
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: ['movements', 'csv', 'master'],
+    });
+    const m = await meMaintenance(storeAdminToken);
+    expect(m.active?.features).toEqual({
+      inbound: 'full',
+      outbound: 'full',
+      csv_export: 'full',
+      csv_import: 'full',
+      master_products: 'full',
+      master_locations: 'full',
+      suppliers: 'full',
+    });
+    // 展開された inbound が実際に止まる
+    const blocked = await inbound(storeAdminToken, 1, 1, 'LOT-MW-LEGACY');
+    expect(blocked.status).toBe(503);
+  });
+
+  it('inbound と outbound は独立に止まる', async () => {
+    const seed = await inbound(storeAdminToken, 1, 1, 'LOT-MW-SPLIT');
+    expect(seed.status).toBe(201);
+
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: { inbound: 'full' },
+    });
+    const blockedIn = await inbound(storeAdminToken, 1, 1, 'LOT-MW-SPLIT2');
+    expect(blockedIn.status).toBe(503);
+    const okOut = await consume(storeAdminToken, 1, 1);
+    expect(okOut.status).toBe(201);
+
+    await resetWindows();
+    const now2 = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now2 - 60_000, endsAt: now2 + HOUR,
+      level: 'features', features: { outbound: 'full' },
+    });
+    const blockedOut = await consume(storeAdminToken, 1, 1);
+    expect(blockedOut.status).toBe(503);
+    // 負在庫の申請も outbound に含まれる
+    const approval = await req(storeAdminToken, '/api/v1/negative-approvals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stockId: 1, quantity: 1, reason: 'テスト' }),
+    });
+    expect(approval.status).toBe(503);
+    const okIn = await inbound(storeAdminToken, 1, 1, 'LOT-MW-SPLIT3');
+    expect(okIn.status).toBe(201);
+  });
+
+  it("write 段階は書き込みだけ止め、閲覧を通す", async () => {
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: { stocktakes: 'write', purchase_orders: 'write' },
+    });
+    const list = await req(storeAdminToken, '/api/v1/stocktakes');
+    expect(list.status).toBe(200);
+    const start = await req(storeAdminToken, '/api/v1/stocktakes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(start.status).toBe(503);
+    const poList = await req(storeAdminToken, '/api/v1/purchase-orders');
+    expect(poList.status).toBe(200);
+    idemSeq += 1;
+    const poCreate = await req(storeAdminToken, '/api/v1/purchase-orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': `mw-test-${idemSeq}` },
+      body: JSON.stringify({ supplierId: 1, lines: [{ productId: 1, quantity: 1 }] }),
+    });
+    expect(poCreate.status).toBe(503);
+
+    // full 段階では読み取りも止まる
+    await resetWindows();
+    const now2 = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now2 - 60_000, endsAt: now2 + HOUR,
+      level: 'features', features: { stocktakes: 'full' },
+    });
+    const listFull = await req(storeAdminToken, '/api/v1/stocktakes');
+    expect(listFull.status).toBe(503);
+  });
+
+  it('csv_export と csv_import は分離され、master も分割される', async () => {
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: { csv_export: 'full', master_products: 'full' },
+    });
+    const csv = await req(storeAdminToken, '/api/v1/stocks.csv');
+    expect(csv.status).toBe(503);
+    const exp = await req(storeAdminToken, '/api/v1/admin/export.json');
+    expect(exp.status).toBe(503);
+    // csv_import は止まらない
+    const imp = await SELF.fetch('https://example.com/api/v1/master/products/import', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${storeAdminToken}`, 'Content-Type': 'text/csv' },
+      body: 'sku,name,unit\nSKU-MW-IMP,インポート品,個',
+    });
+    expect(imp.status).toBe(200);
+    // 商品マスタは止まるが、倉庫マスタは通る
+    const product = await req(storeAdminToken, '/api/v1/master/products', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sku: 'SKU-MW-BLOCK', name: '止まる品', unit: '個' }),
+    });
+    expect(product.status).toBe(503);
+    const warehouse = await req(storeAdminToken, '/api/v1/master/warehouses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: 'WH-MW-1', name: '追加倉庫' }),
+    });
+    expect(warehouse.status).toBe(201);
+
+    await resetWindows();
+    const now2 = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now2 - 60_000, endsAt: now2 + HOUR,
+      level: 'features', features: { csv_import: 'full', suppliers: 'full', master_locations: 'full' },
+    });
+    const imp2 = await SELF.fetch('https://example.com/api/v1/master/products/import', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${storeAdminToken}`, 'Content-Type': 'text/csv' },
+      body: 'sku,name,unit\nSKU-MW-IMP2,インポート品2,個',
+    });
+    expect(imp2.status).toBe(503);
+    const csv2 = await req(storeAdminToken, '/api/v1/stocks.csv');
+    expect(csv2.status).toBe(200);
+    const supplier = await req(storeAdminToken, '/api/v1/master/suppliers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: '仕入先MW' }),
+    });
+    expect(supplier.status).toBe(503);
+    const warehouse2 = await req(storeAdminToken, '/api/v1/master/warehouses', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: 'WH-MW-2', name: '止まる倉庫' }),
+    });
+    expect(warehouse2.status).toBe(503);
+  });
+
+  it('upcoming の phase は開始までの時間で切り替わる', async () => {
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now + 2 * HOUR, endsAt: now + 3 * HOUR, level: 'read_only',
+    });
+    expect((await meMaintenance(storeAdminToken)).upcoming?.phase).toBe('scheduled');
+
+    await resetWindows();
+    await insertWindow({
+      kind: 'once', startsAt: now + 30 * 60_000, endsAt: now + HOUR, level: 'read_only',
+    });
+    expect((await meMaintenance(storeAdminToken)).upcoming?.phase).toBe('warning');
+
+    await resetWindows();
+    await insertWindow({
+      kind: 'once', startsAt: now + 5 * 60_000, endsAt: now + HOUR, level: 'read_only',
+    });
+    const m = await meMaintenance(storeAdminToken);
+    expect(m.upcoming?.phase).toBe('imminent');
+  });
+
+  it('lastEnded は終了後 30 分だけ返る', async () => {
+    const now = Date.now();
+    const endsAt = now - 5 * 60_000;
+    await insertWindow({
+      kind: 'once', startsAt: now - HOUR, endsAt, level: 'features', features: { transfers: 'full' },
+    });
+    const m = await meMaintenance(storeAdminToken);
+    expect(m.active).toBeNull();
+    expect(m.lastEnded?.endsAt).toBe(endsAt);
+    expect(m.lastEnded?.level).toBe('features');
+    expect(m.lastEnded?.features).toEqual({ transfers: 'full' });
+
+    await resetWindows();
+    await insertWindow({
+      kind: 'once', startsAt: now - 2 * HOUR, endsAt: now - 40 * 60_000, level: 'read_only',
+    });
+    expect((await meMaintenance(storeAdminToken)).lastEnded).toBeNull();
+  });
+
+  it('拒否件数が window × グループ × 店舗で数えられる', async () => {
+    const seed = await inbound(storeAdminToken, 1, 1, 'LOT-MW-CNT');
+    expect(seed.status).toBe(201);
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: { transfers: 'full', analytics: 'full' },
+    });
+    const win = await testEnv.DB.prepare('SELECT MAX(id) AS id FROM maintenance_windows').first<{
+      id: number;
+    }>();
+    const windowId = win?.id ?? 0;
+    expect(windowId).toBeGreaterThan(0);
+
+    expect((await transfer(storeAdminToken)).status).toBe(503);
+    expect((await transfer(storeAdminToken)).status).toBe(503);
+    expect((await req(storeAdminToken, '/api/v1/analytics')).status).toBe(503);
+    // 対象外は数えない
+    expect((await inbound(storeAdminToken, 1, 1, 'LOT-MW-CNT2')).status).toBe(201);
+
+    const rows = await testEnv.DB.prepare(
+      'SELECT feature_key, store_id, blocked_count FROM maintenance_rejections WHERE window_id = ?1 ORDER BY feature_key',
+    )
+      .bind(windowId)
+      .all<{ feature_key: string; store_id: number; blocked_count: number }>();
+    expect(rows.results).toEqual([
+      { feature_key: 'analytics', store_id: 1, blocked_count: 1 },
+      { feature_key: 'transfers', store_id: 1, blocked_count: 2 },
+    ]);
+  });
+
+  it('login 停止: 新規ログインは止まり、既存セッションと全体管理者は通る', async () => {
+    const now = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR,
+      level: 'features', features: { login: 'full' }, message: 'ログイン停止中',
+    });
+
+    const loginStart = await SELF.fetch('https://example.com/auth/login', { redirect: 'manual' });
+    expect(loginStart.status).toBe(503);
+
+    const staffCallback = await SELF.fetch('https://example.com/auth/callback?code=staff-code');
+    expect(staffCallback.status).toBe(503);
+    expect(staffCallback.headers.get('set-cookie') ?? '').not.toContain('session=');
+
+    // 全体管理者はログインできる
+    const adminCallback = await SELF.fetch('https://example.com/auth/callback?code=platform-code');
+    expect(adminCallback.status).toBe(200);
+    expect(adminCallback.headers.get('set-cookie') ?? '').toContain('session=');
+
+    // 既存セッションはそのまま使える
+    const sessionToken = await createSession(testEnv.DB, 1);
+    const meRes = await SELF.fetch('https://example.com/api/v1/me', {
+      headers: { Cookie: `session=${sessionToken}` },
+    });
+    expect(meRes.status).toBe(200);
+
+    // 店舗指定の login 枠はログインには効かない
+    await resetWindows();
+    const now2 = Date.now();
+    await insertWindow({
+      kind: 'once', startsAt: now2 - 60_000, endsAt: now2 + HOUR,
+      level: 'features', features: { login: 'full' }, storeId: 1,
+    });
+    const loginStart2 = await SELF.fetch('https://example.com/auth/login', { redirect: 'manual' });
+    expect(loginStart2.status).toBe(302);
   });
 });

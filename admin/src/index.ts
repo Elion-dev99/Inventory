@@ -30,10 +30,16 @@ import {
 } from '../../workers/src/lib/features';
 import {
   activeOccurrence,
+  featureMapFromEntries,
+  LEGACY_FEATURE_EXPANSION,
+  LEGACY_FEATURE_KEYS,
   loadMaintenanceWindows,
   MAINTENANCE_FEATURE_KEYS,
+  MAINTENANCE_WRITE_STAGE_KEYS,
   nextOccurrence,
   normalizeWindow,
+  type MaintenanceFeatureMap,
+  type MaintenanceFeatureStage,
   type MaintenanceWindow,
   type MaintenanceWindowRow,
 } from '../../workers/src/lib/maintenance';
@@ -1000,9 +1006,78 @@ function maintenanceWindowJson(
     createdBy: w.createdBy,
     createdAt: w.createdAt,
     cancelledAt: w.cancelledAt,
+    emergency: w.emergency,
+    reason: w.reason,
+    extendCount: w.extendCount,
     state,
     occurrenceStartsAt,
     occurrenceEndsAt,
+  };
+}
+
+/** 緊急枠の最長 (作成・延長後とも starts_at から 4 時間まで) */
+const EMERGENCY_MAX_MS = 4 * 60 * 60_000;
+
+interface WindowReport {
+  /** 予定の長さ (分)。単発で終了が決まっている場合のみ */
+  plannedMinutes: number | null;
+  /** 実際に止まっていた長さ (分)。終了済みの単発のみ */
+  actualMinutes: number | null;
+  extendCount: number;
+  /** 503 で拒否した件数 (maintenance_rejections の集計) */
+  rejections: number;
+  rejectionsByFeature: Record<string, number>;
+}
+
+/** maintenance_rejections を window ごとに集計する (テーブルが無い環境では空) */
+async function rejectionStats(
+  db: D1Database,
+  windowIds: number[],
+): Promise<Map<number, { total: number; byFeature: Record<string, number> }>> {
+  const out = new Map<number, { total: number; byFeature: Record<string, number> }>();
+  if (windowIds.length === 0) return out;
+  try {
+    const { results } = await db
+      .prepare(
+        `SELECT window_id, feature_key, SUM(blocked_count) AS n FROM maintenance_rejections
+          WHERE window_id IN (${windowIds.map(() => '?').join(',')})
+          GROUP BY window_id, feature_key`,
+      )
+      .bind(...windowIds)
+      .all<{ window_id: number; feature_key: string; n: number }>();
+    for (const r of results) {
+      const entry = out.get(r.window_id) ?? { total: 0, byFeature: {} };
+      entry.total += r.n;
+      entry.byFeature[r.feature_key] = r.n;
+      out.set(r.window_id, entry);
+    }
+  } catch {
+    // migration 0012 未適用の環境では集計なし
+  }
+  return out;
+}
+
+/** 履歴表示用の実施レポートを作る */
+function windowReport(
+  w: MaintenanceWindow,
+  stats: { total: number; byFeature: Record<string, number> } | undefined,
+  now: number,
+): WindowReport {
+  let plannedMinutes: number | null = null;
+  let actualMinutes: number | null = null;
+  if (w.kind === 'once' && w.startsAt !== null) {
+    if (w.endsAt !== null) plannedMinutes = Math.round((w.endsAt - w.startsAt) / 60_000);
+    const endedAt = w.cancelledAt ?? w.endsAt;
+    if (endedAt !== null && endedAt <= now && endedAt > w.startsAt) {
+      actualMinutes = Math.round((endedAt - w.startsAt) / 60_000);
+    }
+  }
+  return {
+    plannedMinutes,
+    actualMinutes,
+    extendCount: w.extendCount,
+    rejections: stats?.total ?? 0,
+    rejectionsByFeature: stats?.byFeature ?? {},
   };
 }
 
@@ -1037,7 +1112,7 @@ function windowJsonFor(
   return maintenanceWindowJson(w, w.storeId !== null ? (names.get(w.storeId) ?? null) : null, now);
 }
 
-/** メンテナンス一覧: 実施中 / 予定 / 直近の履歴 (終了・取消 20 件) */
+/** メンテナンス一覧: 実施中 / 予定 / 直近の履歴 (終了・取消 20 件、実施レポートつき) */
 app.get('/api/platform/maintenance', async (c) => {
   requirePlatformAdmin(c);
   const now = Date.now();
@@ -1047,17 +1122,76 @@ app.get('/api/platform/maintenance', async (c) => {
   const byOccurrence = (a: Record<string, unknown>, b: Record<string, unknown>) =>
     ((a.occurrenceStartsAt as number | null) ?? Number.MAX_SAFE_INTEGER) -
     ((b.occurrenceStartsAt as number | null) ?? Number.MAX_SAFE_INTEGER);
-  const recentKey = (i: Record<string, unknown>) =>
-    (i.cancelledAt as number | null) ?? (i.endsAt as number | null) ?? (i.createdAt as number);
+  const recentWindows = windows
+    .filter((w) => {
+      const item = items.find((i) => i.id === w.id);
+      return item?.state === 'finished' || item?.state === 'cancelled';
+    })
+    .sort((a, b) => {
+      const ka = a.cancelledAt ?? a.endsAt ?? a.createdAt;
+      const kb = b.cancelledAt ?? b.endsAt ?? b.createdAt;
+      return kb - ka;
+    })
+    .slice(0, 20);
+  const stats = await rejectionStats(c.env.DB, recentWindows.map((w) => w.id));
   return c.json({
     active: items.filter((i) => i.state === 'active').sort(byOccurrence),
     scheduled: items.filter((i) => i.state === 'scheduled').sort(byOccurrence),
-    recent: items
-      .filter((i) => i.state === 'finished' || i.state === 'cancelled')
-      .sort((a, b) => recentKey(b) - recentKey(a))
-      .slice(0, 20),
+    recent: recentWindows.map((w) => ({
+      ...windowJsonFor(w, names, now),
+      report: windowReport(w, stats.get(w.id), now),
+    })),
   });
 });
+
+/** features の入力形式: 旧形式の配列 (全キー 'full') と新形式の段階マップの両対応 */
+const featuresInputSchema = z.union([
+  z.array(z.string()),
+  z.record(z.string(), z.enum(['write', 'full'])),
+]);
+
+function invalidWindow(message: string): ApiError {
+  return new ApiError(422, 'INVALID_WINDOW', message);
+}
+
+/**
+ * features 入力 (配列 or { key: stage } マップ) を検証して実効マップにする。
+ * 未知キーは 422、'write' を持てない機能への 'write' 指定も 422。
+ * 旧キーは新キーへ展開する (lib の featureMapFromEntries)。
+ */
+function normalizeFeaturesInput(raw: unknown): MaintenanceFeatureMap {
+  const entries: [string, MaintenanceFeatureStage][] = [];
+  if (Array.isArray(raw)) {
+    for (const v of raw) {
+      if (typeof v === 'string') entries.push([v, 'full']);
+    }
+  } else if (raw !== null && typeof raw === 'object') {
+    for (const [key, stage] of Object.entries(raw as Record<string, unknown>)) {
+      entries.push([key, stage === 'write' ? 'write' : 'full']);
+    }
+  }
+  if (entries.length === 0) {
+    throw invalidWindow('features level requires at least one feature');
+  }
+  for (const [key, stage] of entries) {
+    if (!MAINTENANCE_FEATURE_KEYS.has(key) && !LEGACY_FEATURE_KEYS.has(key)) {
+      throw invalidWindow(`Unknown feature: ${key}`);
+    }
+    if (stage === 'write') {
+      const targets = MAINTENANCE_FEATURE_KEYS.has(key)
+        ? [key]
+        : [...(LEGACY_FEATURE_EXPANSION[key] ?? [])];
+      if (targets.some((t) => !MAINTENANCE_WRITE_STAGE_KEYS.has(t))) {
+        throw invalidWindow(`Feature does not support write-only stop: ${key}`);
+      }
+    }
+  }
+  const map = featureMapFromEntries(entries);
+  if (Object.keys(map).length === 0) {
+    throw invalidWindow('features level requires at least one feature');
+  }
+  return map;
+}
 
 const createWindowBodySchema = z.object({
   kind: z.enum(['once', 'weekly']),
@@ -1067,24 +1201,20 @@ const createWindowBodySchema = z.object({
   startMinute: z.number().int().min(0).max(1439).optional(),
   endMinute: z.number().int().min(1).max(2880).optional(),
   level: z.enum(['read_only', 'features', 'full']),
-  features: z.array(z.string()).optional(),
+  features: featuresInputSchema.optional(),
   storeId: z.number().int().positive().nullable().optional(),
   message: z.string().max(500).nullable().optional(),
+  emergency: z.boolean().optional(),
+  reason: z.string().max(500).nullable().optional(),
 });
 
 /** メンテナンス枠の作成。意味的な検証違反は 422 */
 app.post('/api/platform/maintenance/windows', async (c) => {
   requirePlatformAdmin(c);
   const dto = parseWith(createWindowBodySchema, await parseJson(c));
-  const invalid = (message: string) => new ApiError(422, 'INVALID_WINDOW', message);
+  const invalid = invalidWindow;
 
-  if (dto.level === 'features') {
-    const feats = dto.features ?? [];
-    if (feats.length === 0) throw invalid('features level requires at least one feature');
-    for (const f of feats) {
-      if (!MAINTENANCE_FEATURE_KEYS.has(f)) throw invalid(`Unknown feature: ${f}`);
-    }
-  }
+  const featureMap = dto.level === 'features' ? normalizeFeaturesInput(dto.features) : null;
 
   let startsAt: number | null = null;
   let endsAt: number | null = null;
@@ -1109,34 +1239,64 @@ app.post('/api/platform/maintenance/windows', async (c) => {
     await storeRow(c, dto.storeId); // 無ければ 404
   }
 
-  const features = dto.level === 'features' ? JSON.stringify(dto.features ?? []) : null;
-  const res = await c.env.DB.prepare(
-    `INSERT INTO maintenance_windows
-       (kind, starts_at, ends_at, weekday, start_minute, end_minute, level, features, store_id, message, created_by, created_at, cancelled_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)`,
-  )
-    .bind(
-      dto.kind,
-      startsAt,
-      endsAt,
-      weekday,
-      startMinute,
-      endMinute,
-      dto.level,
-      features,
-      dto.storeId ?? null,
-      dto.message ?? null,
-      user(c).userId,
-      Date.now(),
+  // 緊急枠: 理由必須・単発のみ・終了必須・最長 4 時間
+  const emergency = dto.emergency === true;
+  const reason = dto.reason?.trim() ? dto.reason.trim() : null;
+  if (emergency) {
+    if (!reason) throw invalid('reason is required for emergency windows');
+    if (dto.kind !== 'once') throw invalid('emergency windows must be once');
+    if (startsAt === null || endsAt === null) {
+      throw invalid('emergency windows require both startsAt and endsAt');
+    }
+    if (endsAt - startsAt > EMERGENCY_MAX_MS) {
+      throw invalid('emergency windows are limited to 4 hours');
+    }
+  }
+
+  const features = featureMap ? JSON.stringify(featureMap) : null;
+  const baseBinds: (string | number | null)[] = [
+    dto.kind,
+    startsAt,
+    endsAt,
+    weekday,
+    startMinute,
+    endMinute,
+    dto.level,
+    features,
+    dto.storeId ?? null,
+    dto.message ?? null,
+    user(c).userId,
+    Date.now(),
+  ];
+  let res: D1Result;
+  try {
+    res = await c.env.DB.prepare(
+      `INSERT INTO maintenance_windows
+         (kind, starts_at, ends_at, weekday, start_minute, end_minute, level, features, store_id, message, created_by, created_at, cancelled_at, emergency, reason, extend_count)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14, 0)`,
     )
-    .run();
+      .bind(...baseBinds, emergency ? 1 : 0, reason)
+      .run();
+  } catch {
+    // migration 0012 未適用の DB では緊急列なしで作る (検証は済んでいる)
+    res = await c.env.DB.prepare(
+      `INSERT INTO maintenance_windows
+         (kind, starts_at, ends_at, weekday, start_minute, end_minute, level, features, store_id, message, created_by, created_at, cancelled_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)`,
+    )
+      .bind(...baseBinds)
+      .run();
+  }
   const id = Number(res.meta.last_row_id);
   await platformAudit(
     c,
     'platform.maintenance.create',
     'maintenance_window',
     String(id),
-    { kind: dto.kind, level: dto.level, startsAt, endsAt, weekday, startMinute, endMinute },
+    {
+      kind: dto.kind, level: dto.level, startsAt, endsAt, weekday, startMinute, endMinute,
+      emergency, reason,
+    },
     dto.storeId ?? null,
   );
   const names = await storeNameMap(c);
@@ -1163,15 +1323,28 @@ app.post('/api/platform/maintenance/windows/:id/extend', async (c) => {
   const now = Date.now();
   const endsAt =
     w.endsAt === null ? now + dto.minutes * 60_000 : w.endsAt + dto.minutes * 60_000;
+  // 緊急枠は延長後も開始から 4 時間を超えられない
+  if (w.emergency && w.startsAt !== null && endsAt - w.startsAt > EMERGENCY_MAX_MS) {
+    throw new ApiError(422, 'EMERGENCY_TOO_LONG', 'Emergency windows are limited to 4 hours from start');
+  }
   await c.env.DB.prepare('UPDATE maintenance_windows SET ends_at = ?1 WHERE id = ?2')
     .bind(endsAt, id)
     .run();
+  try {
+    await c.env.DB.prepare(
+      'UPDATE maintenance_windows SET extend_count = COALESCE(extend_count, 0) + 1 WHERE id = ?1',
+    )
+      .bind(id)
+      .run();
+  } catch {
+    // migration 0012 未適用の環境では回数を数えない
+  }
   await platformAudit(
     c,
     'platform.maintenance.extend',
     'maintenance_window',
     String(id),
-    { minutes: dto.minutes, endsAt },
+    { minutes: dto.minutes, endsAt, extendCount: w.extendCount + 1 },
     w.storeId,
   );
   const names = await storeNameMap(c);
@@ -1216,6 +1389,300 @@ app.post('/api/platform/maintenance/windows/:id/end', async (c) => {
   const names = await storeNameMap(c);
   const updated = await maintenanceWindowById(c, id);
   return c.json(windowJsonFor(updated, names, Date.now()));
+});
+
+const previewBodySchema = z.object({
+  level: z.enum(['read_only', 'features', 'full']),
+  features: featuresInputSchema.optional(),
+  storeId: z.number().int().positive().nullable().optional(),
+  startsAt: z.number().int().positive().optional(),
+  endsAt: z.number().int().positive().nullable().optional(),
+});
+
+/**
+ * 機能グループと監査 action の対応 (preview の操作件数集計用)。
+ * マスタ編集や CSV などは監査ログに操作が残らないため常に 0 になる近似。
+ */
+const PREVIEW_OPS_ACTIONS: Record<string, string[]> = {
+  inbound: ['stock.inbound'],
+  outbound: ['stock.consume', 'negative_approval.approved', 'negative_approval.rejected'],
+  transfers: ['stock.transfer'],
+  stocktakes: ['stocktake.start', 'stocktake.finish', 'stocktake.decide'],
+  purchase_orders: ['purchase_order.create', 'purchase_order.receive'],
+  suppliers: [],
+  csv_export: [],
+  csv_import: [],
+  master_products: [],
+  master_locations: [],
+  analytics: [],
+  alerts: [],
+  login: [],
+};
+
+/**
+ * 影響プレビュー: 保存前に「誰が・何が止まるか」を集計する。
+ * - affectedUsers: 対象店舗の割当ユーザー数 (全店舗なら全ユーザー数)
+ * - activeSessions: セッションは店舗に紐づかないため、対象ユーザーの
+ *   有効セッション数で近似する (スコープは区別しない)
+ * - recentOps: 選択グループごとの直近 7 日の関連操作件数 (監査ログの
+ *   action 対応づけによる近似。対応 action が無いグループは 0)
+ * - overlaps: 時間が重なる既存 window (once は区間の重なり、weekly は
+ *   区間内の次回 occurrence で判定する近似)
+ */
+app.post('/api/platform/maintenance/preview', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(previewBodySchema, await parseJson(c));
+  const db = c.env.DB;
+  const storeId = dto.storeId ?? null;
+  if (storeId !== null) await storeRow(c, storeId); // 無ければ 404
+
+  let affectedUsers = 0;
+  try {
+    const row = storeId
+      ? await db
+          .prepare('SELECT COUNT(DISTINCT user_id) AS n FROM user_roles WHERE store_id = ?1')
+          .bind(storeId)
+          .first<{ n: number }>()
+      : await db.prepare('SELECT COUNT(*) AS n FROM users').first<{ n: number }>();
+    affectedUsers = row?.n ?? 0;
+  } catch {
+    affectedUsers = 0;
+  }
+
+  const now = Date.now();
+  let activeSessions = 0;
+  try {
+    const row = storeId
+      ? await db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM sessions
+              WHERE expires_at > ?1
+                AND user_id IN (SELECT user_id FROM user_roles WHERE store_id = ?2)`,
+          )
+          .bind(now, storeId)
+          .first<{ n: number }>()
+      : await db
+          .prepare('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?1')
+          .bind(now)
+          .first<{ n: number }>();
+    activeSessions = row?.n ?? 0;
+  } catch {
+    activeSessions = 0;
+  }
+
+  // 対象グループ: features レベルは選択分、それ以外は全グループ
+  let targetKeys: string[];
+  if (dto.level === 'features' && dto.features !== undefined) {
+    targetKeys = Object.keys(normalizeFeaturesInput(dto.features));
+  } else {
+    targetKeys = Object.keys(PREVIEW_OPS_ACTIONS);
+  }
+  const since = now - 7 * 86_400_000;
+  const recentOps: Record<string, number> = {};
+  for (const key of targetKeys) {
+    const actions = PREVIEW_OPS_ACTIONS[key] ?? [];
+    if (actions.length === 0) {
+      recentOps[key] = 0;
+      continue;
+    }
+    try {
+      const placeholders = actions.map(() => '?').join(',');
+      const row = storeId
+        ? await db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM audit_logs
+                WHERE created_at >= ? AND store_id = ? AND action IN (${placeholders})`,
+            )
+            .bind(since, storeId, ...actions)
+            .first<{ n: number }>()
+        : await db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM audit_logs
+                WHERE created_at >= ? AND action IN (${placeholders})`,
+            )
+            .bind(since, ...actions)
+            .first<{ n: number }>();
+      recentOps[key] = row?.n ?? 0;
+    } catch {
+      recentOps[key] = 0;
+    }
+  }
+
+  let overlaps: Record<string, unknown>[] = [];
+  if (dto.startsAt !== undefined) {
+    const start = dto.startsAt;
+    const end = dto.endsAt ?? null;
+    const names = await storeNameMap(c);
+    const windows = await loadMaintenanceWindows(db);
+    const hit: MaintenanceWindow[] = [];
+    for (const w of windows) {
+      if (w.cancelledAt !== null) continue;
+      // 店舗が重ならない枠は影響しない (片方が全店舗なら重なる)
+      if (storeId !== null && w.storeId !== null && w.storeId !== storeId) continue;
+      if (w.kind === 'once') {
+        if (w.startsAt === null) continue;
+        const wEnd = w.endsAt ?? Number.POSITIVE_INFINITY;
+        if (w.startsAt < (end ?? Number.POSITIVE_INFINITY) && wEnd > start) hit.push(w);
+      } else {
+        const next = nextOccurrence(w, start - 1);
+        if (next && (end === null || next.startsAt < end)) hit.push(w);
+      }
+    }
+    overlaps = hit.map((w) => windowJsonFor(w, names, now));
+  }
+
+  return c.json({ affectedUsers, activeSessions, recentOps, overlaps });
+});
+
+// ------------------------------------------------------------ メンテナンスプリセット
+
+const PRESETS_SETTING_KEY = 'maintenance_presets';
+
+interface MaintenancePreset {
+  id: string;
+  name: string;
+  level: string;
+  features: MaintenanceFeatureMap | null;
+  storeId: number | null;
+  message: string | null;
+}
+
+/** 未保存時に GET で返す既定の雛形 (保存はしない) */
+const DEFAULT_MAINTENANCE_PRESETS: MaintenancePreset[] = [
+  {
+    id: 'default-monthly-stocktake',
+    name: '月次棚卸し',
+    level: 'features',
+    features: { stocktakes: 'full' },
+    storeId: null,
+    message: '棚卸しのため停止中',
+  },
+  {
+    id: 'default-sunday-night',
+    name: '日曜深夜の定期',
+    level: 'read_only',
+    features: null,
+    storeId: null,
+    message: '定期メンテナンス',
+  },
+  {
+    id: 'default-emergency-full',
+    name: '緊急全面停止',
+    level: 'full',
+    features: null,
+    storeId: null,
+    message: null,
+  },
+  {
+    id: 'default-purchase-close',
+    name: '発注締め処理',
+    level: 'features',
+    features: { purchase_orders: 'write' },
+    storeId: null,
+    message: null,
+  },
+];
+
+/** 保存済みプリセットを読む。未保存・破損時は null (= 既定を返す) */
+async function readStoredPresets(db: D1Database): Promise<MaintenancePreset[] | null> {
+  try {
+    const row = await db
+      .prepare('SELECT value FROM platform_settings WHERE key = ?1')
+      .bind(PRESETS_SETTING_KEY)
+      .first<{ value: string | null }>();
+    if (!row?.value) return null;
+    const parsed = JSON.parse(row.value) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    const out: MaintenancePreset[] = [];
+    for (const p of parsed) {
+      if (p === null || typeof p !== 'object') continue;
+      const rec = p as Record<string, unknown>;
+      if (typeof rec.id !== 'string' || typeof rec.name !== 'string') continue;
+      out.push({
+        id: rec.id,
+        name: rec.name,
+        level: typeof rec.level === 'string' ? rec.level : 'read_only',
+        features:
+          rec.features !== null && typeof rec.features === 'object'
+            ? (rec.features as MaintenanceFeatureMap)
+            : null,
+        storeId: typeof rec.storeId === 'number' ? rec.storeId : null,
+        message: typeof rec.message === 'string' ? rec.message : null,
+      });
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+async function writeStoredPresets(
+  c: AppContext,
+  presets: MaintenancePreset[],
+): Promise<void> {
+  await c.env.DB.prepare(
+    `INSERT INTO platform_settings (key, value, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+  )
+    .bind(PRESETS_SETTING_KEY, JSON.stringify(presets), user(c).userId, new Date().toISOString())
+    .run();
+}
+
+/** プリセット一覧 (未保存時は既定 4 件) */
+app.get('/api/platform/maintenance/presets', async (c) => {
+  requirePlatformAdmin(c);
+  const stored = await readStoredPresets(c.env.DB);
+  return c.json({ presets: stored ?? DEFAULT_MAINTENANCE_PRESETS });
+});
+
+const createPresetBodySchema = z.object({
+  // 名前必須は下の手動チェックで 422 にする (他の業務検証と揃える)
+  name: z.string().max(100).optional(),
+  level: z.enum(['read_only', 'features', 'full']),
+  features: featuresInputSchema.optional(),
+  storeId: z.number().int().positive().nullable().optional(),
+  message: z.string().max(500).nullable().optional(),
+});
+
+/** プリセット保存。まだ何も保存していない場合は既定 4 件も一緒に残す */
+app.post('/api/platform/maintenance/presets', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(createPresetBodySchema, await parseJson(c));
+  const name = (dto.name ?? '').trim();
+  if (!name) throw invalidWindow('preset name is required');
+  if (dto.storeId !== undefined && dto.storeId !== null) {
+    await storeRow(c, dto.storeId); // 無ければ 404
+  }
+  const features = dto.level === 'features' ? normalizeFeaturesInput(dto.features) : null;
+  const preset: MaintenancePreset = {
+    id: crypto.randomUUID(),
+    name,
+    level: dto.level,
+    features,
+    storeId: dto.storeId ?? null,
+    message: dto.message ?? null,
+  };
+  const stored = await readStoredPresets(c.env.DB);
+  const list = [...(stored ?? DEFAULT_MAINTENANCE_PRESETS), preset];
+  await writeStoredPresets(c, list);
+  await platformAudit(c, 'platform.maintenance.preset.create', 'maintenance_preset', preset.id, {
+    name,
+    level: dto.level,
+  }, preset.storeId);
+  return c.json({ presets: list }, 201);
+});
+
+/** プリセット削除 */
+app.delete('/api/platform/maintenance/presets/:id', async (c) => {
+  requirePlatformAdmin(c);
+  const id = c.req.param('id');
+  const stored = await readStoredPresets(c.env.DB);
+  const base = stored ?? DEFAULT_MAINTENANCE_PRESETS;
+  const list = base.filter((p) => p.id !== id);
+  if (list.length === base.length) throw notFound('Preset not found');
+  await writeStoredPresets(c, list);
+  await platformAudit(c, 'platform.maintenance.preset.delete', 'maintenance_preset', id, {}, null);
+  return c.json({ presets: list });
 });
 
 /** 全セッション失効 (呼び出し元 = 操作中の全体管理者自身のセッションは残す) */

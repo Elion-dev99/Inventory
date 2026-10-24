@@ -26,6 +26,9 @@ const EXTRA_CSS = `
 .mnt-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.42rem 0.75rem; border: 1px solid var(--line-strong); border-radius: 980px; background: var(--surface-2); color: var(--fg); font-size: 0.92rem; white-space: nowrap; cursor: pointer; }
 .mnt-chip input { margin: 0; flex: none; }
 .mnt-chip:has(input:checked) { background: var(--control); border-color: var(--accent); }
+.mnt-chip select { margin: 0; flex: none; max-width: 10em; }
+.mnt-chip.on { background: var(--control); border-color: var(--accent); }
+.mnt-preset-del { border: 0; background: transparent; color: var(--danger); cursor: pointer; font: inherit; padding: 0 0.1rem; }
 /* 中幅以下ではフォーム行を 1 カラムに積み、コントロールを全幅にする
    (.group-row は折り返しなしの flex のため、狭幅ではラベルが潰れ入力欄がはみ出す) */
 @media (max-width: 900px) {
@@ -127,6 +130,15 @@ export const CONSOLE_HTML = `<!doctype html>
   <h3>メンテナンス</h3>
   <p class="small muted">実施中・予定は店舗アプリへ自動で反映されます (最大30秒)。全体管理者はメンテナンス中も店舗アプリを操作できます。</p>
   <div id="mntNow"><div class="skl skl-row"></div></div>
+  <h4>プリセット</h4>
+  <div class="group">
+    <div class="group-row static mnt-chips" id="mntPresets"></div>
+    <div class="group-row static">
+      <input id="mntPresetName" type="text" placeholder="プリセット名" style="flex:1;">
+      <button class="btn small secondary" id="mntPresetSaveBtn">現在の入力をプリセットとして保存</button>
+    </div>
+    <p class="small muted">チップを選ぶと「予定を追加」の入力に反映されます。保存は「予定を追加」側の現在の入力 (止め方・対象機能・対象店舗・告知文) を使います。</p>
+  </div>
   <h4>今すぐ開始</h4>
   <div class="group">
     <div class="group-row static">
@@ -140,6 +152,16 @@ export const CONSOLE_HTML = `<!doctype html>
       <button class="btn small" id="mntStartBtn">開始</button>
     </div>
     <div class="group-row static mnt-chips" id="mntStartFeatures" style="display:none;"></div>
+    <div class="group-row static">
+      <label><input type="checkbox" id="mntStartEmergency"> 緊急</label>
+      <label id="mntStartDurationWrap" style="display:none;">終了 <select id="mntStartDuration">
+        <option value="60">1時間後</option>
+        <option value="120">2時間後</option>
+        <option value="240">4時間後</option>
+      </select></label>
+      <input id="mntStartReason" type="text" placeholder="緊急の理由 (緊急時は必須)" style="flex:1; display:none;">
+    </div>
+    <p class="small muted" id="mntStartPreview"></p>
   </div>
   <h4>予定を追加</h4>
   <div class="group">
@@ -158,7 +180,7 @@ export const CONSOLE_HTML = `<!doctype html>
     <div class="group-row static" id="mntOnceFields">
       <label>開始 <input id="mntOnceStart" type="datetime-local"></label>
       <label>終了 <input id="mntOnceEnd" type="datetime-local"></label>
-      <span class="small muted">終了を空にすると終了未定</span>
+      <span class="small muted">終了を空にすると終了未定 (緊急時は終了必須)</span>
     </div>
     <div class="group-row static" id="mntWeeklyFields" style="display:none;">
       <label>曜日 <select id="mntWeekday">
@@ -172,9 +194,15 @@ export const CONSOLE_HTML = `<!doctype html>
     </div>
     <div class="group-row static mnt-chips" id="mntFeatures" style="display:none;"></div>
     <div class="group-row static">
+      <label><input type="checkbox" id="mntEmergency"> 緊急</label>
+      <input id="mntReason" type="text" placeholder="緊急の理由 (緊急時は必須)" style="flex:1; display:none;">
+    </div>
+    <p class="small muted" id="mntEmergencyNote" style="display:none;">緊急は単発のみ・終了必須・最長4時間です。理由は監査に残ります。</p>
+    <div class="group-row static">
       <input id="mntMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
       <button class="btn small" id="mntAddBtn">予定を追加</button>
     </div>
+    <p class="small muted" id="mntPreview"></p>
   </div>
   <h4>実施中・予定</h4>
   <div id="mntList"><div class="skl skl-row"></div></div>
@@ -624,14 +652,19 @@ async function loadSystem() {
 }
 
 /* ---------------- メンテナンス ---------------- */
+/* [キー, 表示名, 'write' (書込のみ停止) を選べるか] */
 const MNT_FEATURE_OPTS = [
-  ['movements', '入庫・消費'], ['transfers', '移動'], ['stocktakes', '棚卸し'],
-  ['purchase_orders', '発注'], ['csv', 'CSV'], ['master', 'マスタ編集'], ['analytics', '分析'],
+  ['inbound', '入庫', true], ['outbound', '消費・出庫', true], ['transfers', '移動', true],
+  ['stocktakes', '棚卸し', true], ['purchase_orders', '発注', true], ['suppliers', '仕入先', true],
+  ['csv_export', 'CSVエクスポート', false], ['csv_import', 'CSVインポート', false],
+  ['master_products', '商品マスタ', true], ['master_locations', '倉庫・保管場所', true],
+  ['analytics', '分析', false], ['alerts', 'アラート', false], ['login', '新規ログイン', false],
 ];
 const MNT_LEVEL_LABELS = { read_only: '読み取り専用', features: '機能別停止', full: '全面停止' };
 const MNT_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
 const MNT_STATE_LABELS = { active: '実施中', scheduled: '予定', finished: '終了', cancelled: '取消' };
 let mntFormsFilled = false;
+let mntPresets = [];
 
 function mntFeatureLabel(key) {
   const found = MNT_FEATURE_OPTS.find((o) => o[0] === key);
@@ -648,10 +681,15 @@ function windowPeriod(w) {
   }
   return fmtDate(w.startsAt) + ' 〜 ' + (w.endsAt ? fmtDate(w.endsAt) : '終了未定');
 }
+function featuresText(features) {
+  const keys = Object.keys(features || {});
+  if (keys.length === 0) return '';
+  return keys.map((k) => mntFeatureLabel(k) + (features[k] === 'write' ? ' (書込のみ)' : '')).join('・');
+}
 function windowDesc(w) {
-  let s = MNT_STATE_LABELS[w.state] + ': ' + MNT_LEVEL_LABELS[w.level];
+  let s = MNT_STATE_LABELS[w.state] + ': ' + (w.emergency ? '緊急 ' : '') + MNT_LEVEL_LABELS[w.level];
   if (w.level === 'features') {
-    s += ' (' + (w.features || []).map(mntFeatureLabel).join('・') + ')';
+    s += ' (' + featuresText(w.features) + ')';
   }
   s += ' / ' + (w.storeId === null ? '全店舗' : storeName(w.storeId));
   s += ' / ' + windowPeriod(w);
@@ -659,15 +697,48 @@ function windowDesc(w) {
     s += ' (今回: ' + fmtDate(w.occurrenceStartsAt) + '〜' + (w.occurrenceEndsAt ? fmtDate(w.occurrenceEndsAt) : '終了未定') + ')';
   }
   if (w.message) s += ' / ' + w.message;
+  if (w.emergency && w.reason) s += ' / 理由: ' + w.reason;
   return s;
 }
-function fillFeatureChecks(boxId) {
-  el(boxId).innerHTML = MNT_FEATURE_OPTS.map((o) =>
-    '<label class="mnt-chip"><input type="checkbox" value="' + o[0] + '"> ' + o[1] + '</label>'
-  ).join('');
+function reportText(w) {
+  const r = w.report;
+  if (!r) return '';
+  const parts = [];
+  if (r.plannedMinutes !== null && r.plannedMinutes !== undefined) parts.push('予定 ' + r.plannedMinutes + '分');
+  if (r.actualMinutes !== null && r.actualMinutes !== undefined) parts.push('実績 ' + r.actualMinutes + '分');
+  if (r.extendCount) parts.push('延長 ' + r.extendCount + '回');
+  parts.push('拒否 ' + (r.rejections || 0) + '件');
+  return ' [' + parts.join(' / ') + ']';
 }
+/* 機能ごとに「対象外 / 書込停止 / 全停止」の3択 (write 不可は2択) を並べる */
+function fillFeatureChecks(boxId) {
+  el(boxId).innerHTML = MNT_FEATURE_OPTS.map((o) => {
+    let opts = '<option value="">対象外</option>';
+    if (o[2]) opts += '<option value="write">書込停止</option>';
+    opts += '<option value="full">全停止</option>';
+    return '<label class="mnt-chip">' + o[1] + ' <select data-mnt-feature="' + o[0] + '">' + opts + '</select></label>';
+  }).join('');
+  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
+    sel.onchange = () => {
+      sel.closest('.mnt-chip').classList.toggle('on', sel.value !== '');
+      schedulePreview(boxId === 'mntStartFeatures' ? 'start' : 'add');
+    };
+  });
+}
+/* 選択された機能を { key: stage } マップで返す */
 function checkedFeatures(boxId) {
-  return Array.from(el(boxId).querySelectorAll('input[type=checkbox]:checked')).map((i) => i.value);
+  const map = {};
+  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
+    if (sel.value) map[sel.dataset.mntFeature] = sel.value;
+  });
+  return map;
+}
+function setFeatureSelectors(boxId, features) {
+  el(boxId).querySelectorAll('select[data-mnt-feature]').forEach((sel) => {
+    const v = features && features[sel.dataset.mntFeature] ? features[sel.dataset.mntFeature] : '';
+    sel.value = v;
+    sel.closest('.mnt-chip').classList.toggle('on', v !== '');
+  });
 }
 function fillStoreSelect(selId) {
   el(selId).innerHTML = '<option value="">全店舗</option>' + storeList.map((s) =>
@@ -684,6 +755,12 @@ function syncMaintenanceFormVisibility() {
   const weekly = el('mntKind').value === 'weekly';
   el('mntWeeklyFields').style.display = weekly ? '' : 'none';
   el('mntOnceFields').style.display = weekly ? 'none' : '';
+  const startEmergency = el('mntStartEmergency').checked;
+  el('mntStartReason').style.display = startEmergency ? '' : 'none';
+  el('mntStartDurationWrap').style.display = startEmergency ? '' : 'none';
+  const emergency = el('mntEmergency').checked;
+  el('mntReason').style.display = emergency ? '' : 'none';
+  el('mntEmergencyNote').style.display = emergency ? '' : 'none';
 }
 function fillMaintenanceForms() {
   if (mntFormsFilled) return;
@@ -692,10 +769,132 @@ function fillMaintenanceForms() {
   fillFeatureChecks('mntFeatures');
   fillStoreSelect('mntStartStore');
   fillStoreSelect('mntStore');
-  el('mntStartLevel').onchange = syncMaintenanceFormVisibility;
-  el('mntLevel').onchange = syncMaintenanceFormVisibility;
-  el('mntKind').onchange = syncMaintenanceFormVisibility;
+  el('mntStartLevel').onchange = () => { syncMaintenanceFormVisibility(); schedulePreview('start'); };
+  el('mntLevel').onchange = () => { syncMaintenanceFormVisibility(); schedulePreview('add'); };
+  el('mntKind').onchange = () => { syncMaintenanceFormVisibility(); schedulePreview('add'); };
+  el('mntStartStore').onchange = () => schedulePreview('start');
+  el('mntStore').onchange = () => schedulePreview('add');
+  el('mntStartEmergency').onchange = () => { syncMaintenanceFormVisibility(); schedulePreview('start'); };
+  el('mntEmergency').onchange = () => { syncMaintenanceFormVisibility(); schedulePreview('add'); };
+  el('mntOnceStart').onchange = () => schedulePreview('add');
+  el('mntOnceEnd').onchange = () => schedulePreview('add');
+  el('mntPresetSaveBtn').onclick = savePreset;
   syncMaintenanceFormVisibility();
+  loadPresets();
+}
+
+/* ---------------- プリセット ---------------- */
+async function loadPresets() {
+  try {
+    const data = await api('/api/platform/maintenance/presets');
+    mntPresets = data.presets || [];
+    renderPresets();
+  } catch (e) { /* プリセットが読めなくてもフォームは使える */ }
+}
+function renderPresets() {
+  const box = el('mntPresets');
+  if (mntPresets.length === 0) { box.innerHTML = '<span class="small muted">プリセットはありません。</span>'; return; }
+  box.innerHTML = mntPresets.map((p, i) =>
+    '<label class="mnt-chip"><button type="button" data-preset="' + i + '" style="border:0;background:transparent;font:inherit;cursor:pointer;padding:0;">' +
+    esc(p.name) + '</button><button type="button" class="mnt-preset-del" data-preset-del="' + p.id + '" aria-label="削除">×</button></label>'
+  ).join('');
+  box.querySelectorAll('button[data-preset]').forEach((b) => {
+    b.onclick = () => applyPreset(mntPresets[Number(b.dataset.preset)]);
+  });
+  box.querySelectorAll('button[data-preset-del]').forEach((b) => {
+    b.onclick = () => deletePreset(b.dataset.presetDel);
+  });
+}
+function applyPreset(p) {
+  if (!p) return;
+  el('mntLevel').value = p.level;
+  el('mntStore').value = p.storeId === null || p.storeId === undefined ? '' : String(p.storeId);
+  el('mntMessage').value = p.message || '';
+  setFeatureSelectors('mntFeatures', p.features);
+  syncMaintenanceFormVisibility();
+  schedulePreview('add');
+  setStatus('プリセット「' + p.name + '」を反映しました。');
+}
+async function savePreset() {
+  const name = el('mntPresetName').value.trim();
+  if (!name) { setError('プリセット名を入力してください。'); return; }
+  setError(''); setStatus('保存中…');
+  try {
+    const level = el('mntLevel').value;
+    const body = {
+      name: name, level: level,
+      storeId: storeSelectValue('mntStore'),
+      message: el('mntMessage').value || null,
+    };
+    if (level === 'features') body.features = checkedFeatures('mntFeatures');
+    const data = await api('/api/platform/maintenance/presets', { method: 'POST', body: JSON.stringify(body) });
+    mntPresets = data.presets || [];
+    renderPresets();
+    el('mntPresetName').value = '';
+    setStatus('プリセット「' + name + '」を保存しました。');
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+  }
+}
+async function deletePreset(id) {
+  if (!confirm('このプリセットを削除しますか？')) return;
+  setError(''); setStatus('');
+  try {
+    const data = await api('/api/platform/maintenance/presets/' + encodeURIComponent(id), { method: 'DELETE' });
+    mntPresets = data.presets || [];
+    renderPresets();
+    setStatus('プリセットを削除しました。');
+  } catch (e) {
+    setError(errText(e));
+  }
+}
+
+/* ---------------- 影響プレビュー ---------------- */
+let mntPreviewTimer = null;
+function schedulePreview(which) {
+  if (mntPreviewTimer) clearTimeout(mntPreviewTimer);
+  mntPreviewTimer = setTimeout(() => refreshPreview(which), 350);
+}
+async function refreshPreview(which) {
+  const target = which === 'start' ? el('mntStartPreview') : el('mntPreview');
+  if (!target) return;
+  const body = {};
+  if (which === 'start') {
+    body.level = el('mntStartLevel').value;
+    body.storeId = storeSelectValue('mntStartStore');
+    if (body.level === 'features') body.features = checkedFeatures('mntStartFeatures');
+    body.startsAt = Date.now();
+    body.endsAt = el('mntStartEmergency').checked
+      ? Date.now() + Number(el('mntStartDuration').value) * 60000
+      : null;
+  } else {
+    body.level = el('mntLevel').value;
+    body.storeId = storeSelectValue('mntStore');
+    if (body.level === 'features') body.features = checkedFeatures('mntFeatures');
+    if (el('mntKind').value === 'once') {
+      const s = el('mntOnceStart').value;
+      const e = el('mntOnceEnd').value;
+      if (s) body.startsAt = new Date(s).getTime();
+      body.endsAt = e ? new Date(e).getTime() : null;
+    }
+  }
+  try {
+    const data = await api('/api/platform/maintenance/preview', { method: 'POST', body: JSON.stringify(body) });
+    const ops = Object.keys(data.recentOps || {})
+      .filter((k) => data.recentOps[k] > 0)
+      .map((k) => mntFeatureLabel(k) + ' ' + data.recentOps[k] + '件')
+      .join(' / ');
+    let text = '影響: 対象ユーザー ' + data.affectedUsers + '人 / 有効セッション ' + data.activeSessions + '件';
+    if (ops) text += ' / 直近7日の操作: ' + ops;
+    const overlaps = data.overlaps || [];
+    if (overlaps.length > 0) {
+      text += ' / 重なる予定 ' + overlaps.length + '件: ' + overlaps.map(windowDesc).join('、');
+    }
+    target.textContent = text;
+  } catch (e) {
+    target.textContent = '';
+  }
 }
 
 async function loadMaintenance() {
@@ -731,7 +930,8 @@ async function loadMaintenance() {
     }
     const recent = data.recent || [];
     el('mntRecent').innerHTML = recent.length === 0 ? '履歴はありません。' : recent.map((w) =>
-      '<div class="feed-row"><small class="muted">' + fmtDate(w.cancelledAt || w.endsAt || w.createdAt) + '</small> ' + esc(windowDesc(w)) + '</div>'
+      '<div class="feed-row"><small class="muted">' + fmtDate(w.cancelledAt || w.endsAt || w.createdAt) + '</small> ' +
+      esc(windowDesc(w)) + '<small class="muted">' + esc(reportText(w)) + '</small></div>'
     ).join('');
   } catch (e) {
     setError(errText(e));
@@ -742,14 +942,23 @@ async function startMaintenanceNow() {
   setError(''); setStatus('開始中…');
   try {
     const level = el('mntStartLevel').value;
+    const emergency = el('mntStartEmergency').checked;
     const body = {
       kind: 'once', startsAt: Date.now(), endsAt: null, level: level,
       storeId: storeSelectValue('mntStartStore'),
       message: el('mntStartMessage').value || null,
     };
     if (level === 'features') body.features = checkedFeatures('mntStartFeatures');
+    if (emergency) {
+      const reason = el('mntStartReason').value.trim();
+      if (!reason) { setStatus(''); setError('緊急の理由を入力してください (緊急時は必須)。'); return; }
+      body.emergency = true;
+      body.reason = reason;
+      body.endsAt = Date.now() + Number(el('mntStartDuration').value) * 60000;
+    }
     await api('/api/platform/maintenance/windows', { method: 'POST', body: JSON.stringify(body) });
     el('mntStartMessage').value = '';
+    el('mntStartReason').value = '';
     setStatus('メンテナンスを開始しました。');
     loadMaintenance();
   } catch (e) {
@@ -773,6 +982,12 @@ async function addWindow() {
       message: el('mntMessage').value || null,
     };
     if (level === 'features') body.features = checkedFeatures('mntFeatures');
+    if (el('mntEmergency').checked) {
+      const reason = el('mntReason').value.trim();
+      if (!reason) { setStatus(''); setError('緊急の理由を入力してください (緊急時は必須)。'); return; }
+      body.emergency = true;
+      body.reason = reason;
+    }
     if (kind === 'once') {
       const s = el('mntOnceStart').value;
       const e = el('mntOnceEnd').value;
@@ -792,6 +1007,7 @@ async function addWindow() {
     }
     await api('/api/platform/maintenance/windows', { method: 'POST', body: JSON.stringify(body) });
     el('mntMessage').value = '';
+    el('mntReason').value = '';
     setStatus('メンテナンス予定を追加しました。');
     loadMaintenance();
   } catch (e) {

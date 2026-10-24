@@ -85,6 +85,7 @@ import {
 } from './lib/features';
 import { parseCsv, toCsv } from './lib/csv';
 import {
+  recordMaintenanceRejections,
   resolveMaintenance,
   resolvedMaintenanceMessage,
   type MaintenanceResolution,
@@ -482,7 +483,11 @@ loadAll();
 
 // ログイン開始 (サーバー側リダイレクト、認可コードフロー)。
 // ブラウザ側の JS に依存せず、通常のリンク遷移だけで進める。nonce/state は Cookie で保持する。
-app.get('/auth/login', (c) => {
+// 新規ログイン停止中 (features の 'login') は開始自体を 503 で止める
+// (ログイン中のセッションは影響を受けない)。
+app.get('/auth/login', async (c) => {
+  const loginBlock = await loginMaintenanceBlock(c);
+  if (loginBlock) return c.html(loginMaintenancePage(loginBlock.message, loginBlock.endsAt), 503);
   const clientId = c.env.OIDC_CLIENT_ID ?? '';
   if (!clientId) return c.text('OIDC is not configured', 503);
   const nonce = crypto.randomUUID();
@@ -508,7 +513,7 @@ app.get('/auth/login', (c) => {
 // 認可コードを Google と交換して ID トークンを得て、検証し、users を同期して
 // 結果をそのまま表示する。画面側のボタン操作は不要。
 app.get('/auth/callback', async (c) => {
-  const page = (title: string, body: string, status: 200 | 400 | 500 = 200) =>
+  const page = (title: string, body: string, status: 200 | 400 | 500 | 503 = 200) =>
     c.html(
       `<!doctype html>
 <html lang="ja">
@@ -566,6 +571,22 @@ ${body}
     return page('ログインに失敗しました', '<p>ID トークンの検証に失敗しました。</p>', 400);
   }
 
+  // 新規ログイン停止中はセッションを発行しない (全体管理者は対象外)。
+  // /auth/login を経ずに直接来た場合もここで止める。
+  if (!isPlatformAdmin(authUser.assignments)) {
+    const loginBlock = await loginMaintenanceBlock(c);
+    if (loginBlock) {
+      const safeMessage = loginBlock.message
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const endText = loginBlock.endsAt
+        ? `<p>終了予定: ${new Date(loginBlock.endsAt).toLocaleString('ja-JP')}</p>`
+        : '<p>終了時刻は未定です。</p>';
+      return page('メンテナンス中', `<p>${safeMessage}</p>${endText}`, 503);
+    }
+  }
+
   const roles =
     authUser.assignments.length > 0
       ? authUser.assignments.map((a) => a.roleCode).join(', ')
@@ -589,48 +610,91 @@ ${body}
 /**
  * features レベルのメンテナンスで停止する機能キーとエンドポイントの対応表。
  * lib/maintenance.ts の MAINTENANCE_FEATURES とキーを一致させる。
- * 変更系 (非 GET) のみが対象だが、分析と CSV エクスポートは GET でも止める。
+ * 全メソッドを対象にキーを返し、「どのメソッドを止めるか」は段階
+ * ('write' = 非 GET のみ / 'full' = 全メソッド) で判定する。
  */
 function maintenanceFeatureFor(method: string, path: string): string | null {
   const p = path.startsWith('/api/v1') ? path.slice('/api/v1'.length) : path;
-  if (p === '/analytics' && method === 'GET') return 'analytics';
-  if (p === '/stocks.csv') return 'csv';
-  if (method === 'GET') return null;
+  if (p === '/analytics') return 'analytics';
+  if (p === '/alerts') return 'alerts';
+  if (p === '/stocks.csv' || p === '/admin/export.json') return 'csv_export';
+  if (p === '/products/import' || p === '/master/products/import') return 'csv_import';
+  if (p === '/movements/inbound') return 'inbound';
+  if (p === '/movements/consumption') return 'outbound';
   if (p === '/movements/transfer') return 'transfers';
-  if (
-    p === '/movements/inbound' ||
-    p === '/movements/consumption' ||
-    p === '/negative-approvals' ||
-    p.startsWith('/negative-approvals/')
-  ) {
-    return 'movements';
-  }
+  if (p === '/negative-approvals' || p.startsWith('/negative-approvals/')) return 'outbound';
   if (p === '/stocktakes' || p.startsWith('/stocktakes/')) return 'stocktakes';
+  if (p === '/purchase-orders' || p.startsWith('/purchase-orders/')) return 'purchase_orders';
   if (
-    p === '/purchase-orders' ||
-    p.startsWith('/purchase-orders/') ||
     p === '/suppliers' ||
     p.startsWith('/suppliers/') ||
     p === '/master/suppliers' ||
     p.startsWith('/master/suppliers/')
   ) {
-    return 'purchase_orders';
+    return 'suppliers';
   }
-  if (p === '/products/import' || p === '/master/products/import') return 'csv';
   if (
-    p.startsWith('/master/') ||
     p === '/products' ||
     p.startsWith('/products/') ||
+    p === '/master/products' ||
+    p.startsWith('/master/products/')
+  ) {
+    return 'master_products';
+  }
+  if (
     p === '/warehouses' ||
     p.startsWith('/warehouses/') ||
     p === '/locations' ||
     p.startsWith('/locations/') ||
     p === '/lots' ||
-    p.startsWith('/lots/')
+    p.startsWith('/lots/') ||
+    p === '/master/warehouses' ||
+    p.startsWith('/master/warehouses/') ||
+    p === '/master/locations' ||
+    p.startsWith('/master/locations/') ||
+    p === '/master/lots' ||
+    p.startsWith('/master/lots/')
   ) {
-    return 'master';
+    return 'master_locations';
   }
   return null;
+}
+
+/**
+ * 新規ログイン停止 (features の 'login') の判定。全店舗対象 (store_id NULL)
+ * の枠だけが効く。該当すれば告知文と終了予定を返す。
+ */
+async function loginMaintenanceBlock(
+  c: AppContext,
+): Promise<{ message: string; endsAt: number | null } | null> {
+  const resolution = await resolveMaintenance(c.env.DB, null);
+  const active = resolution.active;
+  if (active && active.level === 'features' && active.features['login']) {
+    return { message: resolvedMaintenanceMessage(active), endsAt: active.endsAt };
+  }
+  return null;
+}
+
+/** ログイン停止中の案内ページ (503) */
+function loginMaintenancePage(message: string, endsAt: number | null): string {
+  const safeMessage = message
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+  const endText = endsAt
+    ? `<p>終了予定: ${new Date(endsAt).toLocaleString('ja-JP')}</p>`
+    : '<p>終了時刻は未定です。</p>';
+  return `<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>メンテナンス中 | 在庫管理システム</title></head>
+<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
+<h1>メンテナンス中</h1>
+<p>${safeMessage}</p>
+${endText}
+<p>ログイン中のセッションはそのまま利用できます。</p>
+</body>
+</html>`;
 }
 
 app.use('/api/v1/*', async (c, next) => {
@@ -649,16 +713,38 @@ app.use('/api/v1/*', async (c, next) => {
     const active = resolution.active;
     if (active && !isPlatformAdmin(authUser.assignments)) {
       const isMeGet = c.req.method === 'GET' && c.req.path === '/api/v1/me';
+      const featureKey = maintenanceFeatureFor(c.req.method, c.req.path);
       let blocked = false;
       if (active.level === 'full') {
         blocked = !isMeGet;
       } else if (active.level === 'read_only') {
         blocked = c.req.method !== 'GET';
-      } else {
-        const key = maintenanceFeatureFor(c.req.method, c.req.path);
-        blocked = key !== null && active.features.includes(key);
+      } else if (featureKey) {
+        const stage = active.features[featureKey];
+        // 'full' は全メソッド、'write' は書き込み系 (非 GET) のみ止める
+        if (stage === 'full') blocked = true;
+        else if (stage === 'write') blocked = c.req.method !== 'GET';
       }
       if (blocked) {
+        // 拒否件数を「寄与した window × 機能グループ × 店舗」で集計する
+        // (全体管理者は上の分岐で対象外なので数えない)。
+        const contributors =
+          active.level === 'features'
+            ? active.windows.filter((w) => {
+                if (!featureKey) return false;
+                const stage = w.features[featureKey];
+                if (stage === 'full') return true;
+                return stage === 'write' && c.req.method !== 'GET';
+              })
+            : active.windows.filter((w) => w.level === active.level);
+        await recordMaintenanceRejections(
+          c.env.DB,
+          contributors.map((w) => ({
+            windowId: w.id,
+            featureKey: featureKey ?? active.level,
+            storeId: ctx ? ctx.store.id : 0,
+          })),
+        );
         return c.json(
           {
             statusCode: 503,
@@ -926,6 +1012,7 @@ app.get('/api/v1/me', async (c) => {
             }
           : null,
         upcoming: res.upcoming,
+        lastEnded: res.lastEnded,
       };
     })(),
   });
