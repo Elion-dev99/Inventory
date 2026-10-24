@@ -494,12 +494,12 @@ function loadDashboard() {
     var dangerN = hCounts.EXPIRED + hCounts.NEGATIVE_STOCK;
     var warnN = hCounts.EXPIRING + hCounts.LOW_STOCK;
     var heroCls = 'ok';
-    var heroTitle = 'すべて正常です';
-    var heroSub = '対応が必要なアラートはありません';
-    if (active) { heroCls = 'warn'; heroTitle = '棚卸し中です'; heroSub = '棚卸しが終わるまで在庫の更新は停止しています'; }
-    else if (dangerN > 0) { heroCls = 'danger'; heroTitle = '要対応 ' + dangerN + ' 件'; heroSub = '期限切れ・マイナス在庫があります'; }
-    else if (warnN > 0) { heroCls = 'warn'; heroTitle = '注意 ' + warnN + ' 件'; heroSub = '期限接近・在庫不足があります'; }
-    if (stocks) heroSub += ' ・ 在庫 ' + stocks.length + ' 件 / 総数量 ' + hTotal;
+    var heroTitle = 'アラートなし';
+    var heroSub = '';
+    if (active) { heroCls = 'warn'; heroTitle = '棚卸し実施中'; heroSub = '在庫の更新は停止中'; }
+    else if (dangerN > 0) { heroCls = 'danger'; heroTitle = '要対応 ' + dangerN + ' 件'; heroSub = '期限切れ・マイナス在庫'; }
+    else if (warnN > 0) { heroCls = 'warn'; heroTitle = '注意 ' + warnN + ' 件'; heroSub = '期限接近・在庫不足'; }
+    if (stocks) heroSub = (heroSub ? heroSub + ' ・ ' : '') + '在庫 ' + stocks.length + ' 件 / 総数量 ' + hTotal;
     h += '<div class="hero ' + heroCls + '"><span class="hero-dot"></span><div class="hero-body"><div class="hero-title">' + heroTitle + '</div><div class="hero-sub">' + esc(heroSub) + '</div></div></div>';
     /* 「やること」タスクカード: 件数バッジ付きで、タップすると該当画面へ */
     var tasks = [];
@@ -522,8 +522,6 @@ function loadDashboard() {
         h += '<button class="task-card" data-task="' + tasks[t].view + '"><span class="row-icon" style="background:' + tasks[t].color + '">' + icon(tasks[t].icon, 19) + '</span><span class="row-label">' + esc(tasks[t].label) + '</span><span class="count-badge' + (tasks[t].amber ? ' amber' : '') + '">' + tasks[t].count + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
       }
       h += '</div>';
-    } else if ((negApprovals && can('negative.decide')) || (suggestions && can('purchases.read'))) {
-      h += '<h3>やること</h3><p class="muted">対応が必要なものはありません。</p>';
     }
     if (can('stocks.read')) {
       h += '<form class="search-hero" id="dashSearch"><span class="search-ic">' + icon('search', 18) + '</span><input id="dashQ" type="search" placeholder="商品名・SKU・ロットで検索" autocomplete="off"></form>';
