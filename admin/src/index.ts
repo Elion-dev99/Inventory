@@ -17,7 +17,9 @@ import {
   clearSessionCookieHeader,
   createSession,
   destroySession,
+  hashSessionToken,
   PLATFORM_SESSION_COOKIE_NAME,
+  readSessionToken,
   resolveSessionUser,
   sessionCookieHeader,
 } from '../../workers/src/lib/session';
@@ -426,19 +428,31 @@ app.put('/api/platform/stores/:id/features/:key', async (c) => {
   return c.json({ storeId: id, key, enabled: dto.enabled });
 });
 
-/** 全ユーザーと、全店舗・全体を含む全割当の一覧 (全体管理用) */
+/**
+ * 全ユーザーと、全店舗・全体を含む全割当の一覧 (全体管理用)。
+ * 各ユーザーに状態・最終ログイン (セッション発行の最新 created_at)・
+ * 割当サマリ (全体管理者か、所属店舗数) を含める。クエリ q で名前・メール検索。
+ */
 app.get('/api/platform/users', async (c) => {
   requirePlatformAdmin(c);
+  const q = (c.req.query('q') ?? '').trim();
+  const like = `%${q}%`;
   const { results: users } = await c.env.DB.prepare(
-    `SELECT id, external_id AS externalId, email, display_name AS displayName, status
-       FROM users ORDER BY id ASC`,
-  ).all<{
-    id: number;
-    externalId: string;
-    email: string;
-    displayName: string;
-    status: string;
-  }>();
+    `SELECT id, external_id AS externalId, email, display_name AS displayName, status,
+            (SELECT MAX(created_at) FROM sessions WHERE user_id = users.id) AS lastLoginAt
+       FROM users
+      WHERE ?1 = '' OR email LIKE ?2 OR display_name LIKE ?2
+      ORDER BY id ASC`,
+  )
+    .bind(q, like)
+    .all<{
+      id: number;
+      externalId: string;
+      email: string;
+      displayName: string;
+      status: string;
+      lastLoginAt: number | null;
+    }>();
   const { results: roleRows } = await c.env.DB.prepare(
     'SELECT user_id AS userId, role_code AS roleCode, warehouse_id AS warehouseId, store_id AS storeId FROM user_roles ORDER BY id ASC',
   ).all<{ userId: number; roleCode: string; warehouseId: number | null; storeId: number | null }>();
@@ -448,7 +462,23 @@ app.get('/api/platform/users', async (c) => {
     list.push({ roleCode: r.roleCode, warehouseId: r.warehouseId, storeId: r.storeId });
     byUser.set(r.userId, list);
   }
-  return c.json(users.map((u) => ({ ...u, assignments: byUser.get(u.id) ?? [] })));
+  return c.json(
+    users.map((u) => {
+      const assignments = byUser.get(u.id) ?? [];
+      return {
+        ...u,
+        assignments,
+        assignmentSummary: {
+          isPlatformAdmin: assignments.some(
+            (a) => a.roleCode === RoleCode.SYSTEM_ADMIN && a.storeId === null,
+          ),
+          storeCount: new Set(
+            assignments.map((a) => a.storeId).filter((id): id is number => id !== null),
+          ).size,
+        },
+      };
+    }),
+  );
 });
 
 const platformAssignmentsBodySchema = z.object({
@@ -555,6 +585,411 @@ app.put('/api/platform/users/:userId/assignments', async (c) => {
   await c.env.DB.batch(stmts);
   await platformAudit(c, 'platform.user_roles.update', 'user', String(userId), { assignments }, null);
   return c.json({ userId, assignments });
+});
+
+// ------------------------------------------------------------ 概要
+
+/** audit_logs.payload (JSON 文字列) を表示用にパースする。壊れていれば文字列のまま */
+function parsePayload(raw: string | null): unknown {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+interface AuditFeedRow {
+  id: number;
+  actorId: number | null;
+  actorEmail: string | null;
+  actorName: string | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  payload: string | null;
+  storeId: number | null;
+  storeName: string | null;
+  createdAt: number;
+}
+
+const AUDIT_FEED_SELECT = `SELECT a.id, a.actor_id AS actorId, u.email AS actorEmail,
+         u.display_name AS actorName, a.action, a.target_type AS targetType,
+         a.target_id AS targetId, a.payload, a.store_id AS storeId,
+         s.name AS storeName, a.created_at AS createdAt
+    FROM audit_logs a
+    LEFT JOIN users u ON u.id = a.actor_id
+    LEFT JOIN stores s ON s.id = a.store_id`;
+
+function auditFeedJson(r: AuditFeedRow): Record<string, unknown> {
+  return { ...r, payload: parsePayload(r.payload) };
+}
+
+/**
+ * 概要: 全店舗横断の件数サマリ、全体操作の直近監査 (store_id IS NULL)、
+ * 店舗ごとのサマリ。コンソールの「概要」セクションが使う。
+ */
+app.get('/api/platform/overview', async (c) => {
+  requirePlatformAdmin(c);
+  const since = Date.now() - 30 * 86_400_000;
+  const totals = await c.env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM stores) AS stores,
+       (SELECT COUNT(*) FROM users) AS users,
+       (SELECT COUNT(*) FROM products WHERE deleted_at IS NULL) AS products,
+       (SELECT COUNT(*) FROM stocks) AS stockRecords,
+       (SELECT COUNT(*) FROM stock_movements WHERE created_at >= ?1) AS movements30d`,
+  )
+    .bind(since)
+    .first<{ stores: number; users: number; products: number; stockRecords: number; movements30d: number }>();
+  const { results: recentAudit } = await c.env.DB.prepare(
+    `${AUDIT_FEED_SELECT} WHERE a.store_id IS NULL ORDER BY a.id DESC LIMIT 10`,
+  ).all<AuditFeedRow>();
+  const { results: summaries } = await c.env.DB.prepare(
+    `SELECT s.id, s.code, s.name, s.status,
+       (SELECT COUNT(DISTINCT user_id) FROM user_roles WHERE store_id = s.id) AS users,
+       (SELECT COUNT(*) FROM products WHERE store_id = s.id AND deleted_at IS NULL) AS products,
+       (SELECT COUNT(*) FROM stocks WHERE store_id = s.id) AS stockRecords
+     FROM stores s ORDER BY s.id ASC`,
+  ).all<{
+    id: number;
+    code: string;
+    name: string;
+    status: string;
+    users: number;
+    products: number;
+    stockRecords: number;
+  }>();
+  return c.json({
+    totals: {
+      stores: totals?.stores ?? 0,
+      users: totals?.users ?? 0,
+      products: totals?.products ?? 0,
+      stockRecords: totals?.stockRecords ?? 0,
+      movements30d: totals?.movements30d ?? 0,
+    },
+    recentPlatformAudit: recentAudit.map(auditFeedJson),
+    storeSummaries: summaries,
+  });
+});
+
+// ------------------------------------------------------------ ユーザーの状態・セッション
+
+const userStatusBodySchema = z.object({ status: z.enum(['active', 'disabled']) });
+
+async function platformUserRow(c: AppContext, userId: number): Promise<{ id: number; status: string }> {
+  if (!Number.isInteger(userId) || userId <= 0) throw notFound('User not found');
+  const row = await c.env.DB.prepare('SELECT id, status FROM users WHERE id = ?1')
+    .bind(userId)
+    .first<{ id: number; status: string }>();
+  if (!row) throw notFound('User not found');
+  return row;
+}
+
+/**
+ * ユーザーの有効化 / 停止。停止すると店舗アプリ・全体管理の両方で
+ * ログインできなくなり、既存セッションも全て削除して即時締め出す。
+ * 自分自身の停止と、最後の全体管理者の停止は 422 LOCKOUT_PREVENTION。
+ */
+app.put('/api/platform/users/:userId/status', async (c) => {
+  requirePlatformAdmin(c);
+  const userId = Number(c.req.param('userId'));
+  const target = await platformUserRow(c, userId);
+  const dto = parseWith(userStatusBodySchema, await parseJson(c));
+  if (dto.status === 'disabled' && target.status !== 'disabled') {
+    if (userId === user(c).userId) {
+      throw new ApiError(422, 'LOCKOUT_PREVENTION', 'You cannot disable your own account');
+    }
+    const targetIsPlatformAdmin =
+      ((await c.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM user_roles
+          WHERE user_id = ?1 AND role_code = 'SYSTEM_ADMIN' AND store_id IS NULL`,
+      )
+        .bind(userId)
+        .first<{ n: number }>())?.n ?? 0) > 0;
+    if (targetIsPlatformAdmin) {
+      const others = await c.env.DB.prepare(
+        `SELECT COUNT(DISTINCT ur.user_id) AS n
+           FROM user_roles ur JOIN users u ON u.id = ur.user_id
+          WHERE ur.role_code = 'SYSTEM_ADMIN' AND ur.store_id IS NULL
+            AND ur.user_id <> ?1 AND u.status = 'active'`,
+      )
+        .bind(userId)
+        .first<{ n: number }>();
+      if ((others?.n ?? 0) === 0) {
+        throw new ApiError(
+          422,
+          'LOCKOUT_PREVENTION',
+          'At least one active platform admin must remain (lockout prevention)',
+        );
+      }
+    }
+    await c.env.DB.batch([
+      c.env.DB
+        .prepare('UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3')
+        .bind(dto.status, Date.now(), userId),
+      c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?1').bind(userId),
+    ]);
+  } else if (dto.status !== target.status) {
+    await c.env.DB
+      .prepare('UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3')
+      .bind(dto.status, Date.now(), userId)
+      .run();
+  }
+  await platformAudit(c, 'platform.user.status', 'user', String(userId), { status: dto.status }, null);
+  return c.json({ userId, status: dto.status });
+});
+
+/** そのユーザーの全セッションを失効させる (状態は変えない) */
+app.post('/api/platform/users/:userId/revoke-sessions', async (c) => {
+  requirePlatformAdmin(c);
+  const userId = Number(c.req.param('userId'));
+  await platformUserRow(c, userId);
+  const res = await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?1').bind(userId).run();
+  const revoked = res.meta.changes ?? 0;
+  await platformAudit(c, 'platform.user.revoke_sessions', 'user', String(userId), { revoked }, null);
+  return c.json({ userId, revoked });
+});
+
+// ------------------------------------------------------------ 監査 (全店舗横断)
+
+/**
+ * 全店舗横断の監査ログ。storeId='platform' で全体操作 (store_id IS NULL) のみ、
+ * 数値で店舗指定、userId で実行者、q で action・payload の部分一致検索。
+ */
+app.get('/api/platform/audit-logs', async (c) => {
+  requirePlatformAdmin(c);
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+  const storeId = c.req.query('storeId');
+  if (storeId === 'platform') {
+    conditions.push('a.store_id IS NULL');
+  } else if (storeId !== undefined && storeId !== '') {
+    const n = Number(storeId);
+    if (!Number.isInteger(n)) throw badRequest('storeId must be an integer or "platform"');
+    conditions.push('a.store_id = ?');
+    params.push(n);
+  }
+  const userId = c.req.query('userId');
+  if (userId !== undefined && userId !== '') {
+    const n = Number(userId);
+    if (!Number.isInteger(n)) throw badRequest('userId must be a user id (integer)');
+    conditions.push('a.actor_id = ?');
+    params.push(n);
+  }
+  const q = c.req.query('q');
+  if (q !== undefined && q !== '') {
+    conditions.push('(a.action LIKE ? OR a.payload LIKE ?)');
+    params.push(`%${q}%`, `%${q}%`);
+  }
+  const limitRaw = Number(c.req.query('limit') ?? 100);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 500) : 100;
+  const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
+  const totalRow = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM audit_logs a${where}`)
+    .bind(...params)
+    .first<{ n: number }>();
+  const { results } = await c.env.DB.prepare(
+    `${AUDIT_FEED_SELECT}${where} ORDER BY a.id DESC LIMIT ?`,
+  )
+    .bind(...params, limit)
+    .all<AuditFeedRow>();
+  return c.json({ items: results.map(auditFeedJson), total: totalRow?.n ?? 0, limit });
+});
+
+// ------------------------------------------------------------ 店舗詳細
+
+/** 店舗詳細: 店舗本体・倉庫・割当ユーザー (ロールつき)・その店舗の直近監査 */
+app.get('/api/platform/stores/:id/detail', async (c) => {
+  requirePlatformAdmin(c);
+  const id = Number(c.req.param('id'));
+  const store = await storeRow(c, id);
+  const { results: warehouses } = await c.env.DB.prepare(
+    'SELECT id, code, name FROM warehouses WHERE store_id = ?1 AND deleted_at IS NULL ORDER BY id ASC',
+  )
+    .bind(id)
+    .all<{ id: number; code: string; name: string }>();
+  const { results: storeUsers } = await c.env.DB.prepare(
+    `SELECT ur.user_id AS userId, u.email, u.display_name AS displayName, u.status,
+            ur.role_code AS roleCode, ur.warehouse_id AS warehouseId
+       FROM user_roles ur JOIN users u ON u.id = ur.user_id
+      WHERE ur.store_id = ?1 ORDER BY ur.id ASC`,
+  )
+    .bind(id)
+    .all<{
+      userId: number;
+      email: string;
+      displayName: string;
+      status: string;
+      roleCode: string;
+      warehouseId: number | null;
+    }>();
+  const { results: recentAudit } = await c.env.DB.prepare(
+    `${AUDIT_FEED_SELECT} WHERE a.store_id = ?1 ORDER BY a.id DESC LIMIT 10`,
+  )
+    .bind(id)
+    .all<AuditFeedRow>();
+  return c.json({
+    store: storeJson(store),
+    warehouses,
+    users: storeUsers,
+    recentAudit: recentAudit.map(auditFeedJson),
+  });
+});
+
+// ------------------------------------------------------------ システム
+
+const SYSTEM_TABLES = [
+  'stores',
+  'users',
+  'products',
+  'stocks',
+  'stock_movements',
+  'audit_logs',
+  'sessions',
+  'purchase_orders',
+] as const;
+
+async function tableCount(db: D1Database, table: string): Promise<number> {
+  try {
+    const row = await db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** platform_settings の maintenance を読む (テーブルが無い環境では OFF) */
+async function readMaintenanceSetting(
+  db: D1Database,
+): Promise<{ on: boolean; message: string | null }> {
+  try {
+    const row = await db
+      .prepare('SELECT value FROM platform_settings WHERE key = ?1')
+      .bind('maintenance')
+      .first<{ value: string | null }>();
+    if (row?.value) {
+      const parsed = JSON.parse(row.value) as { on?: unknown; message?: unknown };
+      return {
+        on: parsed.on === true,
+        message: typeof parsed.message === 'string' && parsed.message.length > 0 ? parsed.message : null,
+      };
+    }
+  } catch {
+    // platform_settings 未適用の環境では OFF として扱う
+  }
+  return { on: false, message: null };
+}
+
+/** システム状態: 主要テーブルの行数、有効セッション数、メンテナンス状態 */
+app.get('/api/platform/system', async (c) => {
+  requirePlatformAdmin(c);
+  const tables: Record<string, number> = {};
+  for (const table of SYSTEM_TABLES) {
+    tables[table] = await tableCount(c.env.DB, table);
+  }
+  let activeSessions = 0;
+  try {
+    const row = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?1')
+      .bind(Date.now())
+      .first<{ n: number }>();
+    activeSessions = row?.n ?? 0;
+  } catch {
+    activeSessions = 0;
+  }
+  const maintenance = await readMaintenanceSetting(c.env.DB);
+  return c.json({ tables, activeSessions, maintenance });
+});
+
+const maintenanceBodySchema = z.object({
+  on: z.boolean(),
+  message: z.string().max(500).optional(),
+});
+
+/**
+ * メンテナンスモードの切り替え。店舗アプリは platform_settings を読んで
+ * 書き込み系 API を 503 で止め、/app に告知バナーを出す (workers 側連動)。
+ */
+app.put('/api/platform/settings/maintenance', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(maintenanceBodySchema, await parseJson(c));
+  const value = JSON.stringify({ on: dto.on, message: dto.message ?? '' });
+  await c.env.DB
+    .prepare(
+      `INSERT INTO platform_settings (key, value, updated_by, updated_at) VALUES ('maintenance', ?1, ?2, ?3)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+    )
+    .bind(value, user(c).userId, new Date().toISOString())
+    .run();
+  await platformAudit(
+    c,
+    'platform.maintenance.update',
+    'platform_settings',
+    'maintenance',
+    { on: dto.on },
+    null,
+  );
+  return c.json({ on: dto.on, message: dto.message ?? '' });
+});
+
+/** 全セッション失効 (呼び出し元 = 操作中の全体管理者自身のセッションは残す) */
+app.post('/api/platform/revoke-all-sessions', async (c) => {
+  requirePlatformAdmin(c);
+  const token = readSessionToken(c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  let res: D1Result;
+  if (token) {
+    const hash = await hashSessionToken(token);
+    res = await c.env.DB.prepare('DELETE FROM sessions WHERE token_hash <> ?1').bind(hash).run();
+  } else {
+    res = await c.env.DB.prepare('DELETE FROM sessions').run();
+  }
+  const revoked = res.meta.changes ?? 0;
+  await platformAudit(c, 'platform.sessions.revoke_all', 'session', 'all', { revoked }, null);
+  return c.json({ revoked });
+});
+
+/**
+ * 全データエクスポート (全体管理用)。店舗アプリの export と同形式だが
+ * 店舗スコープを外し、stores と platform_settings も含める。
+ * sessions・idempotency_keys・write_guards は店舗側と同様に含めない。
+ */
+const PLATFORM_EXPORT_TABLES = [
+  'users',
+  'roles',
+  'user_roles',
+  'warehouses',
+  'locations',
+  'products',
+  'lots',
+  'stocks',
+  'stock_movements',
+  'stocktakes',
+  'stocktake_lines',
+  'negative_stock_approvals',
+  'audit_logs',
+  'permissions',
+  'role_permissions',
+  'stores',
+  'feature_flags',
+  'suppliers',
+  'purchase_orders',
+  'purchase_order_lines',
+  'platform_settings',
+] as const;
+
+app.get('/api/platform/export.json', async (c) => {
+  requirePlatformAdmin(c);
+  const tables: Record<string, unknown[]> = {};
+  for (const table of PLATFORM_EXPORT_TABLES) {
+    try {
+      const { results } = await c.env.DB.prepare(`SELECT * FROM ${table} ORDER BY rowid ASC`).all();
+      tables[table] = results;
+    } catch {
+      tables[table] = [];
+    }
+  }
+  return c.json({ exportedAt: Date.now(), tables }, 200, {
+    'Content-Disposition': 'attachment; filename="inventory-platform-export.json"',
+  });
 });
 
 // ---------------------------------------------------------------- エラー

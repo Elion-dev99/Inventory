@@ -84,6 +84,7 @@ import {
   isFeatureEnabled,
 } from './lib/features';
 import { parseCsv, toCsv } from './lib/csv';
+import { getMaintenance, maintenanceMessage } from './lib/maintenance';
 
 export { InventoryCoordinator };
 
@@ -583,6 +584,14 @@ app.use('/api/v1/*', async (c, next) => {
   if (c.req.path === '/api/v1/health') return next();
   const user = await authenticate(c.req.raw, c.env);
   c.set('user', user);
+  // メンテナンスモード (全体管理が platform_settings で切り替える):
+  // ON の間は書き込み系 (非 GET) を 503 で止める。読み取りとログアウトは通す。
+  if (c.req.method !== 'GET' && c.req.path !== '/api/v1/auth/logout') {
+    const maintenance = await getMaintenance(c.env.DB);
+    if (maintenance.on) {
+      throw new ApiError(503, 'MAINTENANCE', maintenanceMessage(maintenance));
+    }
+  }
   return next();
 });
 
@@ -821,6 +830,10 @@ app.get('/api/v1/me', async (c) => {
     stores,
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
+    maintenance: await (async () => {
+      const m = await getMaintenance(c.env.DB);
+      return { on: m.on, message: m.on ? maintenanceMessage(m) : m.message };
+    })(),
   });
 });
 

@@ -2006,6 +2006,14 @@ function boot() {
       el('noAssignBox').style.display = '';
       return;
     }
+    if (me.maintenance && me.maintenance.on) {
+      var mb = el('maintenanceBanner');
+      if (mb) {
+        mb.textContent = me.maintenance.message || 'メンテナンス中です';
+        mb.style.display = '';
+        el('appBox').style.marginTop = '2.7rem';
+      }
+    }
     if (!me.currentStore) {
       showStorePicker(me);
       return;

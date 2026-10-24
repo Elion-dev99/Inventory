@@ -25,6 +25,8 @@ export const APP_HTML = `<!doctype html>
   <span class="small" id="userLabel"></span>
 </header>
 
+<div id="maintenanceBanner" class="maintenance-banner" style="display:none"></div>
+
 <div id="loadingBox" class="splash"><img class="app-icon-lg" src="/icons/icon-512.png" alt=""><div class="splash-name">在庫管理システム</div></div>
 
 <div id="loginBox" class="center-box" style="display:none">

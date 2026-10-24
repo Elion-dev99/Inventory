@@ -384,6 +384,22 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .toolbar input, .toolbar select { width: auto; margin-top: 0.25rem; }
 
 .msg { border-radius: var(--r-md); padding: 0.8rem 1rem; margin: 0.85rem 0; font-size: 0.92rem; }
+
+/* メンテナンス告知バナー (全体管理がメンテナンスモードを ON にしたとき画面上部に固定表示) */
+.maintenance-banner {
+  position: fixed;
+  top: calc(3.4rem + env(safe-area-inset-top));
+  left: 0;
+  right: 0;
+  z-index: 39;
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-bottom: 1px solid var(--line);
+  padding: 0.55rem 1rem;
+  text-align: center;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
 .msg.error { background: var(--danger-bg); color: var(--danger); }
 .msg.success { background: var(--ok-bg); color: var(--ok); }
 .msg.info { background: var(--info-bg); color: var(--info-fg); }

@@ -10,6 +10,7 @@ import featuresSql from '../../workers/migrations/0006_feature_flags.sql?raw';
 import purchasingSql from '../../workers/migrations/0007_purchasing_analytics.sql?raw';
 import multiStoreSql from '../../workers/migrations/0008_multi_store.sql?raw';
 import sessionScopeSql from '../../workers/migrations/0009_session_scope.sql?raw';
+import platformSettingsSql from '../../workers/migrations/0010_platform_settings.sql?raw';
 import { createSession } from '../../workers/src/lib/session';
 
 /**
@@ -136,6 +137,7 @@ beforeAll(async () => {
     ...statementsOf(purchasingSql),
     ...statementsOf(multiStoreSql),
     ...statementsOf(sessionScopeSql),
+    ...statementsOf(platformSettingsSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -345,5 +347,275 @@ describe('全体管理 Worker (分離後)', () => {
 
     const after = await api('/api/platform/stores', { cookie: adminCookie });
     expect(after.status).toBe(401);
+  });
+});
+
+/**
+ * コンソール拡張 (概要 / ユーザー管理 / 監査 / 店舗詳細 / システム) のテスト。
+ * 前の describe の最終テストで管理者セッションはログアウト済みなので、
+ * ここでは改めてログインし直す。
+ */
+describe('全体管理コンソール拡張', () => {
+  let admin2 = '';
+
+  beforeAll(async () => {
+    const res = await SELF.fetch('https://example.com/auth/callback?code=admin-code', {
+      headers: { Cookie: `oauth_nonce=${ADMIN_NONCE}` },
+    });
+    expect(res.status).toBe(200);
+    const match = setCookieOf(res).match(/admin_session=([^;,]+)/);
+    if (!match?.[1]) throw new Error('admin_session cookie not found');
+    admin2 = match[1];
+
+    // 概要の在庫・移動集計用に、店舗1へ保管場所・ロット・在庫・移動を 1 件ずつ入れる
+    const now = Date.now();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO locations (id, warehouse_id, code, name, created_at, updated_at)
+         VALUES (1, 1, 'A-1', '棚A-1', ?1, ?1)`,
+      ).bind(now),
+      testEnv.DB.prepare(
+        `INSERT INTO lots (id, product_id, lot_code, received_at, store_id, created_at, updated_at)
+         VALUES (1, 1, 'LOT-1', ?1, 1, ?1, ?1)`,
+      ).bind(now),
+      testEnv.DB.prepare(
+        `INSERT INTO stocks (id, location_id, lot_id, quantity, store_id, created_at, updated_at)
+         VALUES (1, 1, 1, 10, 1, ?1, ?1)`,
+      ).bind(now),
+      testEnv.DB.prepare(
+        `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
+         VALUES ('doc-ov-1', 1, 'IN', 10, 0, 10, 1, 1, ?1)`,
+      ).bind(now),
+    ]);
+  });
+
+  it('概要 API: 合計・店舗サマリ・全体監査フィードが返る', async () => {
+    const res = await api('/api/platform/overview', { cookie: admin2 });
+    expect(res.status).toBe(200);
+    const totals = res.body.totals as Record<string, number>;
+    expect(totals.stores).toBe(2); // DGOSK + STORE-X (前の describe で作成)
+    expect(totals.users).toBe(3);
+    expect(totals.products).toBe(1);
+    expect(totals.stockRecords).toBe(1);
+    expect(totals.movements30d).toBe(1);
+
+    const summaries = res.body.storeSummaries as Record<string, unknown>[];
+    const dgosk = summaries.find((s) => s.code === 'DGOSK');
+    expect(dgosk?.users).toBe(1);
+    expect(dgosk?.products).toBe(1);
+    expect(dgosk?.stockRecords).toBe(1);
+
+    const feed = res.body.recentPlatformAudit as Record<string, unknown>[];
+    expect(feed.length).toBeGreaterThan(0);
+    expect(feed.every((a) => a.storeId === null)).toBe(true);
+    expect(feed.map((a) => a.action)).toContain('platform.user_roles.update');
+    expect(feed[0]?.actorEmail).toBe('platform@example.com');
+  });
+
+  it('ユーザー一覧: status・最終ログイン・割当サマリと q 検索', async () => {
+    const res = await api('/api/platform/users', { cookie: admin2 });
+    expect(res.status).toBe(200);
+    const users = res.body as unknown as Record<string, unknown>[];
+    const admin = users.find((u) => u.id === 1) as Record<string, unknown>;
+    expect(admin.status).toBe('active');
+    expect(typeof admin.lastLoginAt).toBe('number'); // ログイン済みなのでセッションがある
+    expect((admin.assignmentSummary as Record<string, unknown>).isPlatformAdmin).toBe(true);
+
+    const staff = users.find((u) => u.id === 2) as Record<string, unknown>;
+    expect((staff.assignmentSummary as Record<string, unknown>).isPlatformAdmin).toBe(false);
+    expect((staff.assignmentSummary as Record<string, unknown>).storeCount).toBe(1);
+
+    const fresh = users.find((u) => u.id === 3) as Record<string, unknown>;
+    expect(fresh.lastLoginAt).toBeNull(); // 一度もログインしていない
+
+    const searched = await api('/api/platform/users?q=staff@', { cookie: admin2 });
+    const found = searched.body as unknown as Record<string, unknown>[];
+    expect(found).toHaveLength(1);
+    expect(found[0]?.id).toBe(2);
+    const byName = await api('/api/platform/users?q=Plat', { cookie: admin2 });
+    expect((byName.body as unknown as Record<string, unknown>[]).map((u) => u.id)).toEqual([1]);
+  });
+
+  it('ユーザー停止: 全セッション削除と締め出し、再有効化、自分・最後の管理者は 422', async () => {
+    // user 2 に両スコープのセッションを作る
+    await createSession(testEnv.DB, 2);
+    await createSession(testEnv.DB, 2, { scope: 'platform' });
+
+    const disabled = await api('/api/platform/users/2/status', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { status: 'disabled' },
+    });
+    expect(disabled.status).toBe(200);
+    expect(disabled.body.status).toBe('disabled');
+    const sessions = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM sessions WHERE user_id = 2',
+    ).first<{ n: number }>();
+    expect(sessions?.n).toBe(0);
+    const row = await testEnv.DB.prepare('SELECT status FROM users WHERE id = 2').first<{ status: string }>();
+    expect(row?.status).toBe('disabled');
+
+    // 自分自身は停止できない
+    const selfDisable = await api('/api/platform/users/1/status', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { status: 'disabled' },
+    });
+    expect(selfDisable.status).toBe(422);
+    expect(selfDisable.body.error).toBe('LOCKOUT_PREVENTION');
+
+    // 不正な値・存在しないユーザーは拒否
+    const bad = await api('/api/platform/users/2/status', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { status: 'banned' },
+    });
+    expect(bad.status).toBe(400);
+    const missing = await api('/api/platform/users/999/status', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { status: 'disabled' },
+    });
+    expect(missing.status).toBe(404);
+
+    const enabled = await api('/api/platform/users/2/status', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { status: 'active' },
+    });
+    expect(enabled.status).toBe(200);
+    expect(enabled.body.status).toBe('active');
+  });
+
+  it('セッション失効: revoke-sessions と revoke-all (自分は残る)', async () => {
+    await createSession(testEnv.DB, 3);
+    await createSession(testEnv.DB, 3, { scope: 'platform' });
+    const revoked = await api('/api/platform/users/3/revoke-sessions', {
+      cookie: admin2,
+      method: 'POST',
+    });
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.revoked).toBe(2);
+    const userRow = await testEnv.DB.prepare('SELECT status FROM users WHERE id = 3').first<{ status: string }>();
+    expect(userRow?.status).toBe('active'); // 状態は変わらない
+
+    await createSession(testEnv.DB, 2);
+    await createSession(testEnv.DB, 3);
+    const all = await api('/api/platform/revoke-all-sessions', { cookie: admin2, method: 'POST' });
+    expect(all.status).toBe(200);
+    expect((all.body.revoked as number) >= 2).toBe(true);
+    // 呼び出し元 (admin2) のセッションは残っている
+    const stillValid = await api('/api/platform/stores', { cookie: admin2 });
+    expect(stillValid.status).toBe(200);
+    const others = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM sessions WHERE user_id IN (2, 3)',
+    ).first<{ n: number }>();
+    expect(others?.n).toBe(0);
+  });
+
+  it('監査 API: 店舗・全体・ユーザー・キーワードで絞り込める', async () => {
+    const platformOnly = await api('/api/platform/audit-logs?storeId=platform', { cookie: admin2 });
+    expect(platformOnly.status).toBe(200);
+    const pItems = platformOnly.body.items as Record<string, unknown>[];
+    expect(pItems.length).toBeGreaterThan(0);
+    expect(pItems.every((a) => a.storeId === null)).toBe(true);
+    expect(pItems.some((a) => a.action === 'platform.user.status')).toBe(true);
+
+    const store1 = await api('/api/platform/audit-logs?storeId=1', { cookie: admin2 });
+    const sItems = store1.body.items as Record<string, unknown>[];
+    expect(sItems.length).toBeGreaterThan(0);
+    expect(sItems.every((a) => a.storeId === 1)).toBe(true);
+    expect(sItems.some((a) => a.action === 'feature_flag.update')).toBe(true);
+    expect(sItems[0]?.storeName).toBe('DGOSK');
+
+    const byUser = await api('/api/platform/audit-logs?userId=1', { cookie: admin2 });
+    const uItems = byUser.body.items as Record<string, unknown>[];
+    expect(uItems.length).toBeGreaterThan(0);
+    expect(uItems.every((a) => a.actorId === 1)).toBe(true);
+
+    const byKeyword = await api('/api/platform/audit-logs?q=user_roles', { cookie: admin2 });
+    const kItems = byKeyword.body.items as Record<string, unknown>[];
+    expect(kItems.length).toBeGreaterThan(0);
+    expect(kItems.every((a) => String(a.action).includes('user_roles'))).toBe(true);
+
+    const limited = await api('/api/platform/audit-logs?limit=1', { cookie: admin2 });
+    expect((limited.body.items as unknown[])).toHaveLength(1);
+    expect(limited.body.limit).toBe(1);
+    expect((limited.body.total as number) > 1).toBe(true);
+  });
+
+  it('店舗詳細 API: 倉庫・割当ユーザー・直近監査が返る', async () => {
+    const res = await api('/api/platform/stores/1/detail', { cookie: admin2 });
+    expect(res.status).toBe(200);
+    expect((res.body.store as Record<string, unknown>).code).toBe('DGOSK');
+    const warehouses = res.body.warehouses as Record<string, unknown>[];
+    expect(warehouses.map((w) => w.code)).toContain('WH-A');
+    const users = res.body.users as Record<string, unknown>[];
+    const staffAssign = users.find((u) => u.userId === 2);
+    expect(staffAssign?.roleCode).toBe('INVENTORY_STAFF');
+    expect(staffAssign?.email).toBe('staff@example.com');
+    expect(Array.isArray(res.body.recentAudit)).toBe(true);
+
+    const missing = await api('/api/platform/stores/999/detail', { cookie: admin2 });
+    expect(missing.status).toBe(404);
+  });
+
+  it('システム API: 行数・有効セッション・maintenance の読み書き', async () => {
+    const sys = await api('/api/platform/system', { cookie: admin2 });
+    expect(sys.status).toBe(200);
+    const tables = sys.body.tables as Record<string, number>;
+    expect(tables.stores).toBe(2);
+    expect(tables.users).toBe(3);
+    expect(tables.products).toBe(1);
+    expect(tables.stocks).toBe(1);
+    expect(tables.audit_logs).toBeGreaterThan(0);
+    expect(sys.body.activeSessions as number).toBeGreaterThan(0);
+    expect((sys.body.maintenance as Record<string, unknown>).on).toBe(false);
+
+    const put = await api('/api/platform/settings/maintenance', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { on: true, message: 'テスト告知文' },
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.on).toBe(true);
+    expect(put.body.message).toBe('テスト告知文');
+
+    const sys2 = await api('/api/platform/system', { cookie: admin2 });
+    const m2 = sys2.body.maintenance as Record<string, unknown>;
+    expect(m2.on).toBe(true);
+    expect(m2.message).toBe('テスト告知文');
+
+    const off = await api('/api/platform/settings/maintenance', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { on: false },
+    });
+    expect(off.status).toBe(200);
+    expect(off.body.on).toBe(false);
+    const badBody = await api('/api/platform/settings/maintenance', {
+      cookie: admin2,
+      method: 'PUT',
+      body: { on: 'yes' },
+    });
+    expect(badBody.status).toBe(400);
+  });
+
+  it('全店舗エクスポート: stores と platform_settings を含む', async () => {
+    const res = await SELF.fetch('https://example.com/api/platform/export.json', {
+      headers: { Cookie: `admin_session=${admin2}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Disposition')).toContain('attachment');
+    const data = (await res.json()) as {
+      exportedAt: string;
+      tables: Record<string, Record<string, unknown>[]>;
+    };
+    expect(data.tables.stores?.length).toBe(2);
+    expect(data.tables.stores?.map((s) => s.code)).toContain('STORE-X');
+    expect(data.tables.users?.length).toBe(3);
+    expect(Array.isArray(data.tables.platform_settings)).toBe(true);
+    expect(data.tables.platform_settings?.some((r) => r.key === 'maintenance')).toBe(true);
+    expect(data.tables.sessions).toBeUndefined(); // セッションは含めない
   });
 });
