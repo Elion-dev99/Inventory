@@ -240,6 +240,7 @@ var ICON_PATHS = {
   box: '<path d="M3.5 7.8 12 3.5l8.5 4.3v8.4L12 20.5l-8.5-4.3z"/><path d="M3.5 7.8 12 12l8.5-4.2"/><path d="M12 12v8.5"/>',
   plus: '<path d="M12 5.5v13M5.5 12h13"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3.2 2"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="m15.8 15.8 4.7 4.7"/>',
   grid: '<path d="M4.5 4.5h6.5v6.5H4.5zM13 4.5h6.5v6.5H13zM4.5 13h6.5v6.5H4.5zM13 13h6.5v6.5H13z"/>',
   in: '<path d="M12 4v10.5m0 0 4.3-4.3M12 14.5 7.7 10.2"/><path d="M4.5 19.5h15"/>',
   out: '<path d="M12 14.5V4m0 0 4.3 4.3M12 4 7.7 8.3"/><path d="M4.5 19.5h15"/>',
@@ -433,6 +434,24 @@ function loadDashboard() {
     } else if (active) {
       h += msgHtml('warn', '棚卸し実施中です (開始: ' + fmtDateTime(active.startedAt) + ')。入庫・消費・移動は停止しています。');
     }
+    /* 状態ヒーロー: 一目で全体像が分かる大きなステータス表示 */
+    var hCounts = { EXPIRED: 0, EXPIRING: 0, LOW_STOCK: 0, NEGATIVE_STOCK: 0 };
+    if (alerts) { for (var ai = 0; ai < alerts.length; ai++) { if (hCounts[alerts[ai].type] !== undefined) hCounts[alerts[ai].type]++; } }
+    var hTotal = 0;
+    if (stocks) { for (var si = 0; si < stocks.length; si++) hTotal += stocks[si].quantity; }
+    var dangerN = hCounts.EXPIRED + hCounts.NEGATIVE_STOCK;
+    var warnN = hCounts.EXPIRING + hCounts.LOW_STOCK;
+    var heroCls = 'ok';
+    var heroTitle = 'すべて正常です';
+    var heroSub = '対応が必要なアラートはありません';
+    if (active) { heroCls = 'warn'; heroTitle = '棚卸し中です'; heroSub = '棚卸しが終わるまで在庫の更新は停止しています'; }
+    else if (dangerN > 0) { heroCls = 'danger'; heroTitle = '要対応 ' + dangerN + ' 件'; heroSub = '期限切れ・マイナス在庫があります'; }
+    else if (warnN > 0) { heroCls = 'warn'; heroTitle = '注意 ' + warnN + ' 件'; heroSub = '期限接近・在庫不足があります'; }
+    if (stocks) heroSub += ' ・ 在庫 ' + stocks.length + ' 件 / 総数量 ' + hTotal;
+    h += '<div class="hero ' + heroCls + '"><span class="hero-dot"></span><div class="hero-body"><div class="hero-title">' + heroTitle + '</div><div class="hero-sub">' + esc(heroSub) + '</div></div></div>';
+    if (can('stocks.read')) {
+      h += '<form class="search-hero" id="dashSearch"><span class="search-ic">' + icon('search', 18) + '</span><input id="dashQ" type="search" placeholder="商品名・SKU・ロットで検索" autocomplete="off"></form>';
+    }
     h += '<div class="cards">';
     if (alerts) {
       var counts = { EXPIRED: 0, EXPIRING: 0, LOW_STOCK: 0, NEGATIVE_STOCK: 0 };
@@ -479,6 +498,12 @@ function loadDashboard() {
     el('view').innerHTML = h;
     var b = el('dashToAlerts');
     if (b) b.onclick = function () { showView('alerts'); };
+    var dsf = el('dashSearch');
+    if (dsf) dsf.onsubmit = function (e) {
+      e.preventDefault();
+      try { sessionStorage.setItem('pendingStockQuery', el('dashQ').value || ''); } catch (err) {}
+      showView('stocks');
+    };
     var qbs = el('view').querySelectorAll('.quick-btn[data-view]');
     for (var qi = 0; qi < qbs.length; qi++) {
       qbs[qi].onclick = function () { showView(this.getAttribute('data-view')); };
@@ -575,6 +600,10 @@ function loadStocks() {
     (feat('csv') ? '<div><label>&nbsp;</label><a class="btn secondary" href="/api/v1/stocks.csv">CSV ダウンロード</a></div>' : '') +
     '</div>' +
     '<div id="stMsg"></div><div id="stBody">' + skeletonRows() + '</div>';
+  try {
+    var pq = sessionStorage.getItem('pendingStockQuery');
+    if (pq) { el('stQ').value = pq; sessionStorage.removeItem('pendingStockQuery'); }
+  } catch (e) {}
   ensureMaster().then(function (m) {
     el('stWh').innerHTML = '<option value="">すべて</option>' + optionsHtml(m.warehouses, function (w) { return w.id; }, function (w) { return w.name; }, '');
     var fillLocs = function () {

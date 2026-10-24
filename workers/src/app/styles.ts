@@ -17,6 +17,9 @@ export const APP_CSS = `
   --accent-press: #0060c9;
   --control: #e8e8ed;
   --header-bg: rgba(251, 251, 253, 0.78);
+  --glass: rgba(255, 255, 255, 0.66);
+  --glass-border: rgba(255, 255, 255, 0.65);
+  --dock-shadow: 0 12px 32px rgba(0, 0, 0, 0.16), 0 2px 8px rgba(0, 0, 0, 0.08);
   --danger: #c81e1e;
   --danger-bg: #fef2f2;
   --warn: #9a6700;
@@ -25,7 +28,7 @@ export const APP_CSS = `
   --ok-bg: #e6f4ea;
   --info-bg: #e8effe;
   --info-fg: #123a8f;
-  --r-lg: 20px;
+  --r-lg: 24px;
   --r-md: 14px;
   --r-sm: 10px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.06);
@@ -33,7 +36,7 @@ export const APP_CSS = `
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #000000;
+    --bg: #060608;
     --surface: #1c1c1e;
     --surface-2: #242426;
     --fg: #f5f5f7;
@@ -42,6 +45,9 @@ export const APP_CSS = `
     --line-strong: rgba(255, 255, 255, 0.24);
     --control: #2c2c2e;
     --header-bg: rgba(22, 22, 24, 0.72);
+    --glass: rgba(30, 30, 34, 0.62);
+    --glass-border: rgba(255, 255, 255, 0.14);
+    --dock-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
     --danger: #ff6961;
     --danger-bg: #3a2222;
     --warn: #f5c66b;
@@ -97,23 +103,36 @@ header.app-header a { text-decoration: none; font-weight: 500; }
   .ws-label { display: none; }
 }
 
-main { padding: 1rem 1rem 2rem; padding-bottom: calc(6.8rem + env(safe-area-inset-bottom)); max-width: 1080px; margin: 0 auto; }
+main { padding: 1rem 1rem 2rem; padding-bottom: calc(7.6rem + env(safe-area-inset-bottom)); max-width: 1080px; margin: 0 auto; }
 
-/* ---- iOS 風 下部タブバー ---- */
+/* 画面遷移: 中身がふわりと浮かび上がる */
+#view > * { animation: view-rise 0.38s cubic-bezier(0.22, 0.9, 0.3, 1) both; }
+#view > *:nth-child(2) { animation-delay: 0.04s; }
+#view > *:nth-child(3) { animation-delay: 0.08s; }
+#view > *:nth-child(4) { animation-delay: 0.12s; }
+#view > *:nth-child(5) { animation-delay: 0.16s; }
+#view > *:nth-child(n+6) { animation-delay: 0.2s; }
+@keyframes view-rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { #view > * { animation: none; } }
+
+/* ---- 浮遊ドック型タブバー (visionOS 風) ---- */
 .tabbar {
   position: fixed;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(0.65rem + env(safe-area-inset-bottom));
   z-index: 45;
+  width: min(450px, calc(100% - 1.4rem));
   display: flex;
   align-items: flex-start;
   justify-content: space-around;
-  padding: 0.45rem 0.5rem calc(0.35rem + env(safe-area-inset-bottom));
-  background: var(--header-bg);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  backdrop-filter: blur(20px) saturate(180%);
-  border-top: 1px solid var(--line);
+  padding: 0.5rem 0.55rem 0.42rem;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  border-radius: 30px;
+  box-shadow: var(--dock-shadow);
 }
 .tab-item, .tab-plus {
   flex: 1;
@@ -134,17 +153,19 @@ main { padding: 1rem 1rem 2rem; padding-bottom: calc(6.8rem + env(safe-area-inse
 }
 .tab-item:active, .tab-plus:active { transform: scale(0.94); }
 .tab-item.active { color: var(--accent); }
+.tab-item { border-radius: 18px; padding: 0.28rem 0.1rem 0.18rem; }
+.tab-item.active { background: rgba(0, 113, 227, 0.13); }
 .tab-plus .plus-circle {
   display: grid;
   place-items: center;
-  width: 50px;
-  height: 50px;
-  margin-top: -20px;
+  width: 52px;
+  height: 52px;
+  margin-top: -22px;
   border-radius: 50%;
   background: var(--accent);
   color: #fff;
-  box-shadow: 0 6px 18px rgba(0, 113, 227, 0.4);
-  border: 3px solid var(--bg);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.22);
+  border: none;
 }
 .tab-plus.active { color: var(--accent); }
 
@@ -178,7 +199,8 @@ main { padding: 1rem 1rem 2rem; padding-bottom: calc(6.8rem + env(safe-area-inse
   padding: 0.75rem;
   padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
 }
-.sheet { background: var(--surface); border-radius: var(--r-lg); overflow: hidden; box-shadow: var(--shadow-lg); }
+.sheet { background: var(--glass); -webkit-backdrop-filter: blur(24px) saturate(180%); backdrop-filter: blur(24px) saturate(180%); border: 1px solid var(--glass-border); border-radius: 26px; overflow: hidden; box-shadow: var(--shadow-lg); animation: sheet-up 0.34s cubic-bezier(0.22, 0.9, 0.3, 1) both; }
+@keyframes sheet-up { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: translateY(0); } }
 .sheet-title { text-align: center; color: var(--muted); font-size: 0.85rem; font-weight: 600; padding: 0.8rem 1rem 0.4rem; }
 .sheet-cancel {
   background: var(--surface);
@@ -194,7 +216,7 @@ main { padding: 1rem 1rem 2rem; padding-bottom: calc(6.8rem + env(safe-area-inse
 }
 
 /* ---- iOS 設定風グループリスト ---- */
-.group { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; margin-bottom: 1rem; }
+.group { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden; margin-bottom: 1rem; }
 .group-row, .sheet-row {
   display: flex;
   align-items: center;
@@ -242,15 +264,64 @@ main { padding: 1rem 1rem 2rem; padding-bottom: calc(6.8rem + env(safe-area-inse
 .quick-btn:active { transform: scale(0.97); }
 .quick-btn .row-icon { width: 36px; height: 36px; border-radius: 10px; }
 
+/* ---- ダッシュボードの状態ヒーローとクイック検索 ---- */
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  border-radius: 26px;
+  padding: 1.15rem 1.25rem;
+  margin-bottom: 0.85rem;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow);
+  background: var(--surface);
+}
+.hero-dot { flex: none; width: 11px; height: 11px; border-radius: 50%; background: var(--accent); }
+.hero.ok .hero-dot { background: #30d158; }
+.hero.warn .hero-dot { background: #ff9f0a; }
+.hero.danger .hero-dot { background: #ff453a; }
+.hero { border-left: 4px solid var(--accent); }
+.hero.ok { border-left-color: #30d158; }
+.hero.warn { border-left-color: #ff9f0a; }
+.hero.danger { border-left-color: #ff453a; }
+.hero-title { font-size: 1.45rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1.25; }
+.hero-sub { color: var(--muted); font-size: 0.88rem; font-weight: 500; }
+.search-hero {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 18px;
+  padding: 0.15rem 0.95rem;
+  margin-bottom: 0.95rem;
+  box-shadow: var(--shadow);
+}
+.search-hero .search-ic { color: var(--muted); display: grid; place-items: center; }
+.search-hero input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 1rem;
+  padding: 0.7rem 0;
+  font-family: inherit;
+}
+.search-hero input:focus { outline: none; }
+.search-hero:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.16), var(--shadow); }
+
 h2 { font-size: 1.9rem; font-weight: 800; letter-spacing: -0.02em; margin: 0.35rem 0 1.1rem; }
 h3 { font-size: 1.02rem; font-weight: 600; letter-spacing: -0.01em; margin: 1.4rem 0 0.6rem; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 0.85rem; }
-.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 1.05rem 1.1rem; box-shadow: var(--shadow); }
+.card { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); padding: 1.05rem 1.1rem; box-shadow: var(--shadow); transition: transform 0.18s ease, box-shadow 0.18s ease; }
+@media (hover: hover) { .card:hover, .quick-btn:hover { transform: translateY(-2px); } }
 .card .num { font-size: 2.05rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; font-variant-numeric: tabular-nums; }
 .card .lbl { color: var(--muted); font-size: 0.82rem; font-weight: 500; margin-top: 0.15rem; }
 
-.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); -webkit-overflow-scrolling: touch; }
+.table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); -webkit-overflow-scrolling: touch; }
 table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
 th, td { border-bottom: 1px solid var(--line); padding: 0.6rem 0.85rem; text-align: left; white-space: nowrap; }
 th { background: var(--surface-2); color: var(--muted); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.04em; }
@@ -301,7 +372,7 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 }
 .btn:hover { background: var(--accent-press); }
 .btn:active { transform: scale(0.97); }
-.btn.secondary { background: var(--control); color: var(--fg); }
+.btn.secondary { background: var(--control); color: var(--fg); box-shadow: none; }
 .btn.secondary:hover { background: var(--line-strong); }
 .btn.danger { background: #d70015; border-color: transparent; }
 .btn.danger:hover { background: #b50011; }
@@ -323,7 +394,7 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
 
-.section-box { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; }
+.section-box { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; }
 
 .modal-overlay {
   position: fixed;
@@ -388,7 +459,7 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---- 分析レポートの SVG 棒グラフ ---- */
-.chart-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; overflow-x: auto; }
+.chart-wrap { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; overflow-x: auto; }
 .chart-legend { display: flex; gap: 1.25rem; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
 .chart-legend .sw { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 3px; margin-right: 0.35rem; vertical-align: -0.08rem; }
 `;
