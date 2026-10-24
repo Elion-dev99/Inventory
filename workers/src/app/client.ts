@@ -396,9 +396,6 @@ function loadMore() {
   if (can('admin.permissions') || can('admin.users')) {
     h += '<a class="group-row" href="/admin/permissions"><span class="row-icon" style="background:#30b0c7">' + icon('shield', 17) + '</span><span class="row-label">権限管理</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
   }
-  if (state.me && state.me.isPlatformAdmin) {
-    h += '<a class="group-row" href="/platform"><span class="row-icon" style="background:#5856d6">' + icon('grid', 17) + '</span><span class="row-label">全体管理 (店舗・全体設定)</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
-  }
   h += '</div>';
   h += '<h3>アカウント</h3><div class="group">';
   if (state.me) {

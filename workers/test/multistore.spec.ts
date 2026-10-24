@@ -9,6 +9,7 @@ import businessSql from '../migrations/0005_business_completion.sql?raw';
 import featuresSql from '../migrations/0006_feature_flags.sql?raw';
 import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
 import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
+import sessionScopeSql from '../migrations/0009_session_scope.sql?raw';
 import { createSession } from '../src/lib/session';
 
 /**
@@ -76,6 +77,26 @@ function nextKey(): string {
   return `ms-test-${keySeq}`;
 }
 
+/**
+ * 全体管理 API は別 Worker (admin) に分離されたため、店舗アプリ側のテストでは
+ * 店舗の作成・停止やフラグ切替を DB 直接操作で用意する
+ * (全体管理 API 自体の検証は admin パッケージのテストが担う)。
+ */
+async function setFeatureFlag(storeId: number, key: string, enabled: boolean): Promise<void> {
+  await testEnv.DB.prepare(
+    `INSERT INTO feature_flags (store_id, key, enabled, updated_by, updated_at) VALUES (?1, ?2, ?3, 1, ?4)
+     ON CONFLICT(store_id, key) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`,
+  )
+    .bind(storeId, key, enabled ? 1 : 0, Date.now())
+    .run();
+}
+
+async function setStoreStatus(storeId: number, status: 'active' | 'suspended'): Promise<void> {
+  await testEnv.DB.prepare('UPDATE stores SET status = ?1, updated_at = ?2 WHERE id = ?3')
+    .bind(status, Date.now(), storeId)
+    .run();
+}
+
 function inbound(cookie: string, locationId: number, productId: number, lotCode: string, quantity: number, key?: string) {
   return api('/api/v1/movements/inbound', {
     cookie,
@@ -122,6 +143,7 @@ beforeAll(async () => {
     ...statementsOf(featuresSql),
     ...statementsOf(purchasingSql),
     ...statementsOf(multiStoreSql),
+    ...statementsOf(sessionScopeSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -278,12 +300,7 @@ describe('複数店舗 (テナント) 分離', () => {
   });
 
   it('機能フラグは店舗ごとに解決される', async () => {
-    const off = await api('/api/v1/platform/stores/1/features/transfers', {
-      token: platformToken,
-      method: 'PUT',
-      body: { enabled: false },
-    });
-    expect(off.status).toBe(200);
+    await setFeatureFlag(1, 'transfers', false);
 
     const featuresA = await api('/api/v1/features', { cookie: cookieA });
     expect((featuresA.body.features as Record<string, boolean>).transfers).toBe(false);
@@ -312,73 +329,46 @@ describe('複数店舗 (テナント) 分離', () => {
     expect(transferB.status).toBe(201);
 
     // 後片付け: 店舗A の移動を戻す
-    const on = await api('/api/v1/platform/stores/1/features/transfers', {
-      token: platformToken,
-      method: 'PUT',
-      body: { enabled: true },
-    });
-    expect(on.status).toBe(200);
+    await setFeatureFlag(1, 'transfers', true);
   });
 
-  it('全体 API は店舗管理者・担当者には 403、全体管理者には開く', async () => {
+  it('全体管理は別 Worker に分離され、店舗アプリではページも API も 404', async () => {
+    // 全体管理コンソール (/platform) は店舗アプリに存在しない
+    const page = await SELF.fetch('https://example.com/platform', {
+      headers: { Cookie: `session=${cookiePlatform}` },
+    });
+    expect(page.status).toBe(404);
+
+    // 全体管理 API も、全体管理者を含む誰で叩いても 404 (存在自体を隠す)
+    const byPlatform = await api('/api/v1/platform/stores', { token: platformToken });
+    expect(byPlatform.status).toBe(404);
     const byStoreAdmin = await api('/api/v1/platform/stores', { token: storeAdminToken });
-    expect(byStoreAdmin.status).toBe(403);
-    const byStaff = await api('/api/v1/platform/stores', { cookie: cookieA });
-    expect(byStaff.status).toBe(403);
-
-    const list = await api('/api/v1/platform/stores', { token: platformToken });
-    expect(list.status).toBe(200);
-    const stores = list.body as unknown as { id: number; code: string; status: string }[];
-    expect(stores.map((s) => s.code)).toEqual(['DGOSK', 'STORE-B']);
-    expect(stores.every((s) => s.status === 'active')).toBe(true);
-
-    const stats = await api('/api/v1/platform/stores/1/stats', { token: platformToken });
-    expect(stats.status).toBe(200);
-    expect(stats.body.users).toBe(3); // 店舗A担当 + 両店舗所属 + 店舗管理者
-    expect(stats.body.products).toBeGreaterThanOrEqual(1);
-    expect(stats.body.stockRecords).toBeGreaterThanOrEqual(1);
-    expect(stats.body.movementsLast30Days).toBeGreaterThanOrEqual(1);
-
-    const users = await api('/api/v1/platform/users', { token: platformToken });
-    expect(users.status).toBe(200);
-    const platformUser = (users.body as unknown as { id: number; assignments: { storeId: number | null }[] }[]).find(
-      (u) => u.id === 1,
-    );
-    expect(platformUser?.assignments).toEqual([
-      { roleCode: 'SYSTEM_ADMIN', warehouseId: null, storeId: null },
-    ]);
+    expect(byStoreAdmin.status).toBe(404);
+    const byStaff = await api('/api/v1/platform/users', { cookie: cookieA });
+    expect(byStaff.status).toBe(404);
+    const post = await api('/api/v1/platform/stores', {
+      token: platformToken,
+      method: 'POST',
+      body: { code: 'NOPE', name: '作れない' },
+    });
+    expect(post.status).toBe(404);
   });
 
   it('店舗作成 -> 割当 -> その店舗で業務ができる一連の流れ', async () => {
-    const created = await api('/api/v1/platform/stores', {
-      token: platformToken,
-      method: 'POST',
-      body: { code: 'STORE-C', name: '店舗C' },
-    });
-    expect(created.status).toBe(201);
-    const storeC = created.body.id as number;
-
-    const dup = await api('/api/v1/platform/stores', {
-      token: platformToken,
-      method: 'POST',
-      body: { code: 'STORE-C', name: '重複' },
-    });
-    expect(dup.status).toBe(409);
-
-    const assigned = await api('/api/v1/platform/users/6/assignments', {
-      token: platformToken,
-      method: 'PUT',
-      body: { assignments: [{ roleCode: 'INVENTORY_MANAGER', warehouseId: null, storeId: storeC }] },
-    });
-    expect(assigned.status).toBe(200);
-
-    // 全体割当は SYSTEM_ADMIN 以外に付けられない
-    const badPlatform = await api('/api/v1/platform/users/6/assignments', {
-      token: platformToken,
-      method: 'PUT',
-      body: { assignments: [{ roleCode: 'INVENTORY_MANAGER', warehouseId: null, storeId: null }] },
-    });
-    expect(badPlatform.status).toBe(422);
+    // 店舗の作成と割当は全体管理 Worker の責務になったため、ここでは DB で用意し、
+    // 「割り当てられた店舗で業務ができる」こと自体を店舗アプリ側で検証する
+    const now = Date.now();
+    const created = await testEnv.DB.prepare(
+      `INSERT INTO stores (code, name, status, created_at, updated_at) VALUES ('STORE-C', '店舗C', 'active', ?1, ?1)`,
+    )
+      .bind(now)
+      .run();
+    const storeC = Number(created.meta.last_row_id);
+    await testEnv.DB.prepare(
+      'INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (6, \'INVENTORY_MANAGER\', NULL, ?1)',
+    )
+      .bind(storeC)
+      .run();
 
     const cookieNew = await createSession(testEnv.DB, 6);
     const me = await api('/api/v1/me', { cookie: cookieNew });
@@ -448,13 +438,7 @@ describe('複数店舗 (テナント) 分離', () => {
   });
 
   it('停止した店舗は店舗ユーザーが使えず、全体管理者だけが入れる', async () => {
-    const suspended = await api('/api/v1/platform/stores/2', {
-      token: platformToken,
-      method: 'PUT',
-      body: { status: 'suspended' },
-    });
-    expect(suspended.status).toBe(200);
-    expect(suspended.body.status).toBe('suspended');
+    await setStoreStatus(2, 'suspended');
 
     const blocked = await api('/api/v1/stocks', { cookie: cookieB });
     expect(blocked.status).toBe(403);
@@ -479,12 +463,7 @@ describe('複数店舗 (テナント) 分離', () => {
     expect(stocks.status).toBe(200);
 
     // 再開すると店舗ユーザーが戻れる
-    const resumed = await api('/api/v1/platform/stores/2', {
-      token: platformToken,
-      method: 'PUT',
-      body: { status: 'active' },
-    });
-    expect(resumed.status).toBe(200);
+    await setStoreStatus(2, 'active');
     const after = await api('/api/v1/stocks?take=200', { cookie: cookieB });
     expect(after.status).toBe(200);
   });

@@ -9,6 +9,7 @@ import businessSql from '../migrations/0005_business_completion.sql?raw';
 import featuresSql from '../migrations/0006_feature_flags.sql?raw';
 import purchasingSql from '../migrations/0007_purchasing_analytics.sql?raw';
 import multiStoreSql from '../migrations/0008_multi_store.sql?raw';
+import sessionScopeSql from '../migrations/0009_session_scope.sql?raw';
 import { createSession, hashSessionToken } from '../src/lib/session';
 
 /**
@@ -117,6 +118,7 @@ beforeAll(async () => {
     ...statementsOf(featuresSql),
     ...statementsOf(purchasingSql),
     ...statementsOf(multiStoreSql),
+    ...statementsOf(sessionScopeSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -266,6 +268,35 @@ describe('セッション認証 (D1 結合)', () => {
       headers: { Upgrade: 'websocket' },
     });
     expect(denied.status).toBe(401);
+  });
+
+  it('platform スコープのセッションでは店舗 API を使えない (スコープ分離)', async () => {
+    // 全体管理 Worker が発行する platform スコープのセッション (管理者 user 1 用)
+    const platformToken = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    const row = await testEnv.DB.prepare(
+      'SELECT scope FROM sessions WHERE token_hash = ?1',
+    )
+      .bind(await hashSessionToken(platformToken))
+      .first<{ scope: string }>();
+    expect(row?.scope).toBe('platform');
+
+    // 同じトークンを店舗アプリの Cookie に入れても未認証として扱われる
+    const me = await fetchWithCookie('/api/v1/me', `session=${platformToken}`);
+    expect(me.status).toBe(401);
+    const stocks = await fetchWithCookie('/api/v1/stocks', `session=${platformToken}`);
+    expect(stocks.status).toBe(401);
+  });
+
+  it('全体管理は別 Worker に分離され、店舗アプリでは 404', async () => {
+    const admin = await testEnv.DB.prepare('SELECT id FROM users WHERE id = 1').first<{ id: number }>();
+    const token = await createSession(testEnv.DB, admin?.id ?? 1);
+    const cookie = `session=${token}`;
+
+    const page = await SELF.fetch('https://example.com/platform', { headers: { Cookie: cookie } });
+    expect(page.status).toBe(404);
+
+    const apiRes = await fetchWithCookie('/api/v1/platform/stores', cookie);
+    expect(apiRes.status).toBe(404);
   });
 
   it('/app は SPA の HTML を 200 で返す', async () => {

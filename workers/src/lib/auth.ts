@@ -37,6 +37,12 @@ export interface AuthUser {
   assignments: RoleAssignment[];
   /** Cookie セッションで選択済みの店舗 ID。Bearer 認証では undefined */
   sessionStoreId?: number | null;
+  /**
+   * セッションのスコープ ('app' = 店舗アプリ / 'platform' = 全体管理)。
+   * Bearer 認証では undefined。店舗アプリは 'app' のセッションだけを、
+   * 全体管理 Worker は 'platform' のセッションだけを受け付ける。
+   */
+  sessionScope?: 'app' | 'platform';
   /** Cookie セッション経由の認証かどうか (店舗選択の保存可否に使う) */
   viaSession?: boolean;
 }

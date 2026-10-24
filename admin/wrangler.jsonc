@@ -1,0 +1,31 @@
+{
+  // 在庫管理システム — 全体管理 (プラットフォーム管理) 専用 Worker。
+  // 店舗アプリ (workers/) とは別プロジェクト。DB (D1) は店舗アプリと共有する
+  // (店舗・ユーザー・割当・機能フラグを横断管理するため)。手順は README.md。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inventory-admin-workers",
+  "main": "src/index.ts",
+  // 店舗アプリ側に合わせる (ローカルの workerd が受理できる上限)
+  "compatibility_date": "2026-08-01",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "inventory-system",
+      // 店舗アプリと同じ D1 (database_id は識別子であり秘密情報ではない)
+      "database_id": "d38d01ca-ab70-48a6-88cf-b9601133ec58"
+    }
+  ],
+  "vars": {
+    // IdP は Google (店舗アプリと同じ公開情報)。クライアント ID は店舗アプリと
+    // 同じだが、Google 側で本 Worker の /auth/callback を承認済みリダイレクト
+    // URI に追加する必要がある (README.md 参照)。
+    "OIDC_ISSUER_URL": "https://accounts.google.com",
+    "OIDC_JWKS_URL": "https://www.googleapis.com/oauth2/v3/certs",
+    "OIDC_AUDIENCE": "1099201950238-iq41o4dmf63nnitj43ifnfojqvtbip8s.apps.googleusercontent.com",
+    "OIDC_CLIENT_ID": "1099201950238-iq41o4dmf63nnitj43ifnfojqvtbip8s.apps.googleusercontent.com"
+  }
+}
