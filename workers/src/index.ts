@@ -241,8 +241,22 @@ app.get('/admin/permissions', (c) =>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>権限管理 | 在庫管理システム</title>${PWA_HEAD}
 <style>${APP_CSS}
-td.perm-cell { text-align: center; }
-td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
+.role-picker { display: flex; gap: 2px; padding: 2px; background: var(--control); border-radius: var(--r-sm); overflow-x: auto; margin-bottom: 1rem; -webkit-overflow-scrolling: touch; }
+.role-picker button { flex: 1 0 auto; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 0.88rem; font-weight: 600; padding: 0.5rem 0.55rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.role-picker button.sel { background: var(--surface); color: var(--fg); box-shadow: var(--shadow); }
+.perm-row { padding: 0.65rem 1rem 0.75rem; border-bottom: 1px solid var(--line); }
+.perm-row:last-child { border-bottom: 0; }
+.perm-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 0.3rem; }
+.perm-name { font-weight: 600; }
+.perm-name small { color: var(--muted); font-weight: 400; font-size: 0.78rem; margin-left: 0.45rem; }
+.perm-state { font-size: 0.82rem; color: var(--muted); white-space: nowrap; }
+.perm-state.on { color: var(--accent); font-weight: 600; }
+.perm-desc { margin: 0 0 0.5rem; font-size: 0.82rem; color: var(--muted); }
+.perm-seg { display: flex; gap: 2px; padding: 2px; background: var(--control); border-radius: var(--r-sm); }
+.perm-seg button { flex: 1 1 0; min-width: 0; border: 0; background: transparent; color: var(--muted); font: inherit; font-size: 0.9rem; font-weight: 600; padding: 0.45rem 0.2rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.perm-seg button.sel { background: var(--surface); color: var(--fg); box-shadow: var(--shadow); }
+.perm-seg button.sel.on { background: var(--accent); color: #fff; }
+#matrix.saving .perm-seg button { pointer-events: none; opacity: 0.55; }
 </style></head>
 <body>
 <header class="app-header">
@@ -260,9 +274,10 @@ td.perm-cell input[type=checkbox] { width: 1.25rem; height: 1.25rem; }
   <p><a class="btn" href="/auth/login">Google でログインする</a></p>
 </div>
 
-<h2>ロール × 権限マトリクス</h2>
-<div class="table-wrap"><div id="matrix"><div class="skl skl-row"></div><div class="skl skl-row"></div><div class="skl skl-row"></div></div></div>
-<button id="saveMatrix" class="btn" style="margin-top: 0.75rem;">マトリクスを保存</button>
+<h2>ロールごとの権限</h2>
+<p class="small muted">ロールを選んで権限を切り替えます。切り替えると即時に保存されます。</p>
+<div id="rolePicker" class="role-picker"></div>
+<div id="matrix"><div class="skl skl-row"></div><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
 
 <h2>機能のオン/オフ</h2>
 <p class="small muted">オフにした機能は、権限があっても API が 403 (FEATURE_DISABLED) を返し、アプリの画面からも消えます。変更は即時反映され、監査ログに記録されます。</p>
@@ -297,22 +312,94 @@ let roleList = [];
 let matrix = {};
 let userList = [];
 
+let currentRole = '';
+let savingPerms = false;
+
+function renderRolePicker() {
+  const el = document.getElementById('rolePicker');
+  el.innerHTML = '';
+  for (const r of roleList) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = r.name || r.code;
+    if (r.code === currentRole) b.className = 'sel';
+    b.onclick = () => {
+      if (savingPerms || currentRole === r.code) return;
+      currentRole = r.code;
+      renderRolePicker();
+      renderMatrix();
+    };
+    el.appendChild(b);
+  }
+}
+
+function paintPermRow(row, on) {
+  const state = row.querySelector('.perm-state');
+  state.textContent = on ? '許可' : 'なし';
+  state.className = 'perm-state' + (on ? ' on' : '');
+  row.querySelectorAll('.perm-seg button').forEach((b) => {
+    const sel = (b.dataset.val === 'on') === on;
+    b.className = sel ? ('sel' + (on ? ' on' : '')) : '';
+  });
+}
+
 function renderMatrix() {
   const el = document.getElementById('matrix');
   if (roleList.length === 0) { el.textContent = 'ロールがありません。'; return; }
-  let html = '<table><thead><tr><th>権限</th>';
-  for (const r of roleList) html += '<th>' + r.code + '<br><small>' + r.name + '</small></th>';
-  html += '</tr></thead><tbody>';
-  for (const p of catalog) {
-    html += '<tr><td><code>' + p.key + '</code><br><small>' + (p.label || '') + '</small></td>';
-    for (const r of roleList) {
-      const checked = (matrix[r.code] || []).includes(p.key) ? ' checked' : '';
-      html += '<td class="perm-cell"><input type="checkbox" data-role="' + r.code + '" data-perm="' + p.key + '"' + checked + '></td>';
-    }
-    html += '</tr>';
+  if (!currentRole || !roleList.some((r) => r.code === currentRole)) {
+    // 既定は最も編集機会の多い在庫管理者 (無ければ先頭のロール)
+    const def = roleList.find((r) => r.code === 'INVENTORY_MANAGER') || roleList[0];
+    currentRole = def.code;
   }
-  html += '</tbody></table>';
+  renderRolePicker();
+  const granted = matrix[currentRole] || [];
+  let html = '<div class="group">';
+  for (const p of catalog) {
+    const on = granted.includes(p.key);
+    html += '<div class="perm-row" data-perm="' + p.key + '">' +
+      '<div class="perm-head"><span class="perm-name">' + (p.label || p.key) + '<small>' + p.key + '</small></span>' +
+      '<span class="perm-state' + (on ? ' on' : '') + '">' + (on ? '許可' : 'なし') + '</span></div>' +
+      (p.description ? '<p class="perm-desc">' + p.description + '</p>' : '') +
+      '<div class="perm-seg">' +
+      '<button type="button" data-val="off" class="' + (!on ? 'sel' : '') + '">なし</button>' +
+      '<button type="button" data-val="on" class="' + (on ? 'sel on' : '') + '">許可</button>' +
+      '</div></div>';
+  }
+  html += '</div>';
   el.innerHTML = html;
+  el.querySelectorAll('.perm-row').forEach((row) => {
+    row.querySelectorAll('.perm-seg button').forEach((btn) => {
+      btn.onclick = () => togglePerm(row.dataset.perm, btn.dataset.val === 'on', row);
+    });
+  });
+}
+
+async function togglePerm(key, on, row) {
+  if (savingPerms) return;
+  const role = currentRole;
+  const prev = (matrix[role] || []).slice();
+  if (prev.includes(key) === on) return;
+  const next = on ? prev.concat([key]) : prev.filter((k) => k !== key);
+  matrix[role] = next;
+  paintPermRow(row, on);
+  savingPerms = true;
+  document.getElementById('matrix').classList.add('saving');
+  setError(''); setStatus('保存中…');
+  try {
+    await api('/api/v1/admin/role-permissions/' + encodeURIComponent(role), {
+      method: 'PUT',
+      body: JSON.stringify({ permissions: next }),
+    });
+    setStatus('保存しました。');
+  } catch (e) {
+    matrix[role] = prev;
+    paintPermRow(row, prev.includes(key));
+    setStatus('');
+    setError(String(e && e.message ? e.message : e));
+  } finally {
+    savingPerms = false;
+    document.getElementById('matrix').classList.remove('saving');
+  }
 }
 
 let featureList = [];
@@ -349,25 +436,6 @@ async function toggleFeature(key, enabled, box) {
     setError(String(e && e.message ? e.message : e));
   } finally {
     box.disabled = false;
-  }
-}
-
-async function saveMatrix() {
-  setError(''); setStatus('保存中…');
-  try {
-    for (const r of roleList) {
-      const boxes = document.querySelectorAll('input[type=checkbox][data-role="' + r.code + '"]:checked');
-      const permissions = [...boxes].map((b) => b.dataset.perm);
-      await api('/api/v1/admin/role-permissions/' + encodeURIComponent(r.code), {
-        method: 'PUT',
-        body: JSON.stringify({ permissions }),
-      });
-      matrix[r.code] = permissions;
-    }
-    setStatus('マトリクスを保存しました。');
-  } catch (e) {
-    setStatus('');
-    setError(String(e && e.message ? e.message : e));
   }
 }
 
@@ -473,7 +541,6 @@ async function loadAll() {
   }
 }
 
-document.getElementById('saveMatrix').onclick = saveMatrix;
 loadAll();
 </script>
 </body>
