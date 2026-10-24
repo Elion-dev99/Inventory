@@ -1148,6 +1148,9 @@ var SCAN_SUPPRESS_MS = 900;
 var scanVerifyMode = 'accurate';
 try { scanVerifyMode = localStorage.getItem('scanVerifyMode') === 'fast' ? 'fast' : 'accurate'; } catch (e) {}
 var pendingNewProductBarcode = '';
+/* スキャナーの「商品を登録」から商品を作成した後に戻る文脈
+   (スキャナー opts.registerReturn が入る: { view: 'inbound'|'consume'|'transfer'|'stocks'|'stocktakes' }) */
+var pendingProductReturn = null;
 
 function scanSupported() {
   return feat('barcode_scan') &&
@@ -1209,6 +1212,30 @@ function scanGateCreate(mode) {
       pendingCode = null;
       pendingCount = 0;
     }
+  };
+}
+
+/* 未登録コード通知のラッチ (scan-core.ts の createUnknownLatch と同じ規則)。
+   カメラは同じコードをフレームごとに繰り返しデコードするため、通知は
+   次の受理 (別コード) かユーザーの操作まで保持し、同じコードの再通知は抑制する。
+   notify(code, outcome) -> 'show' | 'suppress' | 'clear' | 'none' */
+function scanUnknownLatchCreate() {
+  var latched = null;
+  return {
+    latchedCode: function () { return latched; },
+    notify: function (code, outcome) {
+      if (outcome === 'unknown') {
+        if (latched === code) return 'suppress';
+        latched = code;
+        return 'show';
+      }
+      if (latched !== null) {
+        latched = null;
+        return 'clear';
+      }
+      return 'none';
+    },
+    reset: function () { latched = null; }
   };
 }
 
@@ -1329,8 +1356,9 @@ function scanDecodeFrame(buffer, width, height, cb) {
 /* ---- スキャナー画面 (共通コンポーネント) ----
    opts: {
      title, continuous,
+     registerReturn: { view } (「商品を登録」で作成した後に戻る文脈。任意),
      onCode(code, format, api) -> 'ok' | 'unknown' | 'out',
-     panelTitle() / syncHtml() / renderPanel() (continuous 用),
+     panelTitle() / syncHtml() / renderPanel(session) (continuous 用),
      onOpen(api), onBeforeClose(api) -> Promise, onClose()
    } */
 var scanSession = null;
@@ -1365,7 +1393,8 @@ function openScanner(opts) {
   var session = {
     opts: opts, closed: false, closing: false, closingPromise: null,
     stream: null, track: null, timer: null, busy: false, canvas: null,
-    gate: scanGateCreate(scanVerifyMode), undoStack: [], recentLog: [],
+    gate: scanGateCreate(scanVerifyMode), unknownLatch: scanUnknownLatchCreate(),
+    undoStack: [], recentLog: [],
     torchOn: false, toastTimer: null,
   };
   scanSession = session;
@@ -1415,11 +1444,21 @@ function refreshScanPanel(session) {
   var undo = el('scanUndoBtn');
   if (undo) undo.disabled = session.undoStack.length === 0;
   var body = el('scanPanelBody');
-  if (body) body.innerHTML = session.opts.renderPanel ? session.opts.renderPanel() : scanDefaultRecentHtml(session);
+  if (body) body.innerHTML = session.opts.renderPanel ? session.opts.renderPanel(session) : scanDefaultRecentHtml(session);
+}
+/* パネルの空表示。未登録コードがラッチ中のときは「まだ読み取っていません」と
+   矛盾しないよう、読み取った事実と次の操作を示す */
+function scanEmptyHtml(session) {
+  var latched = session && session.unknownLatch ? session.unknownLatch.latchedCode() : null;
+  if (latched) {
+    return '<div class="scan-empty">未登録のバーコード ' + esc(latched) + ' を読み取りました。' +
+      (can('master.write') ? '上の通知の「商品を登録」から登録できます。' : '登録されている商品のバーコードだけが読み取れます。') + '</div>';
+  }
+  return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
 }
 function scanDefaultRecentHtml(session) {
   if (session.recentLog.length === 0) {
-    return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+    return scanEmptyHtml(session);
   }
   var h = '<div class="scan-recent">';
   for (var i = 0; i < Math.min(session.recentLog.length, 8); i++) {
@@ -1445,11 +1484,14 @@ function showScanUnknown(session, code) {
   var box = el('scanUnknownBox');
   if (!box) return;
   box.innerHTML = '未登録のバーコードです: <b>' + esc(code) + '</b>' +
-    (can('master.write') ? '<br><button type="button" class="btn small" id="scanRegisterBtn">商品を登録</button>' : '');
+    (can('master.write')
+      ? '<br><button type="button" class="btn small" id="scanRegisterBtn">商品を登録</button>'
+      : '<br><span class="small">商品の登録にはマスタ編集権限が必要です。</span>');
   box.style.display = 'block';
   var btn = el('scanRegisterBtn');
   if (btn) btn.onclick = function () {
     pendingNewProductBarcode = code;
+    pendingProductReturn = session.opts.registerReturn || null;
     closeScanner().then(function () { showView('master'); });
   };
 }
@@ -1564,10 +1606,11 @@ function scanFrameLoop(session) {
     scanHandleDecoded(session, results[0].text, results[0].format);
   });
 }
-/* デコード結果の受理判定とフィードバック (単発モードは受理で自動的に閉じる) */
+/* デコード結果の受理判定とフィードバック (単発モードは受理で自動的に閉じる)。
+   未登録の通知はラッチで保持する: フレームごとの再デコードで消したり
+   鳴らしたりしない (以前はここで無条件に隠していたため一瞬で消えた)。 */
 function scanHandleDecoded(session, code, format) {
   if (!session || session.closed || session.closing) return;
-  hideScanUnknown();
   if (!session.gate.consider(code, Date.now())) return;
   var outcome = 'ok';
   try {
@@ -1575,13 +1618,18 @@ function scanHandleDecoded(session, code, format) {
   } catch (e) {
     outcome = 'ok';
   }
-  if (outcome === 'unknown') {
+  var act = session.unknownLatch.notify(code, outcome);
+  if (act === 'show') {
     scanFeedbackNg();
     showScanUnknown(session, code);
-  } else if (outcome === 'out') {
-    scanFeedbackNg();
-  } else {
-    scanFeedbackOk();
+    refreshScanPanel(session);
+  } else if (act === 'clear') {
+    hideScanUnknown();
+    if (outcome === 'out') scanFeedbackNg();
+    else scanFeedbackOk();
+  } else if (act !== 'suppress') {
+    if (outcome === 'out') scanFeedbackNg();
+    else scanFeedbackOk();
   }
   if (!session.opts.continuous && outcome === 'ok') closeScanner();
 }
@@ -1629,7 +1677,7 @@ function closeScanner() {
 /* ---- 記録シート (入庫・消費・移動) 用の連続スキャン ----
    同じ商品の連続スキャンで数量 +1、別の商品を読んだらその商品へ切り替え、
    その商品のセッション数量をフォームへ反映する。 */
-function openSheetScanner(productSelId, qtyId) {
+function openSheetScanner(productSelId, qtyId, viewName) {
   var counts = {};
   var order = [];
   var current = null;
@@ -1649,10 +1697,11 @@ function openSheetScanner(productSelId, qtyId) {
   openScanner({
     title: 'バーコードスキャン',
     continuous: true,
+    registerReturn: viewName ? { view: viewName } : null,
     panelTitle: '読み取り履歴 (閉じると最後の商品と数量がフォームに残ります)',
-    renderPanel: function () {
+    renderPanel: function (sess) {
       if (order.length === 0) {
-        return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+        return scanEmptyHtml(sess);
       }
       var h = '<div class="scan-recent">';
       for (var i = order.length - 1; i >= 0; i--) {
@@ -1828,6 +1877,7 @@ function loadStocks() {
       openScanner({
         title: 'バーコードスキャン',
         continuous: false,
+        registerReturn: { view: 'stocks' },
         onCode: function (code) {
           var p = productByBarcode(code);
           if (!p) {
@@ -1848,6 +1898,7 @@ function loadStocks() {
       });
     };
     fetchStocks();
+    if (state.flash) { el('stMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
   });
   function fetchStocks() {
     var loc = el('stLoc') ? el('stLoc').value : '';
@@ -1908,6 +1959,7 @@ function loadInbound() {
       '</form>';
     el('view').innerHTML = h;
     bindSteppers();
+    if (state.flash) { el('inMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
     setMaintFormNote('mntNoteInbound', ['inbound'], ['#inSubmit']);
     var updateHint = function () {
       var p = productOf(Number(el('inProduct').value));
@@ -1929,7 +1981,7 @@ function loadInbound() {
     }
     updateHint();
     var inScan = el('inScan');
-    if (inScan) inScan.onclick = function () { openSheetScanner('inProduct', 'inQty'); };
+    if (inScan) inScan.onclick = function () { openSheetScanner('inProduct', 'inQty', 'inbound'); };
     el('inForm').onsubmit = function (ev) {
       ev.preventDefault();
       var btn = el('inSubmit');
@@ -1979,6 +2031,7 @@ function loadConsume() {
       '</form><div id="coResult"></div>';
     el('view').innerHTML = h;
     bindSteppers();
+    if (state.flash) { el('coMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
     setMaintFormNote('mntNoteConsume', ['outbound'], ['#coSubmit']);
     /* 在庫一覧の行タップから来た場合は対象をプリセットする */
     var coPreset = takeFormPreset('consume');
@@ -1987,7 +2040,7 @@ function loadConsume() {
       if (coPreset.locationId) el('coLocation').value = String(coPreset.locationId);
     }
     var coScan = el('coScan');
-    if (coScan) coScan.onclick = function () { openSheetScanner('coProduct', 'coQty'); };
+    if (coScan) coScan.onclick = function () { openSheetScanner('coProduct', 'coQty', 'consume'); };
     el('coForm').onsubmit = function (ev) {
       ev.preventDefault();
       var btn = el('coSubmit');
@@ -2048,6 +2101,7 @@ function loadTransfer() {
       '</form><div id="trResult"></div>';
     el('view').innerHTML = h;
     bindSteppers();
+    if (state.flash) { el('trMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
     setMaintFormNote('mntNoteTransfer', ['transfers'], ['#trSubmit']);
     var fillLots = function () {
       var pid = Number(el('trProduct').value);
@@ -2056,7 +2110,7 @@ function loadTransfer() {
     };
     el('trProduct').onchange = fillLots;
     var trScan = el('trScan');
-    if (trScan) trScan.onclick = function () { openSheetScanner('trProduct', 'trQty'); };
+    if (trScan) trScan.onclick = function () { openSheetScanner('trProduct', 'trQty', 'transfer'); };
     /* 在庫一覧の行タップから来た場合は対象をプリセットする (移動元 = その在庫の場所) */
     var trPreset = takeFormPreset('transfer');
     if (trPreset) {
@@ -2529,15 +2583,43 @@ function loadMasterView() {
     }
     bindLabelButton('maLabelProducts', 'data-label-product', 'products');
     bindLabelButton('maLabelLocations', 'data-label-location', 'locations');
-    bindForm('maProductForm', { path: '/api/v1/master/products', body: function () {
+    /* 商品の追加は bindForm と別に扱う: スキャナーの「商品を登録」から来た
+       場合は、作成後に元の文脈へ戻す (記録シートは商品をセットして戻る、
+       棚卸しは一覧の明細からスキャンを再開できる、在庫検索は SKU で絞り込む)。
+       戻り先は下の pending ブロックで productReturn に取り込む */
+    var productReturn = null;
+    var productFormEl = el('maProductForm');
+    if (productFormEl) productFormEl.onsubmit = function (ev) {
+      ev.preventDefault();
       var b = { sku: el('mpSku').value, name: el('mpName').value, unit: el('mpUnit').value, safetyStock: Number(el('mpSafety').value || 0), requiresExpiry: el('mpExpiry').value === '1' };
       if (el('mpBarcode').value) b.barcode = el('mpBarcode').value;
       if (el('mpAlertDays').value) b.expiryAlertDays = Number(el('mpAlertDays').value);
       if (el('mpCost').value) b.unitCost = Number(el('mpCost').value);
       if (el('mpCase').value) b.caseSize = Number(el('mpCase').value);
       if (el('mpLead').value) b.leadTimeDays = Number(el('mpLead').value);
-      return b;
-    } }, '商品を追加しました。');
+      api('/api/v1/master/products', { method: 'POST', body: b }).then(function (res) {
+        state.master = null;
+        var ret = productReturn;
+        productReturn = null;
+        if (ret && res && res.id) {
+          state.flash = '商品を登録しました: ' + (res.sku || '') + ' ' + (res.name || '');
+          if (ret.view === 'stocks') {
+            try { sessionStorage.setItem('pendingStockQuery', res.sku || ''); } catch (e) {}
+            showView('stocks');
+          } else if (ret.view === 'stocktakes') {
+            showView('stocktakes');
+          } else {
+            saveFormPreset(ret.view, { productId: res.id });
+            showView(ret.view);
+          }
+          return;
+        }
+        state.flash = '商品を追加しました。';
+        loadMasterView();
+      }).catch(function (e) {
+        el('maMsg').innerHTML = msgHtml('error', errMsg(e));
+      });
+    };
     bindForm('maWarehouseForm', { path: '/api/v1/master/warehouses', body: function () {
       return { code: el('mwCode').value, name: el('mwName').value };
     } }, '倉庫を追加しました。');
@@ -2562,6 +2644,8 @@ function loadMasterView() {
     if (pendingNewProductBarcode) {
       var pendingBarcode = pendingNewProductBarcode;
       pendingNewProductBarcode = '';
+      productReturn = pendingProductReturn;
+      pendingProductReturn = null;
       var bcInput = el('mpBarcode');
       if (bcInput) {
         bcInput.value = pendingBarcode;
@@ -2699,6 +2783,7 @@ function loadStocktakes() {
       h += '</tbody></table></div>';
     }
     el('view').innerHTML = h;
+    if (state.flash) { el('tkMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
     setMaintFormNote('mntNoteStocktakes', ['stocktakes'], ['#tkStart', '#tkFinish', '#tkApprove', '#tkReject', '#tkDetail button']);
     var scopeRadios = el('view').querySelectorAll('input[name="tkScope"]');
     for (var si = 0; si < scopeRadios.length; si++) {
@@ -2882,6 +2967,7 @@ function openStocktakeScanner(t, detail, locationId) {
   openScanner({
     title: '棚卸しスキャン',
     continuous: true,
+    registerReturn: { view: 'stocktakes' },
     onOpen: function (api_) { sessionApi = api_; },
     panelTitle: function () {
       return locationLabel(locationId) + ' — 合計 ' + sessionTotal() + ' 件';
@@ -2891,9 +2977,9 @@ function openStocktakeScanner(t, detail, locationId) {
       if (saving > 0) return '<span class="scan-sync saving">同期中…</span>';
       return '<span class="scan-sync">保存済み</span>';
     },
-    renderPanel: function () {
+    renderPanel: function (sess) {
       if (recentOrder.length === 0) {
-        return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+        return scanEmptyHtml(sess);
       }
       var h = '<div class="scan-recent">';
       for (var i = recentOrder.length - 1; i >= 0; i--) {

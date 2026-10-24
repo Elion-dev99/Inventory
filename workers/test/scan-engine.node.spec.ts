@@ -8,6 +8,7 @@ import {
   barcodeCandidates,
   createScanCounter,
   createScanGate,
+  createUnknownLatch,
   pickScanCountLine,
   type ScanCountLine,
 } from '../src/lib/scan-core';
@@ -206,6 +207,46 @@ describe('スキャンカウントの集計 (createScanCounter)', () => {
   });
 });
 
+describe('未登録コード通知のラッチ (createUnknownLatch)', () => {
+  it('未登録は表示し、同じコードの再通知は抑制する', () => {
+    const latch = createUnknownLatch();
+    expect(latch.notify('4901330407247', 'unknown')).toBe('show');
+    expect(latch.latchedCode()).toBe('4901330407247');
+    // カメラが同じコードを繰り返しデコードしても再通知しない
+    expect(latch.notify('4901330407247', 'unknown')).toBe('suppress');
+    expect(latch.notify('4901330407247', 'unknown')).toBe('suppress');
+    expect(latch.latchedCode()).toBe('4901330407247');
+  });
+
+  it('別の未登録コードは表示し直し、ラッチを差し替える', () => {
+    const latch = createUnknownLatch();
+    expect(latch.notify('111', 'unknown')).toBe('show');
+    expect(latch.notify('222', 'unknown')).toBe('show');
+    expect(latch.latchedCode()).toBe('222');
+    expect(latch.notify('222', 'unknown')).toBe('suppress');
+  });
+
+  it('次の受理 (ok / out) でラッチが解除され、同じコードも再び通知できる', () => {
+    const latch = createUnknownLatch();
+    expect(latch.notify('111', 'unknown')).toBe('show');
+    expect(latch.notify('999', 'ok')).toBe('clear');
+    expect(latch.latchedCode()).toBeNull();
+    expect(latch.notify('111', 'unknown')).toBe('show');
+    expect(latch.notify('999', 'out')).toBe('clear');
+    // ラッチが無い状態の受理では何もしない
+    expect(latch.notify('999', 'ok')).toBe('none');
+    expect(latch.notify('999', 'out')).toBe('none');
+  });
+
+  it('reset でラッチが消える', () => {
+    const latch = createUnknownLatch();
+    latch.notify('111', 'unknown');
+    latch.reset();
+    expect(latch.latchedCode()).toBeNull();
+    expect(latch.notify('111', 'unknown')).toBe('show');
+  });
+});
+
 describe('APP_JS (スキャナー作り替えの確認)', () => {
   it('構文が正しく、旧デコーダ経路が撤去されている', () => {
     expect(() => new Function(APP_JS)).not.toThrow();
@@ -215,5 +256,42 @@ describe('APP_JS (スキャナー作り替えの確認)', () => {
     expect(APP_JS).toContain('function scanHandleDecoded');
     expect(APP_JS).toContain('function openStocktakeScanner');
     expect(APP_JS).toContain('function openSheetScanner');
+  });
+
+  it('未登録の通知はラッチで保持し、フレームごとに消さない', () => {
+    expect(APP_JS).toContain('function scanUnknownLatchCreate');
+    expect(APP_JS).toContain('unknownLatch: scanUnknownLatchCreate()');
+    const start = APP_JS.indexOf('function scanHandleDecoded');
+    const body = APP_JS.slice(start, APP_JS.indexOf('function stopScanStream', start));
+    // ゲート判定より前に通知を消していたのがフリッカーの原因だった
+    expect(body).not.toContain('hideScanUnknown();\n  if (!session.gate.consider');
+    expect(body).toContain('session.gate.consider');
+    expect(body).toContain('session.unknownLatch.notify');
+    // 通知の表示はラッチの 'show' のときだけ、'suppress' では何もしない
+    expect(body).toContain("act === 'show'");
+    expect(body).toContain("act !== 'suppress'");
+  });
+
+  it('登録ボタンが復帰文脈を保存し、各文脈が registerReturn を渡す', () => {
+    expect(APP_JS).toContain('pendingProductReturn = session.opts.registerReturn || null');
+    expect(APP_JS).toContain("registerReturn: viewName ? { view: viewName } : null");
+    expect(APP_JS).toContain("registerReturn: { view: 'stocks' }");
+    expect(APP_JS).toContain("registerReturn: { view: 'stocktakes' }");
+    expect(APP_JS).toContain("openSheetScanner('inProduct', 'inQty', 'inbound')");
+    expect(APP_JS).toContain("openSheetScanner('coProduct', 'coQty', 'consume')");
+    expect(APP_JS).toContain("openSheetScanner('trProduct', 'trQty', 'transfer')");
+  });
+
+  it('商品作成後の復帰 (プリセットで記録シートへ、検索は SKU 絞り込み) が配線されている', () => {
+    expect(APP_JS).toContain('productReturn = pendingProductReturn');
+    expect(APP_JS).toContain('saveFormPreset(ret.view, { productId: res.id })');
+    expect(APP_JS).toContain("sessionStorage.setItem('pendingStockQuery', res.sku || '')");
+    expect(APP_JS).toContain("showView('stocktakes')");
+  });
+
+  it('パネルの空表示が未登録ラッチと矛盾しない文言に切り替わる', () => {
+    expect(APP_JS).toContain('function scanEmptyHtml');
+    expect(APP_JS).toContain('session.opts.renderPanel(session)');
+    expect(APP_JS).toContain('return scanEmptyHtml(sess);');
   });
 });

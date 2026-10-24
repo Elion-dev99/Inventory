@@ -4,6 +4,7 @@
  * ブラウザ側 (src/app/client.ts の APP_JS) は TS モジュールを import できないため
  * 同じ規則を ES5 で実装している。規則を変える場合は両方を揃えること:
  * - createScanGate ⇔ scanGateCreate (検証モードと重複抑制)
+ * - createUnknownLatch ⇔ scanUnknownLatchCreate (未登録通知のラッチと再通知抑制)
  * - pickScanCountLine ⇔ scanPickLine (棚卸しスキャンカウントの対象行選択)
  * - barcodeCandidates ⇔ productByBarcode の候補展開 (UPC-A ⇔ EAN-13)
  */
@@ -63,6 +64,47 @@ export function createScanGate(initialMode: ScanVerifyMode): ScanGate {
       pendingCount = 0;
       lastCode = null;
       lastAt = 0;
+    },
+  };
+}
+
+/** スキャン 1 件の受理結果 */
+export type ScanOutcome = 'ok' | 'unknown' | 'out';
+
+/**
+ * 未登録コード通知のラッチ (保持) 状態。
+ * カメラは同じコードをフレームごとに繰り返しデコードするため、通知は
+ * 「次の受理 (別コード) かユーザーの操作」まで保持し、同じコードの
+ * 再通知 (再表示・再フィードバック) は抑制する。
+ * - notify(code, 'unknown'): ラッチ中と同コードなら 'suppress' (何もしない)、
+ *   それ以外はコードをラッチして 'show' (通知を出す)。
+ * - notify(code, 'ok' | 'out'): ラッチがあれば解除して 'clear' (通知を消す)、
+ *   無ければ 'none'。
+ */
+export interface ScanUnknownLatch {
+  latchedCode: () => string | null;
+  notify: (code: string, outcome: ScanOutcome) => 'show' | 'suppress' | 'clear' | 'none';
+  reset: () => void;
+}
+
+export function createUnknownLatch(): ScanUnknownLatch {
+  let latched: string | null = null;
+  return {
+    latchedCode: () => latched,
+    notify(code, outcome) {
+      if (outcome === 'unknown') {
+        if (latched === code) return 'suppress';
+        latched = code;
+        return 'show';
+      }
+      if (latched !== null) {
+        latched = null;
+        return 'clear';
+      }
+      return 'none';
+    },
+    reset() {
+      latched = null;
     },
   };
 }
