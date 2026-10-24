@@ -23,6 +23,89 @@ function fmtDateTime(ms) {
   return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
     ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
 }
+/* ---------------- メンテナンス表示 ---------------- */
+var MAINT_FEATURE_LABELS = { movements: '入庫・消費', transfers: '移動', stocktakes: '棚卸し', purchase_orders: '発注', csv: 'CSV', master: 'マスタ編集', analytics: '分析' };
+function maintFeatureText(features) {
+  if (!features || features.length === 0) return '';
+  var parts = [];
+  features.forEach(function (k) { parts.push(MAINT_FEATURE_LABELS[k] || k); });
+  return parts.join('・');
+}
+function fmtDayTime(ms) {
+  var d = new Date(ms);
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+function fmtEndText(endsAt) {
+  if (!endsAt) return '終了未定';
+  var now = new Date();
+  var d = new Date(endsAt);
+  var hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  var sameDay = now.getFullYear() === d.getFullYear() && now.getMonth() === d.getMonth() && now.getDate() === d.getDate();
+  var label = sameDay ? hm : (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm;
+  var mins = Math.max(0, Math.round((endsAt - Date.now()) / 60000));
+  return '終了予定 ' + label + '（残り約' + mins + '分）';
+}
+var maintenanceTimer = null;
+function startMaintenanceTimer() {
+  if (maintenanceTimer) return;
+  maintenanceTimer = setInterval(refreshMaintenance, 60000);
+}
+function refreshMaintenance() {
+  api('/api/v1/me').then(function (me) {
+    var wasFull = !!(state.maintenance && state.maintenance.active && state.maintenance.active.level === 'full');
+    var isFull = !!(me.maintenance && me.maintenance.active && me.maintenance.active.level === 'full');
+    if (wasFull && !isFull) { location.reload(); return; }
+    state.me = me;
+    applyMaintenance(me.maintenance);
+  }).catch(function () {});
+}
+/* /me の maintenance を画面に反映する。全画面表示にした場合は true を返す */
+function applyMaintenance(m) {
+  state.maintenance = m || { active: null, upcoming: null };
+  var active = state.maintenance.active;
+  var upcoming = state.maintenance.upcoming;
+  var fullBox = el('maintenanceBox');
+  if (active && active.level === 'full') {
+    el('loadingBox').style.display = 'none';
+    el('appBox').style.display = 'none';
+    var mb0 = el('maintenanceBanner');
+    if (mb0) mb0.style.display = 'none';
+    if (fullBox) {
+      fullBox.style.display = '';
+      el('mntFullMessage').textContent = active.message || 'メンテナンス中です';
+      el('mntFullEnds').textContent = fmtEndText(active.endsAt);
+      var rb = el('mntReloadBtn');
+      if (rb) rb.onclick = function () { location.reload(); };
+    }
+    startMaintenanceTimer();
+    return true;
+  }
+  if (fullBox) fullBox.style.display = 'none';
+  var mb = el('maintenanceBanner');
+  if (mb) {
+    if (active) {
+      var target = active.level === 'read_only' ? '書き込み' : maintFeatureText(active.features);
+      var text = 'メンテナンス中: ' + target + 'は停止中 ・ ' + fmtEndText(active.endsAt);
+      if (active.message) text += ' ・ ' + active.message;
+      mb.textContent = text;
+      mb.className = 'maintenance-banner';
+      mb.style.display = '';
+      el('appBox').style.marginTop = '2.7rem';
+    } else if (upcoming) {
+      var range = fmtDayTime(upcoming.startsAt) + '〜' + (upcoming.endsAt ? fmtDayTime(upcoming.endsAt) : '');
+      var scope = upcoming.level === 'full' ? '全面停止' : upcoming.level === 'read_only' ? '書き込み停止' : maintFeatureText(upcoming.features);
+      mb.textContent = range + ' メンテナンス予定（' + scope + '）';
+      mb.className = 'maintenance-banner upcoming';
+      mb.style.display = '';
+      el('appBox').style.marginTop = '2.7rem';
+    } else {
+      mb.style.display = 'none';
+      el('appBox').style.marginTop = '';
+    }
+  }
+  startMaintenanceTimer();
+  return false;
+}
 function uuid() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
   var hex = '0123456789abcdef';
@@ -49,6 +132,9 @@ function api(path, opts) {
         var err = new Error(msg);
         err.status = res.status;
         err.code = data && data.error ? data.error : '';
+        err.level = data && data.level ? data.level : '';
+        err.endsAt = data && data.endsAt ? data.endsAt : null;
+        err.features = data && data.features ? data.features : [];
         throw err;
       }
       if ((opts.method || 'GET') !== 'GET') invalidateCache();
@@ -90,6 +176,10 @@ function viewLoading(title, kind) {
   el('view').innerHTML = '<h2>' + esc(title) + '</h2>' + skeletonHtml(kind);
 }
 function errMsg(e) {
+  if (e && e.code === 'MAINTENANCE') {
+    var mbase = e.message ? e.message : 'メンテナンス中です';
+    return e.endsAt ? mbase + '（' + fmtEndText(e.endsAt) + '）' : mbase + '（終了未定）';
+  }
   if (e && e.status === 423) return '棚卸し実施中のため、この操作は停止しています (423)。棚卸しが終了するまでお待ちください。';
   if (e && e.code === 'STORE_SUSPENDED') return 'この店舗は現在停止中です。全体管理者に連絡してください。';
   if (e && e.code === 'STORE_NOT_SELECTED') return '店舗が選択されていません。画面を再読み込みして、店舗を選んでください。';
@@ -103,6 +193,7 @@ function msgHtml(kind, text) {
 /* ---------------- state ---------------- */
 var state = {
   me: null,
+  maintenance: null,
   perms: {},
   features: {},
   view: 'dashboard',
@@ -2006,14 +2097,7 @@ function boot() {
       el('noAssignBox').style.display = '';
       return;
     }
-    if (me.maintenance && me.maintenance.on) {
-      var mb = el('maintenanceBanner');
-      if (mb) {
-        mb.textContent = me.maintenance.message || 'メンテナンス中です';
-        mb.style.display = '';
-        el('appBox').style.marginTop = '2.7rem';
-      }
-    }
+    if (applyMaintenance(me.maintenance)) return;
     if (!me.currentStore) {
       showStorePicker(me);
       return;

@@ -122,7 +122,8 @@ beforeAll(async () => {
        VALUES (1, 'sub-admin', 'admin@example.com', 'Admin', 'active', ?1, ?1)`,
     ).bind(now),
     testEnv.DB.prepare(
-      `INSERT INTO user_roles (user_id, role_code, warehouse_id) VALUES (1, 'SYSTEM_ADMIN', NULL)`,
+      // 店舗スコープの管理者 (全体管理者だとメンテナンス強制の対象外になるため)
+      `INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (1, 'SYSTEM_ADMIN', NULL, 1)`,
     ),
     testEnv.DB.prepare(
       `INSERT INTO warehouses (id, code, name, created_at, updated_at) VALUES (1, 'WH1', '本社倉庫', ?1, ?1)`,
@@ -144,9 +145,11 @@ describe('全体管理との連動 (停止ユーザー / メンテナンス)', (
 
     const meRes = await bearer('/api/v1/me');
     expect(meRes.status).toBe(200);
-    const me = (await meRes.json()) as { maintenance: { on: boolean; message: string | null } };
-    expect(me.maintenance.on).toBe(false);
-    expect(me.maintenance.message).toBeNull();
+    const me = (await meRes.json()) as {
+      maintenance: { active: unknown; upcoming: unknown };
+    };
+    expect(me.maintenance.active).toBeNull();
+    expect(me.maintenance.upcoming).toBeNull();
   });
 
   it('メンテナンス ON: POST は 503、GET は通常、/me に告知、logout は通る', async () => {
@@ -165,17 +168,18 @@ describe('全体管理との連動 (停止ユーザー / メンテナンス)', (
     expect(stocks.status).toBe(200);
 
     const me = (await (await bearer('/api/v1/me')).json()) as {
-      maintenance: { on: boolean; message: string | null };
+      maintenance: { active: { level: string; message: string } | null };
     };
-    expect(me.maintenance.on).toBe(true);
-    expect(me.maintenance.message).toBe('定期メンテナンス中です');
+    // 従来の即時設定は read_only の仮想 window として合算される
+    expect(me.maintenance.active?.level).toBe('read_only');
+    expect(me.maintenance.active?.message).toBe('定期メンテナンス中です');
 
     // 告知文が空なら既定文言になる
     await setMaintenance(true, '');
     const meDefault = (await (await bearer('/api/v1/me')).json()) as {
-      maintenance: { on: boolean; message: string | null };
+      maintenance: { active: { level: string; message: string } | null };
     };
-    expect(meDefault.maintenance.message).toBe('メンテナンス中です。しばらくしてから再度お試しください。');
+    expect(meDefault.maintenance.active?.message).toBe('メンテナンス中です。しばらくしてから再度お試しください。');
     const blockedDefault = await inbound('LOT-MAINT2');
     expect(blockedDefault.status).toBe(503);
     expect(((await blockedDefault.json()) as { message: string }).message).toBe(
@@ -196,9 +200,9 @@ describe('全体管理との連動 (停止ユーザー / メンテナンス)', (
     const created = await inbound('LOT-RESUMED');
     expect(created.status).toBe(201);
     const me = (await (await bearer('/api/v1/me')).json()) as {
-      maintenance: { on: boolean };
+      maintenance: { active: unknown };
     };
-    expect(me.maintenance.on).toBe(false);
+    expect(me.maintenance.active).toBeNull();
   });
 
   it('停止ユーザーは Bearer・Cookie セッションともに 401、再有効化で復帰する', async () => {

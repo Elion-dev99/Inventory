@@ -84,7 +84,11 @@ import {
   isFeatureEnabled,
 } from './lib/features';
 import { parseCsv, toCsv } from './lib/csv';
-import { getMaintenance, maintenanceMessage } from './lib/maintenance';
+import {
+  resolveMaintenance,
+  resolvedMaintenanceMessage,
+  type MaintenanceResolution,
+} from './lib/maintenance';
 
 export { InventoryCoordinator };
 
@@ -101,6 +105,8 @@ type Variables = {
   storeCtx?: StoreContext;
   /** 表示用の緩い解決結果 (null = 未選択) のメモ化 */
   softCtxBox?: { ctx: StoreContext | null };
+  /** 認証ミドルウェアで解決したメンテナンス状態 (/me が再利用する) */
+  maintenance?: MaintenanceResolution;
 };
 type AppContext = Context<{ Bindings: Env; Variables: Variables }>;
 
@@ -580,16 +586,91 @@ ${body}
 });
 
 // ---------------------------------------------------------------- 認証
+/**
+ * features レベルのメンテナンスで停止する機能キーとエンドポイントの対応表。
+ * lib/maintenance.ts の MAINTENANCE_FEATURES とキーを一致させる。
+ * 変更系 (非 GET) のみが対象だが、分析と CSV エクスポートは GET でも止める。
+ */
+function maintenanceFeatureFor(method: string, path: string): string | null {
+  const p = path.startsWith('/api/v1') ? path.slice('/api/v1'.length) : path;
+  if (p === '/analytics' && method === 'GET') return 'analytics';
+  if (p === '/stocks.csv') return 'csv';
+  if (method === 'GET') return null;
+  if (p === '/movements/transfer') return 'transfers';
+  if (
+    p === '/movements/inbound' ||
+    p === '/movements/consumption' ||
+    p === '/negative-approvals' ||
+    p.startsWith('/negative-approvals/')
+  ) {
+    return 'movements';
+  }
+  if (p === '/stocktakes' || p.startsWith('/stocktakes/')) return 'stocktakes';
+  if (
+    p === '/purchase-orders' ||
+    p.startsWith('/purchase-orders/') ||
+    p === '/suppliers' ||
+    p.startsWith('/suppliers/') ||
+    p === '/master/suppliers' ||
+    p.startsWith('/master/suppliers/')
+  ) {
+    return 'purchase_orders';
+  }
+  if (p === '/products/import' || p === '/master/products/import') return 'csv';
+  if (
+    p.startsWith('/master/') ||
+    p === '/products' ||
+    p.startsWith('/products/') ||
+    p === '/warehouses' ||
+    p.startsWith('/warehouses/') ||
+    p === '/locations' ||
+    p.startsWith('/locations/') ||
+    p === '/lots' ||
+    p.startsWith('/lots/')
+  ) {
+    return 'master';
+  }
+  return null;
+}
+
 app.use('/api/v1/*', async (c, next) => {
   if (c.req.path === '/api/v1/health') return next();
-  const user = await authenticate(c.req.raw, c.env);
-  c.set('user', user);
-  // メンテナンスモード (全体管理が platform_settings で切り替える):
-  // ON の間は書き込み系 (非 GET) を 503 で止める。読み取りとログアウトは通す。
-  if (c.req.method !== 'GET' && c.req.path !== '/api/v1/auth/logout') {
-    const maintenance = await getMaintenance(c.env.DB);
-    if (maintenance.on) {
-      throw new ApiError(503, 'MAINTENANCE', maintenanceMessage(maintenance));
+  const authUser = await authenticate(c.req.raw, c.env);
+  c.set('user', authUser);
+  // メンテナンス (全体管理の maintenance_windows + 従来の即時設定を合算)。
+  // 認証後・現在店舗の確定後に判定する。全体管理者 (store_id NULL の
+  // SYSTEM_ADMIN 割当) は強制の対象外 (状態は /me で見える)。
+  // ログアウトだけはどのレベルでも常時通す。
+  const isLogout = c.req.method === 'POST' && c.req.path === '/api/v1/auth/logout';
+  if (!isLogout) {
+    const ctx = await softStoreContext(c);
+    const resolution = await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null);
+    c.set('maintenance', resolution);
+    const active = resolution.active;
+    if (active && !isPlatformAdmin(authUser.assignments)) {
+      const isMeGet = c.req.method === 'GET' && c.req.path === '/api/v1/me';
+      let blocked = false;
+      if (active.level === 'full') {
+        blocked = !isMeGet;
+      } else if (active.level === 'read_only') {
+        blocked = c.req.method !== 'GET';
+      } else {
+        const key = maintenanceFeatureFor(c.req.method, c.req.path);
+        blocked = key !== null && active.features.includes(key);
+      }
+      if (blocked) {
+        return c.json(
+          {
+            statusCode: 503,
+            error: 'MAINTENANCE',
+            message: resolvedMaintenanceMessage(active),
+            level: active.level,
+            endsAt: active.endsAt,
+            features: active.features,
+          },
+          503,
+        );
+      }
     }
   }
   return next();
@@ -831,8 +912,21 @@ app.get('/api/v1/me', async (c) => {
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
     maintenance: await (async () => {
-      const m = await getMaintenance(c.env.DB);
-      return { on: m.on, message: m.on ? maintenanceMessage(m) : m.message };
+      const res =
+        c.get('maintenance') ??
+        (await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null));
+      return {
+        active: res.active
+          ? {
+              level: res.active.level,
+              features: res.active.features,
+              endsAt: res.active.endsAt,
+              message: resolvedMaintenanceMessage(res.active),
+              windows: res.active.windows,
+            }
+          : null,
+        upcoming: res.upcoming,
+      };
     })(),
   });
 });

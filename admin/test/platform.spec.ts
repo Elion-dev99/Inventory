@@ -11,6 +11,7 @@ import purchasingSql from '../../workers/migrations/0007_purchasing_analytics.sq
 import multiStoreSql from '../../workers/migrations/0008_multi_store.sql?raw';
 import sessionScopeSql from '../../workers/migrations/0009_session_scope.sql?raw';
 import platformSettingsSql from '../../workers/migrations/0010_platform_settings.sql?raw';
+import maintenanceWindowsSql from '../../workers/migrations/0011_maintenance_windows.sql?raw';
 import { createSession } from '../../workers/src/lib/session';
 
 /**
@@ -138,6 +139,7 @@ beforeAll(async () => {
     ...statementsOf(multiStoreSql),
     ...statementsOf(sessionScopeSql),
     ...statementsOf(platformSettingsSql),
+    ...statementsOf(maintenanceWindowsSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -617,5 +619,242 @@ describe('全体管理コンソール拡張', () => {
     expect(Array.isArray(data.tables.platform_settings)).toBe(true);
     expect(data.tables.platform_settings?.some((r) => r.key === 'maintenance')).toBe(true);
     expect(data.tables.sessions).toBeUndefined(); // セッションは含めない
+  });
+});
+
+/**
+ * メンテナンスウィンドウ (migration 0011) のテスト:
+ * 作成と検証エラー (422)、extend (null→設定・加算・weekly は 422)、
+ * end/cancel、一覧の状態判定、監査が残ること、/system への反映。
+ * 前の describe の管理者セッションは生きているとは限らないため、ここでも
+ * ログインし直す。
+ */
+describe('メンテナンスウィンドウ', () => {
+  let admin3 = '';
+  const HOUR_MS = 3_600_000;
+
+  interface WindowBody {
+    id: number;
+    kind: string;
+    level: string;
+    features: string[];
+    storeId: number | null;
+    storeName: string | null;
+    startsAt: number | null;
+    endsAt: number | null;
+    cancelledAt: number | null;
+    state: string;
+    occurrenceStartsAt: number | null;
+    occurrenceEndsAt: number | null;
+  }
+
+  async function listWindows(): Promise<{
+    active: WindowBody[];
+    scheduled: WindowBody[];
+    recent: WindowBody[];
+  }> {
+    const res = await api('/api/platform/maintenance', { cookie: admin3 });
+    expect(res.status).toBe(200);
+    return res.body as unknown as {
+      active: WindowBody[];
+      scheduled: WindowBody[];
+      recent: WindowBody[];
+    };
+  }
+
+  beforeAll(async () => {
+    const res = await SELF.fetch('https://example.com/auth/callback?code=admin-code', {
+      headers: { Cookie: `oauth_nonce=${ADMIN_NONCE}` },
+    });
+    expect(res.status).toBe(200);
+    const match = setCookieOf(res).match(/admin_session=([^;,]+)/);
+    if (!match?.[1]) throw new Error('admin_session cookie not found');
+    admin3 = match[1];
+    await testEnv.DB.prepare('DELETE FROM maintenance_windows').run();
+  });
+
+  it('作成と一覧の状態判定 (実施中/予定/履歴)', async () => {
+    const now = Date.now();
+    const active = await api('/api/platform/maintenance/windows', {
+      cookie: admin3,
+      method: 'POST',
+      body: {
+        kind: 'once', startsAt: now - 60_000, endsAt: now + HOUR_MS,
+        level: 'features', features: ['transfers'], message: '枠テスト',
+      },
+    });
+    expect(active.status).toBe(201);
+    expect(active.body.state).toBe('active');
+    expect(active.body.occurrenceEndsAt).toBe(now + HOUR_MS);
+    const activeId = active.body.id as number;
+
+    const future = await api('/api/platform/maintenance/windows', {
+      cookie: admin3,
+      method: 'POST',
+      body: { kind: 'once', startsAt: now + 2 * HOUR_MS, endsAt: null, level: 'read_only' },
+    });
+    expect(future.status).toBe(201);
+    expect(future.body.state).toBe('scheduled');
+
+    const weekly = await api('/api/platform/maintenance/windows', {
+      cookie: admin3,
+      method: 'POST',
+      body: { kind: 'weekly', weekday: 1, startMinute: 60, endMinute: 240, level: 'full', storeId: 1 },
+    });
+    expect(weekly.status).toBe(201);
+    expect(weekly.body.state).toBe('scheduled');
+    expect(weekly.body.storeName).toBe('DGOSK');
+
+    const past = await api('/api/platform/maintenance/windows', {
+      cookie: admin3,
+      method: 'POST',
+      body: { kind: 'once', startsAt: now - 3 * HOUR_MS, endsAt: now - 2 * HOUR_MS, level: 'read_only' },
+    });
+    expect(past.status).toBe(201);
+    expect(past.body.state).toBe('finished');
+
+    const list = await listWindows();
+    expect(list.active.map((w) => w.id)).toEqual([activeId]);
+    expect(list.scheduled.length).toBe(2);
+    expect(list.recent.length).toBe(1);
+    expect(list.recent[0]?.state).toBe('finished');
+
+    // /system の maintenance にも実施中が反映される (従来設定は off のまま)
+    const sys = await api('/api/platform/system', { cookie: admin3 });
+    expect((sys.body.maintenance as Record<string, unknown>).on).toBe(true);
+  });
+
+  it('作成の検証エラーは 422', async () => {
+    const now = Date.now();
+    const badRange = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now + HOUR_MS, endsAt: now + HOUR_MS, level: 'read_only' },
+    });
+    expect(badRange.status).toBe(422);
+
+    const noFeatures = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now, endsAt: null, level: 'features', features: [] },
+    });
+    expect(noFeatures.status).toBe(422);
+
+    const unknownFeature = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now, endsAt: null, level: 'features', features: ['nope'] },
+    });
+    expect(unknownFeature.status).toBe(422);
+
+    const badWeekly = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'weekly', weekday: 2, startMinute: 600, endMinute: 600, level: 'read_only' },
+    });
+    expect(badWeekly.status).toBe(422);
+
+    const missingStart = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', level: 'read_only' },
+    });
+    expect(missingStart.status).toBe(422);
+
+    const badShape = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'daily', level: 'read_only' },
+    });
+    expect(badShape.status).toBe(400);
+  });
+
+  it('extend: 終了未定→設定、設定済み→加算、weekly は 422', async () => {
+    const now = Date.now();
+    const open = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now - 60_000, endsAt: null, level: 'read_only' },
+    });
+    expect(open.status).toBe(201);
+    const openId = open.body.id as number;
+
+    const before = Date.now();
+    const ext1 = await api(`/api/platform/maintenance/windows/${openId}/extend`, {
+      cookie: admin3, method: 'POST', body: { minutes: 30 },
+    });
+    expect(ext1.status).toBe(200);
+    const ends1 = ext1.body.endsAt as number;
+    expect(ends1).toBeGreaterThanOrEqual(before + 30 * 60_000);
+    expect(ends1).toBeLessThanOrEqual(Date.now() + 30 * 60_000 + 1000);
+
+    const ext2 = await api(`/api/platform/maintenance/windows/${openId}/extend`, {
+      cookie: admin3, method: 'POST', body: { minutes: 60 },
+    });
+    expect(ext2.status).toBe(200);
+    expect(ext2.body.endsAt).toBe(ends1 + 60 * 60_000);
+
+    const weekly = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'weekly', weekday: 3, startMinute: 0, endMinute: 120, level: 'read_only' },
+    });
+    const weeklyId = weekly.body.id as number;
+    const extWeekly = await api(`/api/platform/maintenance/windows/${weeklyId}/extend`, {
+      cookie: admin3, method: 'POST', body: { minutes: 30 },
+    });
+    expect(extWeekly.status).toBe(422);
+
+    const missing = await api('/api/platform/maintenance/windows/99999/extend', {
+      cookie: admin3, method: 'POST', body: { minutes: 30 },
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  it('end: 実施中の once は即時終了、未来の once と weekly は取消になる', async () => {
+    const now = Date.now();
+    const list0 = await listWindows();
+    const activeOnce = list0.active.find((w) => w.kind === 'once');
+    if (!activeOnce) throw new Error('active once window not found');
+    const ended = await api(`/api/platform/maintenance/windows/${activeOnce.id}/end`, {
+      cookie: admin3, method: 'POST',
+    });
+    expect(ended.status).toBe(200);
+    expect(ended.body.state).toBe('finished');
+    expect((ended.body.endsAt as number)).toBeLessThanOrEqual(Date.now());
+    expect(ended.body.cancelledAt).toBeNull();
+
+    const future = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'once', startsAt: now + 5 * HOUR_MS, endsAt: null, level: 'read_only' },
+    });
+    const futureId = future.body.id as number;
+    const cancelled = await api(`/api/platform/maintenance/windows/${futureId}/end`, {
+      cookie: admin3, method: 'POST',
+    });
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body.state).toBe('cancelled');
+    expect(cancelled.body.cancelledAt).not.toBeNull();
+
+    const weekly = await api('/api/platform/maintenance/windows', {
+      cookie: admin3, method: 'POST',
+      body: { kind: 'weekly', weekday: 4, startMinute: 0, endMinute: 60, level: 'read_only' },
+    });
+    const weeklyId = weekly.body.id as number;
+    const cancelledWeekly = await api(`/api/platform/maintenance/windows/${weeklyId}/end`, {
+      cookie: admin3, method: 'POST',
+    });
+    expect(cancelledWeekly.body.state).toBe('cancelled');
+
+    // 残っている実施中を片付けると /system の maintenance は off に戻る
+    const rest = await listWindows();
+    for (const w of rest.active) {
+      await api(`/api/platform/maintenance/windows/${w.id}/end`, { cookie: admin3, method: 'POST' });
+    }
+    const sys = await api('/api/platform/system', { cookie: admin3 });
+    expect((sys.body.maintenance as Record<string, unknown>).on).toBe(false);
+  });
+
+  it('監査ログに create / extend / end が残る', async () => {
+    const res = await api('/api/platform/audit-logs?q=platform.maintenance&limit=50', { cookie: admin3 });
+    expect(res.status).toBe(200);
+    const rows = (res.body as unknown as { rows: { action: string }[] }).rows ??
+      (res.body as unknown as { items: { action: string }[] }).items ?? [];
+    const actions = rows.map((r) => r.action);
+    expect(actions).toContain('platform.maintenance.create');
+    expect(actions).toContain('platform.maintenance.extend');
+    expect(actions).toContain('platform.maintenance.end');
   });
 });

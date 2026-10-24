@@ -104,15 +104,62 @@ export const CONSOLE_HTML = `<!doctype html>
 
 <section id="sec-system" class="console-sec" style="display:none;">
   <h2>システム</h2>
-  <h3>メンテナンスモード</h3>
+  <h3>メンテナンス</h3>
+  <p class="small muted">実施中・予定は店舗アプリへ自動で反映されます (最大30秒)。全体管理者はメンテナンス中も店舗アプリを操作できます。</p>
+  <div id="mntNow"><div class="skl skl-row"></div></div>
+  <h4>今すぐ開始</h4>
   <div class="group">
-    <div class="group-row"><span class="row-label">メンテナンスモード <small class="muted">オンの間、店舗アプリの書き込みは停止し、告知バナーが表示されます (閲覧は可能)</small></span>
-      <label class="switch"><input type="checkbox" id="mntToggle"><span class="track"></span></label></div>
     <div class="group-row static">
-      <input id="mntMessage" type="text" placeholder="告知文 (空 = 既定文言)" style="flex:1;">
-      <button class="btn small" id="mntSave">保存</button>
+      <label>止め方 <select id="mntStartLevel">
+        <option value="read_only">読み取り専用 (書き込み停止)</option>
+        <option value="features">機能別停止</option>
+        <option value="full">全面停止</option>
+      </select></label>
+      <label>対象店舗 <select id="mntStartStore"></select></label>
+      <input id="mntStartMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
+      <button class="btn small" id="mntStartBtn">開始</button>
+    </div>
+    <div class="group-row static" id="mntStartFeatures" style="display:none;"></div>
+  </div>
+  <h4>予定を追加</h4>
+  <div class="group">
+    <div class="group-row static">
+      <label>種別 <select id="mntKind">
+        <option value="once">単発</option>
+        <option value="weekly">毎週</option>
+      </select></label>
+      <label>止め方 <select id="mntLevel">
+        <option value="read_only">読み取り専用 (書き込み停止)</option>
+        <option value="features">機能別停止</option>
+        <option value="full">全面停止</option>
+      </select></label>
+      <label>対象店舗 <select id="mntStore"></select></label>
+    </div>
+    <div class="group-row static" id="mntOnceFields">
+      <label>開始 <input id="mntOnceStart" type="datetime-local"></label>
+      <label>終了 <input id="mntOnceEnd" type="datetime-local"></label>
+      <span class="small muted">終了を空にすると終了未定</span>
+    </div>
+    <div class="group-row static" id="mntWeeklyFields" style="display:none;">
+      <label>曜日 <select id="mntWeekday">
+        <option value="0">日</option><option value="1">月</option><option value="2">火</option>
+        <option value="3">水</option><option value="4">木</option><option value="5">金</option>
+        <option value="6">土</option>
+      </select></label>
+      <label>開始 <input id="mntWeeklyStart" type="time"></label>
+      <label>終了 <input id="mntWeeklyEnd" type="time"></label>
+      <span class="small muted">終了が開始より前なら翌日まで</span>
+    </div>
+    <div class="group-row static" id="mntFeatures" style="display:none;"></div>
+    <div class="group-row static">
+      <input id="mntMessage" type="text" placeholder="告知文 (任意)" style="flex:1;">
+      <button class="btn small" id="mntAddBtn">予定を追加</button>
     </div>
   </div>
+  <h4>実施中・予定</h4>
+  <div id="mntList"><div class="skl skl-row"></div></div>
+  <h4>履歴</h4>
+  <div id="mntRecent"></div>
   <h3>データベース</h3>
   <div id="sysTables"><div class="skl skl-row"></div></div>
   <p class="small muted" id="sysSessions"></p>
@@ -549,24 +596,212 @@ async function loadSystem() {
     }
     el('sysTables').innerHTML = html + '</tbody></table></div>';
     el('sysSessions').textContent = '有効なセッション: ' + data.activeSessions + ' 件';
-    const m = data.maintenance || { on: false, message: null };
-    el('mntToggle').checked = m.on === true;
-    el('mntMessage').value = m.message || '';
+  } catch (e) {
+    setError(errText(e));
+  }
+  fillMaintenanceForms();
+  loadMaintenance();
+}
+
+/* ---------------- メンテナンス ---------------- */
+const MNT_FEATURE_OPTS = [
+  ['movements', '入庫・消費'], ['transfers', '移動'], ['stocktakes', '棚卸し'],
+  ['purchase_orders', '発注'], ['csv', 'CSV'], ['master', 'マスタ編集'], ['analytics', '分析'],
+];
+const MNT_LEVEL_LABELS = { read_only: '読み取り専用', features: '機能別停止', full: '全面停止' };
+const MNT_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
+const MNT_STATE_LABELS = { active: '実施中', scheduled: '予定', finished: '終了', cancelled: '取消' };
+let mntFormsFilled = false;
+
+function mntFeatureLabel(key) {
+  const found = MNT_FEATURE_OPTS.find((o) => o[0] === key);
+  return found ? found[1] : key;
+}
+function fmtMinutesOfDay(m) {
+  const mm = ((m % 1440) + 1440) % 1440;
+  return String(Math.floor(mm / 60)).padStart(2, '0') + ':' + String(mm % 60).padStart(2, '0');
+}
+function windowPeriod(w) {
+  if (w.kind === 'weekly') {
+    return '毎週' + MNT_WEEKDAYS[w.weekday] + '曜 ' + fmtMinutesOfDay(w.startMinute) + '〜' +
+      fmtMinutesOfDay(w.endMinute) + (w.endMinute > 1440 ? ' (翌日)' : '');
+  }
+  return fmtDate(w.startsAt) + ' 〜 ' + (w.endsAt ? fmtDate(w.endsAt) : '終了未定');
+}
+function windowDesc(w) {
+  let s = MNT_STATE_LABELS[w.state] + ': ' + MNT_LEVEL_LABELS[w.level];
+  if (w.level === 'features') {
+    s += ' (' + (w.features || []).map(mntFeatureLabel).join('・') + ')';
+  }
+  s += ' / ' + (w.storeId === null ? '全店舗' : storeName(w.storeId));
+  s += ' / ' + windowPeriod(w);
+  if (w.kind === 'weekly' && (w.state === 'active' || w.state === 'scheduled')) {
+    s += ' (今回: ' + fmtDate(w.occurrenceStartsAt) + '〜' + (w.occurrenceEndsAt ? fmtDate(w.occurrenceEndsAt) : '終了未定') + ')';
+  }
+  if (w.message) s += ' / ' + w.message;
+  return s;
+}
+function fillFeatureChecks(boxId) {
+  el(boxId).innerHTML = MNT_FEATURE_OPTS.map((o) =>
+    '<label style="margin-right:0.9rem;"><input type="checkbox" value="' + o[0] + '"> ' + o[1] + '</label>'
+  ).join('');
+}
+function checkedFeatures(boxId) {
+  return Array.from(el(boxId).querySelectorAll('input[type=checkbox]:checked')).map((i) => i.value);
+}
+function fillStoreSelect(selId) {
+  el(selId).innerHTML = '<option value="">全店舗</option>' + storeList.map((s) =>
+    '<option value="' + s.id + '">' + esc(s.name) + '</option>'
+  ).join('');
+}
+function storeSelectValue(selId) {
+  const v = el(selId).value;
+  return v === '' ? null : Number(v);
+}
+function syncMaintenanceFormVisibility() {
+  el('mntStartFeatures').style.display = el('mntStartLevel').value === 'features' ? '' : 'none';
+  el('mntFeatures').style.display = el('mntLevel').value === 'features' ? '' : 'none';
+  const weekly = el('mntKind').value === 'weekly';
+  el('mntWeeklyFields').style.display = weekly ? '' : 'none';
+  el('mntOnceFields').style.display = weekly ? 'none' : '';
+}
+function fillMaintenanceForms() {
+  if (mntFormsFilled) return;
+  mntFormsFilled = true;
+  fillFeatureChecks('mntStartFeatures');
+  fillFeatureChecks('mntFeatures');
+  fillStoreSelect('mntStartStore');
+  fillStoreSelect('mntStore');
+  el('mntStartLevel').onchange = syncMaintenanceFormVisibility;
+  el('mntLevel').onchange = syncMaintenanceFormVisibility;
+  el('mntKind').onchange = syncMaintenanceFormVisibility;
+  syncMaintenanceFormVisibility();
+}
+
+async function loadMaintenance() {
+  try {
+    const data = await api('/api/platform/maintenance');
+    const active = data.active || [];
+    if (active.length === 0) {
+      el('mntNow').innerHTML = '<div class="group"><div class="group-row"><span class="row-label">現在の状態</span><span>実施中のメンテナンスはありません</span></div></div>';
+    } else {
+      el('mntNow').innerHTML = '<div class="group">' + active.map((w) =>
+        '<div class="group-row"><span class="row-label">' + esc(windowDesc(w)) + '</span><span class="badge badge-danger">実施中</span></div>'
+      ).join('') + '</div>';
+    }
+    const items = active.concat(data.scheduled || []);
+    if (items.length === 0) {
+      el('mntList').textContent = '実施中・予定のメンテナンスはありません。';
+    } else {
+      el('mntList').innerHTML = items.map((w) => {
+        let btns = '';
+        if (w.kind === 'once') {
+          btns += '<button data-mnt-ext="30" data-id="' + w.id + '">+30分</button> ' +
+            '<button data-mnt-ext="60" data-id="' + w.id + '">+1時間</button> ';
+        }
+        btns += '<button data-mnt-end="' + w.id + '">' + (w.state === 'active' ? '終了' : '取消') + '</button>';
+        return '<div class="feed-row">' + esc(windowDesc(w)) + ' ' + btns + '</div>';
+      }).join('');
+      el('mntList').querySelectorAll('button[data-mnt-ext]').forEach((b) => {
+        b.onclick = () => extendWindow(Number(b.dataset.id), Number(b.dataset.mntExt));
+      });
+      el('mntList').querySelectorAll('button[data-mnt-end]').forEach((b) => {
+        b.onclick = () => endWindow(Number(b.dataset.mntEnd));
+      });
+    }
+    const recent = data.recent || [];
+    el('mntRecent').innerHTML = recent.length === 0 ? '履歴はありません。' : recent.map((w) =>
+      '<div class="feed-row"><small class="muted">' + fmtDate(w.cancelledAt || w.endsAt || w.createdAt) + '</small> ' + esc(windowDesc(w)) + '</div>'
+    ).join('');
   } catch (e) {
     setError(errText(e));
   }
 }
 
-async function saveMaintenance() {
-  setError(''); setStatus('保存中…');
+async function startMaintenanceNow() {
+  setError(''); setStatus('開始中…');
   try {
-    const res = await api('/api/platform/settings/maintenance', {
-      method: 'PUT',
-      body: JSON.stringify({ on: el('mntToggle').checked, message: el('mntMessage').value }),
-    });
-    setStatus('メンテナンスモードを' + (res.on ? 'オン' : 'オフ') + 'にしました。');
+    const level = el('mntStartLevel').value;
+    const body = {
+      kind: 'once', startsAt: Date.now(), endsAt: null, level: level,
+      storeId: storeSelectValue('mntStartStore'),
+      message: el('mntStartMessage').value || null,
+    };
+    if (level === 'features') body.features = checkedFeatures('mntStartFeatures');
+    await api('/api/platform/maintenance/windows', { method: 'POST', body: JSON.stringify(body) });
+    el('mntStartMessage').value = '';
+    setStatus('メンテナンスを開始しました。');
+    loadMaintenance();
   } catch (e) {
     setStatus('');
+    setError(errText(e));
+  }
+}
+
+function timeToMinutes(v) {
+  const p = v.split(':');
+  return Number(p[0]) * 60 + Number(p[1]);
+}
+
+async function addWindow() {
+  setError(''); setStatus('追加中…');
+  try {
+    const kind = el('mntKind').value;
+    const level = el('mntLevel').value;
+    const body = {
+      kind: kind, level: level, storeId: storeSelectValue('mntStore'),
+      message: el('mntMessage').value || null,
+    };
+    if (level === 'features') body.features = checkedFeatures('mntFeatures');
+    if (kind === 'once') {
+      const s = el('mntOnceStart').value;
+      const e = el('mntOnceEnd').value;
+      if (!s) { setStatus(''); setError('開始日時を入力してください。'); return; }
+      body.startsAt = new Date(s).getTime();
+      body.endsAt = e ? new Date(e).getTime() : null;
+    } else {
+      const st = el('mntWeeklyStart').value;
+      const en = el('mntWeeklyEnd').value;
+      if (!st || !en) { setStatus(''); setError('開始・終了時刻を入力してください。'); return; }
+      const sm = timeToMinutes(st);
+      let em = timeToMinutes(en);
+      if (em <= sm) em += 1440;
+      body.weekday = Number(el('mntWeekday').value);
+      body.startMinute = sm;
+      body.endMinute = em;
+    }
+    await api('/api/platform/maintenance/windows', { method: 'POST', body: JSON.stringify(body) });
+    el('mntMessage').value = '';
+    setStatus('メンテナンス予定を追加しました。');
+    loadMaintenance();
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+  }
+}
+
+async function extendWindow(id, minutes) {
+  setError(''); setStatus('延長中…');
+  try {
+    await api('/api/platform/maintenance/windows/' + id + '/extend', {
+      method: 'POST', body: JSON.stringify({ minutes: minutes }),
+    });
+    setStatus('メンテナンス #' + id + ' を ' + minutes + ' 分延長しました。');
+    loadMaintenance();
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+  }
+}
+
+async function endWindow(id) {
+  if (!confirm('このメンテナンスを終了/取消しますか？')) return;
+  setError(''); setStatus('');
+  try {
+    await api('/api/platform/maintenance/windows/' + id + '/end', { method: 'POST' });
+    setStatus('メンテナンス #' + id + ' を終了/取消しました。');
+    loadMaintenance();
+  } catch (e) {
     setError(errText(e));
   }
 }
@@ -626,7 +861,8 @@ el('logoutBtn').onclick = async () => {
 el('createStore').onclick = createStore;
 el('userSearchBtn').onclick = loadUsers;
 el('auditSearchBtn').onclick = loadAudit;
-el('mntSave').onclick = saveMaintenance;
+el('mntStartBtn').onclick = startMaintenanceNow;
+el('mntAddBtn').onclick = addWindow;
 el('revokeAllBtn').onclick = revokeAllSessions;
 loadAll();
 </script>

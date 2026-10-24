@@ -28,6 +28,15 @@ import {
   FEATURE_KEYS,
   getFeatures,
 } from '../../workers/src/lib/features';
+import {
+  activeOccurrence,
+  loadMaintenanceWindows,
+  MAINTENANCE_FEATURE_KEYS,
+  nextOccurrence,
+  normalizeWindow,
+  type MaintenanceWindow,
+  type MaintenanceWindowRow,
+} from '../../workers/src/lib/maintenance';
 import { ApiError, badRequest, forbidden, notFound, unauthorized } from '../../workers/src/lib/errors';
 import { CONSOLE_HTML } from './console';
 
@@ -896,7 +905,19 @@ app.get('/api/platform/system', async (c) => {
   } catch {
     activeSessions = 0;
   }
-  const maintenance = await readMaintenanceSetting(c.env.DB);
+  // 従来の形 ({ on, message }) を保ちつつ、windows 由来の実施中も on に反映する
+  const legacy = await readMaintenanceSetting(c.env.DB);
+  let maintenance = legacy;
+  if (!legacy.on) {
+    const now = Date.now();
+    const windows = await loadMaintenanceWindows(c.env.DB);
+    for (const w of windows) {
+      if (activeOccurrence(w, now)) {
+        maintenance = { on: true, message: w.message };
+        break;
+      }
+    }
+  }
   return c.json({ tables, activeSessions, maintenance });
 });
 
@@ -929,6 +950,272 @@ app.put('/api/platform/settings/maintenance', async (c) => {
     null,
   );
   return c.json({ on: dto.on, message: dto.message ?? '' });
+});
+
+// ------------------------------------------------------------ メンテナンスウィンドウ
+
+/**
+ * メンテナンス枠 (maintenance_windows) の管理。評価ロジック (JST の曜日・
+ * 時刻解釈、occurrence 展開) は店舗アプリと共有の lib を使い、解釈を一致させる。
+ */
+
+function maintenanceWindowJson(
+  w: MaintenanceWindow,
+  storeName: string | null,
+  now: number,
+): Record<string, unknown> {
+  let state: 'active' | 'scheduled' | 'finished' | 'cancelled' = 'finished';
+  let occurrenceStartsAt: number | null = null;
+  let occurrenceEndsAt: number | null = null;
+  if (w.cancelledAt !== null) {
+    state = 'cancelled';
+  } else {
+    const occ = activeOccurrence(w, now);
+    if (occ) {
+      state = 'active';
+      occurrenceStartsAt = occ.startsAt;
+      occurrenceEndsAt = occ.endsAt;
+    } else {
+      const next = nextOccurrence(w, now);
+      if (next) {
+        state = 'scheduled';
+        occurrenceStartsAt = next.startsAt;
+        occurrenceEndsAt = next.endsAt;
+      }
+    }
+  }
+  return {
+    id: w.id,
+    kind: w.kind,
+    level: w.level,
+    features: w.features,
+    storeId: w.storeId,
+    storeName,
+    message: w.message,
+    startsAt: w.startsAt,
+    endsAt: w.endsAt,
+    weekday: w.weekday,
+    startMinute: w.startMinute,
+    endMinute: w.endMinute,
+    createdBy: w.createdBy,
+    createdAt: w.createdAt,
+    cancelledAt: w.cancelledAt,
+    state,
+    occurrenceStartsAt,
+    occurrenceEndsAt,
+  };
+}
+
+async function storeNameMap(c: AppContext): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  try {
+    const { results } = await c.env.DB.prepare('SELECT id, name FROM stores').all<{
+      id: number;
+      name: string;
+    }>();
+    for (const r of results) map.set(r.id, r.name);
+  } catch {
+    // stores 未適用の環境では名前なしで返す
+  }
+  return map;
+}
+
+async function maintenanceWindowById(c: AppContext, id: number): Promise<MaintenanceWindow> {
+  const row = await c.env.DB.prepare('SELECT * FROM maintenance_windows WHERE id = ?1')
+    .bind(id)
+    .first<MaintenanceWindowRow>();
+  const w = row ? normalizeWindow(row) : null;
+  if (!w) throw notFound('Maintenance window not found');
+  return w;
+}
+
+function windowJsonFor(
+  w: MaintenanceWindow,
+  names: Map<number, string>,
+  now: number,
+): Record<string, unknown> {
+  return maintenanceWindowJson(w, w.storeId !== null ? (names.get(w.storeId) ?? null) : null, now);
+}
+
+/** メンテナンス一覧: 実施中 / 予定 / 直近の履歴 (終了・取消 20 件) */
+app.get('/api/platform/maintenance', async (c) => {
+  requirePlatformAdmin(c);
+  const now = Date.now();
+  const names = await storeNameMap(c);
+  const windows = await loadMaintenanceWindows(c.env.DB);
+  const items = windows.map((w) => windowJsonFor(w, names, now));
+  const byOccurrence = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+    ((a.occurrenceStartsAt as number | null) ?? Number.MAX_SAFE_INTEGER) -
+    ((b.occurrenceStartsAt as number | null) ?? Number.MAX_SAFE_INTEGER);
+  const recentKey = (i: Record<string, unknown>) =>
+    (i.cancelledAt as number | null) ?? (i.endsAt as number | null) ?? (i.createdAt as number);
+  return c.json({
+    active: items.filter((i) => i.state === 'active').sort(byOccurrence),
+    scheduled: items.filter((i) => i.state === 'scheduled').sort(byOccurrence),
+    recent: items
+      .filter((i) => i.state === 'finished' || i.state === 'cancelled')
+      .sort((a, b) => recentKey(b) - recentKey(a))
+      .slice(0, 20),
+  });
+});
+
+const createWindowBodySchema = z.object({
+  kind: z.enum(['once', 'weekly']),
+  startsAt: z.number().int().positive().optional(),
+  endsAt: z.number().int().positive().nullable().optional(),
+  weekday: z.number().int().min(0).max(6).optional(),
+  startMinute: z.number().int().min(0).max(1439).optional(),
+  endMinute: z.number().int().min(1).max(2880).optional(),
+  level: z.enum(['read_only', 'features', 'full']),
+  features: z.array(z.string()).optional(),
+  storeId: z.number().int().positive().nullable().optional(),
+  message: z.string().max(500).nullable().optional(),
+});
+
+/** メンテナンス枠の作成。意味的な検証違反は 422 */
+app.post('/api/platform/maintenance/windows', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(createWindowBodySchema, await parseJson(c));
+  const invalid = (message: string) => new ApiError(422, 'INVALID_WINDOW', message);
+
+  if (dto.level === 'features') {
+    const feats = dto.features ?? [];
+    if (feats.length === 0) throw invalid('features level requires at least one feature');
+    for (const f of feats) {
+      if (!MAINTENANCE_FEATURE_KEYS.has(f)) throw invalid(`Unknown feature: ${f}`);
+    }
+  }
+
+  let startsAt: number | null = null;
+  let endsAt: number | null = null;
+  let weekday: number | null = null;
+  let startMinute: number | null = null;
+  let endMinute: number | null = null;
+  if (dto.kind === 'once') {
+    if (dto.startsAt === undefined) throw invalid('startsAt is required for once windows');
+    startsAt = dto.startsAt;
+    endsAt = dto.endsAt ?? null;
+    if (endsAt !== null && endsAt <= startsAt) throw invalid('endsAt must be after startsAt');
+  } else {
+    if (dto.weekday === undefined || dto.startMinute === undefined || dto.endMinute === undefined) {
+      throw invalid('weekday, startMinute and endMinute are required for weekly windows');
+    }
+    if (dto.endMinute <= dto.startMinute) throw invalid('endMinute must be after startMinute');
+    weekday = dto.weekday;
+    startMinute = dto.startMinute;
+    endMinute = dto.endMinute;
+  }
+  if (dto.storeId !== undefined && dto.storeId !== null) {
+    await storeRow(c, dto.storeId); // 無ければ 404
+  }
+
+  const features = dto.level === 'features' ? JSON.stringify(dto.features ?? []) : null;
+  const res = await c.env.DB.prepare(
+    `INSERT INTO maintenance_windows
+       (kind, starts_at, ends_at, weekday, start_minute, end_minute, level, features, store_id, message, created_by, created_at, cancelled_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)`,
+  )
+    .bind(
+      dto.kind,
+      startsAt,
+      endsAt,
+      weekday,
+      startMinute,
+      endMinute,
+      dto.level,
+      features,
+      dto.storeId ?? null,
+      dto.message ?? null,
+      user(c).userId,
+      Date.now(),
+    )
+    .run();
+  const id = Number(res.meta.last_row_id);
+  await platformAudit(
+    c,
+    'platform.maintenance.create',
+    'maintenance_window',
+    String(id),
+    { kind: dto.kind, level: dto.level, startsAt, endsAt, weekday, startMinute, endMinute },
+    dto.storeId ?? null,
+  );
+  const names = await storeNameMap(c);
+  const w = await maintenanceWindowById(c, id);
+  return c.json(windowJsonFor(w, names, Date.now()), 201);
+});
+
+const extendWindowBodySchema = z.object({
+  minutes: z.number().int().positive().max(60 * 24 * 30),
+});
+
+/** 枠の延長 (once のみ)。ends_at が無ければ現在時刻 + minutes を設定する */
+app.post('/api/platform/maintenance/windows/:id/extend', async (c) => {
+  requirePlatformAdmin(c);
+  const dto = parseWith(extendWindowBodySchema, await parseJson(c));
+  const id = Number(c.req.param('id'));
+  const w = await maintenanceWindowById(c, id);
+  if (w.kind !== 'once') {
+    throw new ApiError(422, 'WEEKLY_NOT_EXTENDABLE', 'Weekly windows cannot be extended');
+  }
+  if (w.cancelledAt !== null) {
+    throw new ApiError(422, 'WINDOW_CANCELLED', 'Window is already cancelled');
+  }
+  const now = Date.now();
+  const endsAt =
+    w.endsAt === null ? now + dto.minutes * 60_000 : w.endsAt + dto.minutes * 60_000;
+  await c.env.DB.prepare('UPDATE maintenance_windows SET ends_at = ?1 WHERE id = ?2')
+    .bind(endsAt, id)
+    .run();
+  await platformAudit(
+    c,
+    'platform.maintenance.extend',
+    'maintenance_window',
+    String(id),
+    { minutes: dto.minutes, endsAt },
+    w.storeId,
+  );
+  const names = await storeNameMap(c);
+  const updated = await maintenanceWindowById(c, id);
+  return c.json(windowJsonFor(updated, names, Date.now()));
+});
+
+/**
+ * 枠の終了/取消。実施中の once は ends_at = 現在時刻で即時終了し、
+ * weekly と未来の once は cancelled_at で無効化する。
+ */
+app.post('/api/platform/maintenance/windows/:id/end', async (c) => {
+  requirePlatformAdmin(c);
+  const id = Number(c.req.param('id'));
+  const w = await maintenanceWindowById(c, id);
+  const now = Date.now();
+  const isActiveOnce = w.kind === 'once' && activeOccurrence(w, now) !== null;
+  const alreadyFinished =
+    w.kind === 'once' && w.cancelledAt === null && w.endsAt !== null && w.endsAt <= now;
+  let mode: 'end' | 'cancel' | 'none' = 'none';
+  if (isActiveOnce) {
+    await c.env.DB.prepare('UPDATE maintenance_windows SET ends_at = ?1 WHERE id = ?2')
+      .bind(now, id)
+      .run();
+    mode = 'end';
+  } else if (w.cancelledAt === null && !alreadyFinished) {
+    await c.env.DB.prepare('UPDATE maintenance_windows SET cancelled_at = ?1 WHERE id = ?2')
+      .bind(now, id)
+      .run();
+    mode = 'cancel';
+  }
+  if (mode !== 'none') {
+    await platformAudit(
+      c,
+      'platform.maintenance.end',
+      'maintenance_window',
+      String(id),
+      { mode },
+      w.storeId,
+    );
+  }
+  const names = await storeNameMap(c);
+  const updated = await maintenanceWindowById(c, id);
+  return c.json(windowJsonFor(updated, names, Date.now()));
 });
 
 /** 全セッション失効 (呼び出し元 = 操作中の全体管理者自身のセッションは残す) */

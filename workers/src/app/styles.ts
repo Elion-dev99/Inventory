@@ -400,6 +400,11 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
   font-weight: 600;
   font-size: 0.9rem;
 }
+/* メンテナンス予定の事前告知は情報色で控えめに出す */
+.maintenance-banner.upcoming {
+  background: var(--info-bg);
+  color: var(--info-fg);
+}
 .msg.error { background: var(--danger-bg); color: var(--danger); }
 .msg.success { background: var(--ok-bg); color: var(--ok); }
 .msg.info { background: var(--info-bg); color: var(--info-fg); }

@@ -41,6 +41,13 @@ export const APP_HTML = `<!doctype html>
   <p class="muted">ログインはできていますが、このアカウントにはまだロールが割り当てられていません。管理者にロール付与を依頼してください。</p>
 </div>
 
+<div id="maintenanceBox" class="center-box" style="display:none">
+  <h2>メンテナンス中</h2>
+  <p id="mntFullMessage"></p>
+  <p class="muted" id="mntFullEnds"></p>
+  <p><button class="btn" id="mntReloadBtn">再読み込み</button></p>
+</div>
+
 <div id="storeBox" class="center-box" style="display:none">
   <img class="app-icon-lg" src="/icons/icon-512.png" alt="">
   <h2>店舗を選んでください</h2>
