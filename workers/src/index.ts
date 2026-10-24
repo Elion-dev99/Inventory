@@ -113,6 +113,14 @@ import {
   requireImagesBucket,
 } from './lib/photos';
 import { qrSvg } from './lib/qr';
+import {
+  SCAN_ENGINE_VERSION,
+  SCAN_READER_JS,
+  SCAN_SHARE_JS,
+  SCAN_WASM_SHA256,
+  scanWasmBytes,
+} from './scan-assets';
+import { SCAN_WORKER_JS } from './scan-worker';
 
 export { InventoryCoordinator };
 
@@ -170,6 +178,34 @@ app.get('/manifest.webmanifest', () => manifestResponse());
 app.get('/icons/:name', (c) => iconResponse(c.req.param('name')) ?? c.notFound());
 // Web Push 用 Service Worker (push で通知表示、クリックで /app を開く)
 app.get('/sw.js', () => serviceWorkerResponse());
+
+// ------------------------------------------------------------ バーコードスキャンエンジン
+// ZXing (zxing-wasm) のデコードエンジンを Worker 自身が配信する。
+// 本番デプロイが単一モジュール (index.js) の API アップロードのため、
+// エンジンを外部 CDN に置かず、glue JS は文字列として、wasm は base64 で
+// 内包している (src/scan-assets.ts、生成: scripts/gen-scan-assets.mjs)。
+// ブラウザ側はモジュールワーカー (/assets/scan/worker.js) が相対 import で
+// glue を読み、wasm は Cache Storage にキャッシュして使う。
+function scanJsResponse(js: string): Response {
+  return new Response(js, {
+    headers: {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Cache-Control': 'public, max-age=86400',
+    },
+  });
+}
+app.get('/assets/scan/worker.js', () => scanJsResponse(SCAN_WORKER_JS));
+app.get('/assets/scan/es/share.js', () => scanJsResponse(SCAN_SHARE_JS));
+app.get('/assets/scan/es/reader/index.js', () => scanJsResponse(SCAN_READER_JS));
+app.get('/assets/scan/zxing_reader.wasm', () =>
+  new Response(scanWasmBytes(), {
+    headers: {
+      'Content-Type': 'application/wasm',
+      'Cache-Control': 'public, max-age=604800',
+      ETag: `"zxing-${SCAN_ENGINE_VERSION}-${SCAN_WASM_SHA256.slice(0, 12)}"`,
+    },
+  }),
+);
 
 // ------------------------------------------------------------ ラベル印刷
 // QR ラベルをサーバー描画で返す印刷用ページ (要ログイン + master.read)。

@@ -70,6 +70,8 @@ export const APP_HTML = `<!doctype html>
   <div class="modal" id="modalBox"></div>
 </div>
 
+<div id="scannerOverlay" class="scanner-overlay" style="display:none"></div>
+
 <script>${APP_JS}</script>
 </body>
 </html>`;

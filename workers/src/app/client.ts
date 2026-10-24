@@ -1139,73 +1139,562 @@ function loadDashboard() {
   });
 }
 
-/* ---------------- barcode scan ---------------- */
-/* BarcodeDetector + getUserMedia が使える環境でのみ有効 (未対応ではボタンを出さない) */
-var scanStream = null;
-var scanTimer = null;
+/* ---------------- barcode scan (ZXing WASM エンジン) ---------------- */
+/* 旧実装のブラウザ標準デコーダは iOS Safari で使えないため、WASM デコーダ
+   (zxing-wasm) を Web Worker で動かす方式に作り替えた。エンジンは外部 CDN
+   ではなく Worker 自身が /assets/scan/* で配信する (src/scan-assets.ts)。
+   検証ゲート・対象行選択・候補展開の規則は src/lib/scan-core.ts と同じ。 */
+var SCAN_SUPPRESS_MS = 900;
+var scanVerifyMode = 'accurate';
+try { scanVerifyMode = localStorage.getItem('scanVerifyMode') === 'fast' ? 'fast' : 'accurate'; } catch (e) {}
+var pendingNewProductBarcode = '';
+
 function scanSupported() {
   return feat('barcode_scan') &&
-    'BarcodeDetector' in window &&
-    !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) &&
+    typeof Worker !== 'undefined';
 }
-function stopScan() {
-  if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
-  if (scanStream) {
-    scanStream.getTracks().forEach(function (t) { t.stop(); });
-    scanStream = null;
-  }
+
+/* UPC-A は ZXing が EAN-13 (先頭 0) として返すため、照合候補を両方向に展開する */
+function barcodeCandidateList(code) {
+  var s = String(code);
+  var out = [s];
+  if (/^0[0-9]{12}$/.test(s)) out.push(s.slice(1));
+  if (/^[0-9]{12}$/.test(s)) out.push('0' + s);
+  return out;
 }
 function productByBarcode(code) {
   var m = state.master;
   if (!m) return null;
-  for (var i = 0; i < m.products.length; i++) {
-    if (m.products[i].barcode && String(m.products[i].barcode) === String(code)) return m.products[i];
-  }
-  /* バーコード未登録の商品は SKU でも解決する (SKU の QR ラベル用) */
-  for (var j = 0; j < m.products.length; j++) {
-    if (String(m.products[j].sku) === String(code)) return m.products[j];
+  var cands = barcodeCandidateList(code);
+  for (var ci = 0; ci < cands.length; ci++) {
+    for (var i = 0; i < m.products.length; i++) {
+      if (m.products[i].barcode && String(m.products[i].barcode) === cands[ci]) return m.products[i];
+    }
+    /* バーコード未登録の商品は SKU でも解決する (SKU の QR ラベル用) */
+    for (var j = 0; j < m.products.length; j++) {
+      if (String(m.products[j].sku) === cands[ci]) return m.products[j];
+    }
   }
   return null;
 }
-function openScanner(onDetect) {
-  el('modalBox').innerHTML = '<h3>バーコードをスキャン</h3><div id="scanMsg"></div>' +
-    '<video id="scanVideo" autoplay playsinline muted style="width:100%; border-radius:12px; background:#000;"></video>' +
-    '<p class="small muted">カメラをバーコードに向けてください。読み取ると自動で反映します。</p>' +
-    '<p><button class="btn secondary" type="button" id="scanCancel">キャンセル</button></p>';
-  el('modalOverlay').style.display = '';
-  el('scanCancel').onclick = function () { stopScan(); closeModal(); };
-  var detector;
+
+/* 検証ゲート (src/lib/scan-core.ts の createScanGate と同じ規則)。
+   accurate: 同じ値が連続 2 回のデコードで一致したら受理。fast: 1 回で受理。
+   受理後 900ms は同一コードを抑制する (別コードは対象外)。 */
+function scanGateCreate(mode) {
+  var pendingCode = null;
+  var pendingCount = 0;
+  var lastCode = null;
+  var lastAt = 0;
+  function accept(code, now) {
+    lastCode = code;
+    lastAt = now;
+    pendingCode = null;
+    pendingCount = 0;
+    return true;
+  }
+  return {
+    consider: function (code, now) {
+      if (!code) return false;
+      if (code === lastCode && now - lastAt < SCAN_SUPPRESS_MS) return false;
+      if (mode === 'fast') return accept(code, now);
+      if (code === pendingCode) pendingCount++;
+      else { pendingCode = code; pendingCount = 1; }
+      if (pendingCount >= 2) return accept(code, now);
+      return false;
+    },
+    setMode: function (next) {
+      mode = next;
+      pendingCode = null;
+      pendingCount = 0;
+    }
+  };
+}
+
+/* 棚卸しスキャンカウントの対象行選択 (scan-core.ts の pickScanCountLine と同じ規則) */
+function scanPickLine(lines, productId, locationId) {
+  var best = null;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.productId !== productId || line.locationId !== locationId) continue;
+    if (!best) { best = line; continue; }
+    var a = line.expiryDate || null;
+    var b = best.expiryDate || null;
+    if (a && !b) best = line;
+    else if (a && b && a < b) best = line;
+    else if (a === b && line.id < best.id) best = line;
+  }
+  return best;
+}
+
+/* ---- 読み取りフィードバック (ビープ + バイブ + 枠の色変化のみ、過剰な演出はしない) ---- */
+var scanAudioCtx = null;
+function scanBeep(freq, durMs) {
   try {
-    detector = new window.BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'qr_code'] });
+    if (!scanAudioCtx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      scanAudioCtx = new AC();
+    }
+    if (scanAudioCtx.state === 'suspended') scanAudioCtx.resume();
+    var t = scanAudioCtx.currentTime;
+    var osc = scanAudioCtx.createOscillator();
+    var gain = scanAudioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.16, t + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + durMs / 1000);
+    osc.connect(gain);
+    gain.connect(scanAudioCtx.destination);
+    osc.start(t);
+    osc.stop(t + durMs / 1000 + 0.03);
+  } catch (e) {}
+}
+function scanFlashFrame(cls) {
+  var f = el('scanFrame');
+  if (!f) return;
+  f.classList.add(cls);
+  setTimeout(function () { var x = el('scanFrame'); if (x) x.classList.remove(cls); }, 180);
+}
+function scanFeedbackOk() {
+  scanBeep(880, 70);
+  if (navigator.vibrate) { try { navigator.vibrate(10); } catch (e) {} }
+  scanFlashFrame('hit');
+}
+function scanFeedbackNg() {
+  scanBeep(220, 100);
+  if (navigator.vibrate) { try { navigator.vibrate([20, 30, 20]); } catch (e) {} }
+  scanFlashFrame('miss');
+}
+function scanTimeText(ms) {
+  var d = new Date(ms);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
+
+/* ---- デコード用 Web Worker (シングルトン。初回オープン時にだけ読み込む) ---- */
+var scanWorker = null;
+var scanWorkerState = 'idle';
+var scanWorkerWaiters = [];
+var scanDecodeSeq = 0;
+var scanDecodePending = {};
+function flushScanWorkerWaiters(ok) {
+  var ws = scanWorkerWaiters;
+  scanWorkerWaiters = [];
+  for (var i = 0; i < ws.length; i++) ws[i](ok);
+}
+function ensureScanWorker(done) {
+  if (scanWorkerState === 'ready') { done(true); return; }
+  scanWorkerWaiters.push(done);
+  if (scanWorkerState === 'loading') return;
+  scanWorkerState = 'loading';
+  try {
+    scanWorker = new Worker('/assets/scan/worker.js', { type: 'module' });
   } catch (e) {
-    try { detector = new window.BarcodeDetector(); }
-    catch (e2) {
-      el('scanMsg').innerHTML = msgHtml('error', 'バーコード読み取りを開始できませんでした。');
+    scanWorkerState = 'error';
+    flushScanWorkerWaiters(false);
+    return;
+  }
+  scanWorker.onmessage = function (ev) {
+    var msg = ev.data || {};
+    if (msg.type === 'ready') {
+      scanWorkerState = 'ready';
+      flushScanWorkerWaiters(true);
+    } else if (msg.type === 'error') {
+      scanWorkerState = 'error';
+      flushScanWorkerWaiters(false);
+    } else if (msg.type === 'result') {
+      var cb = scanDecodePending[msg.id];
+      if (cb) {
+        delete scanDecodePending[msg.id];
+        cb(msg.results || []);
+      }
+    }
+  };
+  scanWorker.onerror = function () {
+    if (scanWorkerState === 'loading') {
+      scanWorkerState = 'error';
+      flushScanWorkerWaiters(false);
+    }
+  };
+  scanWorker.postMessage({ type: 'init' });
+}
+function scanDecodeFrame(buffer, width, height, cb) {
+  var id = ++scanDecodeSeq;
+  scanDecodePending[id] = cb;
+  scanWorker.postMessage({ type: 'decode', id: id, buffer: buffer, width: width, height: height }, [buffer]);
+}
+
+/* ---- スキャナー画面 (共通コンポーネント) ----
+   opts: {
+     title, continuous,
+     onCode(code, format, api) -> 'ok' | 'unknown' | 'out',
+     panelTitle() / syncHtml() / renderPanel() (continuous 用),
+     onOpen(api), onBeforeClose(api) -> Promise, onClose()
+   } */
+var scanSession = null;
+function scannerHtml(opts, continuous) {
+  var h = '<div class="scan-video-wrap">' +
+    '<video id="scanVideo" class="scan-video" autoplay playsinline muted></video>' +
+    '<div class="scan-top">' +
+    '<button type="button" class="scan-round-btn" id="scanCloseBtn" aria-label="閉じる">✕</button>' +
+    '<div class="scan-title">' + esc(opts.title || 'バーコードスキャン') + '</div>' +
+    '<button type="button" class="scan-pill-btn" id="scanTorchBtn" style="display:none">ライト</button>' +
+    '<div class="scan-seg" id="scanModeSeg"><button type="button" data-vmode="accurate">高精度</button><button type="button" data-vmode="fast">高速</button></div>' +
+    '</div>' +
+    '<div class="scan-frame" id="scanFrame"></div>' +
+    '<div class="scan-status" id="scanStatus">準備しています…</div>' +
+    '</div>';
+  if (continuous) {
+    h += '<div class="scan-panel">' +
+      '<div class="scan-panel-head"><div class="scan-panel-title" id="scanPanelTitle"></div><span id="scanSync"></span>' +
+      '<button type="button" class="scan-undo-btn" id="scanUndoBtn" disabled>最後の1件を取り消し</button></div>' +
+      '<div id="scanToast" class="scan-toast"></div>' +
+      '<div id="scanUnknownBox" class="scan-unknown"></div>' +
+      '<div id="scanPanelBody"></div>' +
+      '</div>';
+  } else {
+    h += '<div id="scanUnknownBox" class="scan-unknown scan-notice"></div>' +
+      '<div class="scan-close-bar"><button type="button" class="btn secondary" id="scanCancelBtn">キャンセル</button></div>';
+  }
+  return h;
+}
+function openScanner(opts) {
+  if (scanSession && !scanSession.closed) teardownScanSession(scanSession);
+  var session = {
+    opts: opts, closed: false, closing: false, closingPromise: null,
+    stream: null, track: null, timer: null, busy: false, canvas: null,
+    gate: scanGateCreate(scanVerifyMode), undoStack: [], recentLog: [],
+    torchOn: false, toastTimer: null,
+  };
+  scanSession = session;
+  var overlay = el('scannerOverlay');
+  overlay.innerHTML = scannerHtml(opts, !!opts.continuous);
+  overlay.style.display = '';
+  bindScannerChrome(session);
+  refreshScanPanel(session);
+  var status = el('scanStatus');
+  if (status) status.textContent = 'スキャンエンジンを準備しています…';
+  ensureScanWorker(function (ok) {
+    if (session.closed) return;
+    var s = el('scanStatus');
+    if (!ok) {
+      if (s) s.textContent = 'スキャンエンジンを読み込めませんでした。通信環境を確認して開き直してください。';
       return;
     }
+    if (s) s.textContent = 'バーコードを枠内に入れてください';
+    startScanCamera(session);
+  });
+  if (opts.onOpen) opts.onOpen(scanSessionApi(session));
+  return session;
+}
+function scanSessionApi(session) {
+  return {
+    refreshPanel: function () { refreshScanPanel(session); },
+    toast: function (text) { showScanToast(session, text); },
+    setStatus: function (text) { var s = el('scanStatus'); if (s) s.textContent = text; },
+    pushUndo: function (fn) { session.undoStack.push(fn); refreshScanPanel(session); },
+    addRecent: function (label, sub) {
+      session.recentLog.unshift({ label: label, sub: sub || '', at: Date.now() });
+      if (session.recentLog.length > 30) session.recentLog.pop();
+      refreshScanPanel(session);
+    },
+    close: function () { closeScanner(); },
+  };
+}
+function refreshScanPanel(session) {
+  if (!session.opts.continuous || session.closed) return;
+  var title = el('scanPanelTitle');
+  if (title) {
+    var t = session.opts.panelTitle;
+    title.textContent = typeof t === 'function' ? t() : (t || '読み取り履歴');
   }
-  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(function (stream) {
-    scanStream = stream;
-    var video = el('scanVideo');
-    if (!video) { stopScan(); return; }
+  var sync = el('scanSync');
+  if (sync && session.opts.syncHtml) sync.innerHTML = session.opts.syncHtml();
+  var undo = el('scanUndoBtn');
+  if (undo) undo.disabled = session.undoStack.length === 0;
+  var body = el('scanPanelBody');
+  if (body) body.innerHTML = session.opts.renderPanel ? session.opts.renderPanel() : scanDefaultRecentHtml(session);
+}
+function scanDefaultRecentHtml(session) {
+  if (session.recentLog.length === 0) {
+    return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+  }
+  var h = '<div class="scan-recent">';
+  for (var i = 0; i < Math.min(session.recentLog.length, 8); i++) {
+    var r = session.recentLog[i];
+    h += '<div class="scan-recent-row"><span class="scan-recent-name">' + esc(r.label) + '</span>' +
+      (r.sub ? '<span class="scan-recent-qty">' + esc(r.sub) + '</span>' : '') +
+      '<span class="scan-recent-time">' + scanTimeText(r.at) + '</span></div>';
+  }
+  return h + '</div>';
+}
+function showScanToast(session, text) {
+  var t = el('scanToast');
+  if (!t) return;
+  t.textContent = text;
+  t.style.display = 'block';
+  if (session.toastTimer) clearTimeout(session.toastTimer);
+  session.toastTimer = setTimeout(function () {
+    var x = el('scanToast');
+    if (x) x.style.display = 'none';
+  }, 2400);
+}
+function showScanUnknown(session, code) {
+  var box = el('scanUnknownBox');
+  if (!box) return;
+  box.innerHTML = '未登録のバーコードです: <b>' + esc(code) + '</b>' +
+    (can('master.write') ? '<br><button type="button" class="btn small" id="scanRegisterBtn">商品を登録</button>' : '');
+  box.style.display = 'block';
+  var btn = el('scanRegisterBtn');
+  if (btn) btn.onclick = function () {
+    pendingNewProductBarcode = code;
+    closeScanner().then(function () { showView('master'); });
+  };
+}
+function hideScanUnknown() {
+  var box = el('scanUnknownBox');
+  if (box) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+  }
+}
+function bindScannerChrome(session) {
+  el('scanCloseBtn').onclick = function () { closeScanner(); };
+  var cancel = el('scanCancelBtn');
+  if (cancel) cancel.onclick = function () { closeScanner(); };
+  var undo = el('scanUndoBtn');
+  if (undo) undo.onclick = function () {
+    var fn = session.undoStack.pop();
+    if (fn) { try { fn(); } catch (e) {} }
+    refreshScanPanel(session);
+  };
+  var seg = el('scanModeSeg');
+  if (seg) {
+    var btns = seg.querySelectorAll('button[data-vmode]');
+    var syncSeg = function () {
+      for (var i = 0; i < btns.length; i++) {
+        if (btns[i].getAttribute('data-vmode') === scanVerifyMode) btns[i].classList.add('active');
+        else btns[i].classList.remove('active');
+      }
+    };
+    syncSeg();
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function () {
+        scanVerifyMode = this.getAttribute('data-vmode');
+        try { localStorage.setItem('scanVerifyMode', scanVerifyMode); } catch (e) {}
+        session.gate.setMode(scanVerifyMode);
+        syncSeg();
+      };
+    }
+  }
+  var torch = el('scanTorchBtn');
+  if (torch) torch.onclick = function () {
+    if (!session.track) return;
+    session.torchOn = !session.torchOn;
+    try {
+      var p = session.track.applyConstraints({ advanced: [{ torch: session.torchOn }] });
+      if (p && p.catch) p.catch(function () {});
+    } catch (e) {}
+    torch.classList.toggle('active', session.torchOn);
+  };
+}
+function startScanCamera(session) {
+  var video = el('scanVideo');
+  if (!video) return;
+  navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+  }).then(function (stream) {
+    if (session.closed) {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      return;
+    }
+    session.stream = stream;
     video.srcObject = stream;
-    var busy = false;
-    scanTimer = setInterval(function () {
-      if (busy || !video.videoWidth) return;
-      busy = true;
-      detector.detect(video).then(function (codes) {
-        busy = false;
-        if (codes && codes.length > 0 && codes[0].rawValue) {
-          var value = codes[0].rawValue;
-          stopScan();
-          closeModal();
-          onDetect(value);
-        }
-      }).catch(function () { busy = false; });
-    }, 350);
+    var played = video.play();
+    if (played && played.catch) played.catch(function () {});
+    var track = stream.getVideoTracks()[0] || null;
+    session.track = track;
+    try {
+      var caps = track && track.getCapabilities ? track.getCapabilities() : null;
+      if (caps && caps.torch) {
+        var tb = el('scanTorchBtn');
+        if (tb) tb.style.display = '';
+      }
+    } catch (e) {}
+    session.canvas = document.createElement('canvas');
+    scanFrameLoop(session);
   }).catch(function (e) {
-    var msg = el('scanMsg');
-    if (msg) msg.innerHTML = msgHtml('error', 'カメラを利用できませんでした: ' + errMsg(e));
+    var s = el('scanStatus');
+    if (s) s.textContent = 'カメラを利用できませんでした: ' + errMsg(e);
+  });
+}
+/* 中央 ROI を切り出して Worker へ送る。応答が返るまで次フレームは送らない
+   (バックプレッシャで実効 10〜15fps 程度に収まる) */
+function scanFrameLoop(session) {
+  if (session.closed) return;
+  session.timer = setTimeout(function () { scanFrameLoop(session); }, 55);
+  if (session.busy || scanWorkerState !== 'ready') return;
+  var video = el('scanVideo');
+  if (!video || !video.videoWidth || video.readyState < 2) return;
+  var vw = video.videoWidth;
+  var vh = video.videoHeight;
+  var sw = Math.round(vw * 0.86);
+  var sh = Math.round(vh * 0.62);
+  var sx = Math.round((vw - sw) / 2);
+  var sy = Math.round((vh - sh) / 2);
+  var scale = Math.min(1, 1280 / sw);
+  var w = Math.max(2, Math.round(sw * scale));
+  var h = Math.max(2, Math.round(sh * scale));
+  var canvas = session.canvas;
+  if (!canvas) return;
+  canvas.width = w;
+  canvas.height = h;
+  var ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return;
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h);
+  var img;
+  try { img = ctx.getImageData(0, 0, w, h); } catch (e) { return; }
+  session.busy = true;
+  scanDecodeFrame(img.data.buffer, w, h, function (results) {
+    session.busy = false;
+    if (session.closed || !results || results.length === 0) return;
+    scanHandleDecoded(session, results[0].text, results[0].format);
+  });
+}
+/* デコード結果の受理判定とフィードバック (単発モードは受理で自動的に閉じる) */
+function scanHandleDecoded(session, code, format) {
+  if (!session || session.closed || session.closing) return;
+  hideScanUnknown();
+  if (!session.gate.consider(code, Date.now())) return;
+  var outcome = 'ok';
+  try {
+    outcome = session.opts.onCode(code, format, scanSessionApi(session)) || 'ok';
+  } catch (e) {
+    outcome = 'ok';
+  }
+  if (outcome === 'unknown') {
+    scanFeedbackNg();
+    showScanUnknown(session, code);
+  } else if (outcome === 'out') {
+    scanFeedbackNg();
+  } else {
+    scanFeedbackOk();
+  }
+  if (!session.opts.continuous && outcome === 'ok') closeScanner();
+}
+function stopScanStream(session) {
+  if (session.timer) {
+    clearTimeout(session.timer);
+    session.timer = null;
+  }
+  if (session.stream) {
+    session.stream.getTracks().forEach(function (t) { t.stop(); });
+    session.stream = null;
+  }
+}
+function teardownScanSession(session) {
+  session.closed = true;
+  stopScanStream(session);
+  var overlay = el('scannerOverlay');
+  if (overlay) {
+    overlay.style.display = 'none';
+    overlay.innerHTML = '';
+  }
+  if (scanSession === session) scanSession = null;
+  if (session.opts.onClose) {
+    try { session.opts.onClose(); } catch (e) {}
+  }
+}
+/* 閉じる前に未送信分を flush する (opts.onBeforeClose の Promise を待つ) */
+function closeScanner() {
+  var session = scanSession;
+  if (!session || session.closed) return Promise.resolve();
+  if (session.closingPromise) return session.closingPromise;
+  session.closing = true;
+  var p = Promise.resolve();
+  if (session.opts.onBeforeClose) {
+    try {
+      p = Promise.resolve(session.opts.onBeforeClose(scanSessionApi(session)));
+    } catch (e) {
+      p = Promise.resolve();
+    }
+  }
+  session.closingPromise = p.then(function () { teardownScanSession(session); });
+  return session.closingPromise;
+}
+
+/* ---- 記録シート (入庫・消費・移動) 用の連続スキャン ----
+   同じ商品の連続スキャンで数量 +1、別の商品を読んだらその商品へ切り替え、
+   その商品のセッション数量をフォームへ反映する。 */
+function openSheetScanner(productSelId, qtyId) {
+  var counts = {};
+  var order = [];
+  var current = null;
+  var initProduct = el(productSelId).value;
+  var initQty = Number(el(qtyId).value);
+  if (initProduct && initQty > 0) {
+    counts[initProduct] = initQty;
+    order.push(initProduct);
+    current = initProduct;
+  }
+  function applyToForm(productId) {
+    el(productSelId).value = String(productId);
+    el(qtyId).value = counts[productId] || 1;
+    var sel = el(productSelId);
+    if (sel && sel.onchange) sel.onchange();
+  }
+  openScanner({
+    title: 'バーコードスキャン',
+    continuous: true,
+    panelTitle: '読み取り履歴 (閉じると最後の商品と数量がフォームに残ります)',
+    renderPanel: function () {
+      if (order.length === 0) {
+        return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+      }
+      var h = '<div class="scan-recent">';
+      for (var i = order.length - 1; i >= 0; i--) {
+        var pid = order[i];
+        var p = productOf(Number(pid));
+        h += '<div class="scan-recent-row"><span class="scan-recent-name">' + esc(p ? p.sku + ' ' + p.name : '商品#' + pid) + '</span>' +
+          '<span class="scan-recent-qty">× ' + counts[pid] + '</span></div>';
+      }
+      return h + '</div>';
+    },
+    onCode: function (code, format, api) {
+      var p = productByBarcode(code);
+      if (!p) return 'unknown';
+      var key = String(p.id);
+      var prevProduct = current;
+      var prevCount = prevProduct ? counts[prevProduct] : 0;
+      var isNew = counts[key] === undefined;
+      counts[key] = (counts[key] || 0) + 1;
+      if (isNew) order.push(key);
+      current = key;
+      applyToForm(key);
+      if (prevProduct !== null && prevProduct !== key) {
+        api.toast('商品を切り替えました: ' + p.sku + ' ' + p.name);
+      }
+      api.pushUndo(function () {
+        counts[key] -= 1;
+        if (counts[key] <= 0) {
+          delete counts[key];
+          order = order.filter(function (x) { return x !== key; });
+        }
+        if (prevProduct !== null && counts[prevProduct] !== undefined) {
+          current = prevProduct;
+          el(productSelId).value = String(prevProduct);
+          el(qtyId).value = prevCount;
+          var sel2 = el(productSelId);
+          if (sel2 && sel2.onchange) sel2.onchange();
+        }
+        api.refreshPanel();
+      });
+      api.refreshPanel();
+      return 'ok';
+    },
   });
 }
 
@@ -1335,11 +1824,27 @@ function loadStocks() {
     el('stReload').onclick = fetchStocks;
     var scanBtn = el('stScan');
     if (scanBtn) scanBtn.onclick = function () {
-      openScanner(function (code) {
-        var p = productByBarcode(code);
-        el('stQ').value = p ? p.sku : code;
-        fetchStocks();
-        if (!p) el('stMsg').innerHTML = msgHtml('warn', 'バーコード ' + code + ' の商品が見つかりませんでした。');
+      var unknownCode = '';
+      openScanner({
+        title: 'バーコードスキャン',
+        continuous: false,
+        onCode: function (code) {
+          var p = productByBarcode(code);
+          if (!p) {
+            unknownCode = code;
+            return 'unknown';
+          }
+          el('stQ').value = p.sku;
+          fetchStocks();
+          return 'ok';
+        },
+        onClose: function () {
+          if (unknownCode && el('stQ')) {
+            el('stQ').value = unknownCode;
+            fetchStocks();
+            el('stMsg').innerHTML = msgHtml('warn', 'バーコード ' + unknownCode + ' の商品が見つかりませんでした。');
+          }
+        },
       });
     };
     fetchStocks();
@@ -1424,13 +1929,7 @@ function loadInbound() {
     }
     updateHint();
     var inScan = el('inScan');
-    if (inScan) inScan.onclick = function () {
-      openScanner(function (code) {
-        var p = productByBarcode(code);
-        if (p) { el('inProduct').value = String(p.id); updateHint(); }
-        else el('inMsg').innerHTML = msgHtml('warn', 'バーコード ' + code + ' の商品が見つかりませんでした。');
-      });
-    };
+    if (inScan) inScan.onclick = function () { openSheetScanner('inProduct', 'inQty'); };
     el('inForm').onsubmit = function (ev) {
       ev.preventDefault();
       var btn = el('inSubmit');
@@ -1488,13 +1987,7 @@ function loadConsume() {
       if (coPreset.locationId) el('coLocation').value = String(coPreset.locationId);
     }
     var coScan = el('coScan');
-    if (coScan) coScan.onclick = function () {
-      openScanner(function (code) {
-        var p = productByBarcode(code);
-        if (p) el('coProduct').value = String(p.id);
-        else el('coMsg').innerHTML = msgHtml('warn', 'バーコード ' + code + ' の商品が見つかりませんでした。');
-      });
-    };
+    if (coScan) coScan.onclick = function () { openSheetScanner('coProduct', 'coQty'); };
     el('coForm').onsubmit = function (ev) {
       ev.preventDefault();
       var btn = el('coSubmit');
@@ -1543,7 +2036,8 @@ function loadTransfer() {
     var h = '<h2>在庫移動</h2><div class="mnt-form-note" id="mntNoteTransfer" style="display:none"></div><div id="trMsg"></div>' +
       '<form class="grid" id="trForm">' +
       '<div><label>商品</label><select id="trProduct" required>' +
-      optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+      optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
+      (scanSupported() ? '<div style="margin-top:0.4rem;"><button class="btn small secondary" type="button" id="trScan">スキャンで商品を選ぶ</button></div>' : '') + '</div>' +
       '<div><label>移動元 保管場所</label><select id="trFrom" required>' +
       optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
       '<div><label>移動先 保管場所</label><select id="trTo" required>' +
@@ -1561,6 +2055,8 @@ function loadTransfer() {
       el('trLot').innerHTML = optionsHtml(lots, function (l) { return l.id; }, function (l) { return l.lotCode; }, '', 'FEFO (自動)');
     };
     el('trProduct').onchange = fillLots;
+    var trScan = el('trScan');
+    if (trScan) trScan.onclick = function () { openSheetScanner('trProduct', 'trQty'); };
     /* 在庫一覧の行タップから来た場合は対象をプリセットする (移動元 = その在庫の場所) */
     var trPreset = takeFormPreset('transfer');
     if (trPreset) {
@@ -2062,6 +2558,18 @@ function loadMasterView() {
       if (el('msLead').value) b.leadTimeDays = Number(el('msLead').value);
       return b;
     } }, '仕入先を追加しました。');
+    /* スキャナーで未登録だったバーコードを引き継いで商品登録へ進める */
+    if (pendingNewProductBarcode) {
+      var pendingBarcode = pendingNewProductBarcode;
+      pendingNewProductBarcode = '';
+      var bcInput = el('mpBarcode');
+      if (bcInput) {
+        bcInput.value = pendingBarcode;
+        el('maMsg').innerHTML = msgHtml('info', 'バーコード ' + pendingBarcode + ' を入力しました。SKU と商品名を入力して「商品を追加」を押してください。');
+        var skuInput = el('mpSku');
+        if (skuInput) skuInput.focus();
+      }
+    }
   });
 }
 
@@ -2261,6 +2769,17 @@ function renderStocktakeDetail(t) {
     if (d.blind && d.status === 'in_progress') {
       h += '<p class="small muted">盲検中のため、帳簿数と差異は表示されません (差異は承認画面でのみ表示されます)。</p>';
     }
+    if (editable && scanSupported() && d.lines && d.lines.length > 0) {
+      var scanLocIds = [];
+      d.lines.forEach(function (ln) {
+        if (scanLocIds.indexOf(ln.locationId) === -1) scanLocIds.push(ln.locationId);
+      });
+      h += '<div class="section-box"><h4>スキャンで数える</h4>' +
+        '<p><label>対象の保管場所</label> <select id="tkScanLoc">' +
+        optionsHtml(scanLocIds, function (id) { return id; }, function (id) { return locationLabel(id); }, '') +
+        '</select> <button class="btn" type="button" id="tkScanStart">スキャンで数える</button></p>' +
+        '<p class="small muted">バーコードを連続スキャンすると、選んだ場所の実数が 1 ずつ増えます (複数ロットは期限の早い行へ)。</p></div>';
+    }
     if (!d.lines || d.lines.length === 0) {
       h += '<p class="muted">対象の在庫がありません。</p>';
     } else {
@@ -2282,6 +2801,10 @@ function renderStocktakeDetail(t) {
     h += '</div>';
     box.innerHTML = h;
     renderMaintFormNote();
+    var tkScanStart = el('tkScanStart');
+    if (tkScanStart) tkScanStart.onclick = function () {
+      openStocktakeScanner(t, d, Number(el('tkScanLoc').value));
+    };
     var btns = box.querySelectorAll('button[data-count-line]');
     for (var i = 0; i < btns.length; i++) {
       btns[i].onclick = function () {
@@ -2295,6 +2818,128 @@ function renderStocktakeDetail(t) {
     }
   }).catch(function (e) {
     box.innerHTML = msgHtml('error', errMsg(e));
+  });
+}
+
+/* 棚卸しスキャンカウント: 選んだ保管場所で連続スキャンし、受理のたびに
+   その商品 × 場所の明細行 (複数ロットは期限の早い行) の実数を +1 する。
+   保存は既存の実数更新 API へ絶対値を直列化して送り、閉じる前に必ず flush する。
+   集計の規則は src/lib/scan-core.ts の createScanCounter と同じ。
+   盲検でも使える (ここで出すのは数えた数量だけで、帳簿数は一切扱わない)。 */
+function openStocktakeScanner(t, detail, locationId) {
+  var lines = detail.lines || [];
+  var countedVals = {}; /* lineId -> 現在の実数 (絶対値) */
+  var savedVals = {}; /* lineId -> サーバーへ保存できた実数 */
+  var scheduled = {}; /* lineId -> 保存ランがキュー済みか */
+  var baseVals = {}; /* lineId -> 開始時点の countedQuantity (null = 未入力) */
+  lines.forEach(function (ln) { baseVals[ln.id] = ln.countedQuantity; });
+  var recentByProduct = {}; /* productId -> { name, count, at } */
+  var recentOrder = [];
+  var saveQueue = Promise.resolve();
+  var saving = 0;
+  var saveError = '';
+  var sessionApi = null;
+
+  function currentCounted(line) {
+    if (countedVals[line.id] !== undefined) return countedVals[line.id];
+    return line.countedQuantity === null || line.countedQuantity === undefined ? 0 : line.countedQuantity;
+  }
+  function refreshSync() { if (sessionApi) sessionApi.refreshPanel(); }
+  /* 保存は直列化し、実行時点で最新の実数を読む (連続スキャンの PUT を間引く)。
+     取り消しで未入力に戻った行や、保存済みと同値の行は送らない。 */
+  function enqueueSave(lineId) {
+    if (scheduled[lineId]) return;
+    scheduled[lineId] = true;
+    saving++;
+    refreshSync();
+    saveQueue = saveQueue.then(function () {
+      delete scheduled[lineId];
+      var value = countedVals[lineId];
+      if (value === undefined || savedVals[lineId] === value ||
+          (savedVals[lineId] === undefined && baseVals[lineId] === value)) {
+        saving--;
+        refreshSync();
+        return;
+      }
+      return api('/api/v1/stocktakes/' + detail.id + '/lines/' + lineId, { method: 'PUT', body: { countedQuantity: value } })
+        .then(function () {
+          savedVals[lineId] = value;
+          saveError = '';
+        })
+        .catch(function (e) { saveError = errMsg(e); })
+        .then(function () {
+          saving--;
+          refreshSync();
+        });
+    });
+  }
+  function sessionTotal() {
+    var total = 0;
+    for (var pid in recentByProduct) total += recentByProduct[pid].count;
+    return total;
+  }
+
+  openScanner({
+    title: '棚卸しスキャン',
+    continuous: true,
+    onOpen: function (api_) { sessionApi = api_; },
+    panelTitle: function () {
+      return locationLabel(locationId) + ' — 合計 ' + sessionTotal() + ' 件';
+    },
+    syncHtml: function () {
+      if (saveError) return '<span class="scan-sync error">保存エラー</span>';
+      if (saving > 0) return '<span class="scan-sync saving">同期中…</span>';
+      return '<span class="scan-sync">保存済み</span>';
+    },
+    renderPanel: function () {
+      if (recentOrder.length === 0) {
+        return '<div class="scan-empty">まだ読み取っていません。バーコードを枠内に入れてください。</div>';
+      }
+      var h = '<div class="scan-recent">';
+      for (var i = recentOrder.length - 1; i >= 0; i--) {
+        var r = recentByProduct[recentOrder[i]];
+        if (!r || r.count <= 0) continue;
+        h += '<div class="scan-recent-row"><span class="scan-recent-name">' + esc(r.name) + '</span>' +
+          '<span class="scan-recent-qty">× ' + r.count + '</span>' +
+          '<span class="scan-recent-time">' + scanTimeText(r.at) + '</span></div>';
+      }
+      return h + '</div>';
+    },
+    onCode: function (code, format, api_) {
+      var p = productByBarcode(code);
+      if (!p) return 'unknown';
+      var line = scanPickLine(lines, p.id, locationId);
+      if (!line) {
+        api_.setStatus('対象外: ' + p.sku + ' ' + p.name + ' はこの場所の棚卸し対象にありません');
+        return 'out';
+      }
+      countedVals[line.id] = currentCounted(line) + 1;
+      enqueueSave(line.id);
+      if (!recentByProduct[p.id]) {
+        recentByProduct[p.id] = { name: p.sku + ' ' + p.name, count: 0, at: Date.now() };
+        recentOrder.push(p.id);
+      }
+      recentByProduct[p.id].count++;
+      recentByProduct[p.id].at = Date.now();
+      api_.pushUndo(function () {
+        var cur = countedVals[line.id] === undefined ? currentCounted(line) : countedVals[line.id];
+        var nv = Math.max(0, cur - 1);
+        /* 未入力だった行を未保存のまま 0 へ戻す取り消しは未入力へ戻す。
+           一度保存した行は 0 を送って戻す (実数 API は null を受け付けない) */
+        if (nv === 0 && baseVals[line.id] === null && savedVals[line.id] === undefined) {
+          delete countedVals[line.id];
+        } else {
+          countedVals[line.id] = nv;
+          enqueueSave(line.id);
+        }
+        if (recentByProduct[p.id]) recentByProduct[p.id].count--;
+        api_.refreshPanel();
+      });
+      api_.refreshPanel();
+      return 'ok';
+    },
+    onBeforeClose: function () { return saveQueue; },
+    onClose: function () { renderStocktakeDetail(t); },
   });
 }
 
