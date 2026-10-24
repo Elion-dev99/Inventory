@@ -462,4 +462,128 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .chart-wrap { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; overflow-x: auto; }
 .chart-legend { display: flex; gap: 1.25rem; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.5rem; }
 .chart-legend .sw { display: inline-block; width: 0.8rem; height: 0.8rem; border-radius: 3px; margin-right: 0.35rem; vertical-align: -0.08rem; }
+
+/* ---- 在庫一覧: 上部固定ツールバーと絞り込みチップ ---- */
+.sticky-bar {
+  position: sticky;
+  top: calc(3.1rem + env(safe-area-inset-top));
+  z-index: 30;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow);
+  padding: 0.6rem 0.7rem;
+  margin-bottom: 0.85rem;
+}
+.sticky-bar .toolbar { margin-bottom: 0.55rem; }
+.sticky-bar .toolbar:last-child { margin-bottom: 0; }
+.chips { display: flex; gap: 0.45rem; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.chips::-webkit-scrollbar { display: none; }
+.chip {
+  flex: none;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--fg);
+  border-radius: 980px;
+  padding: 0.42rem 0.95rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.chip:active { transform: scale(0.96); }
+.chip.active { background: var(--accent); border-color: transparent; color: #fff; }
+
+/* ---- 在庫一覧: 行タップと数量の強調 ---- */
+.stocks-table tbody tr { cursor: pointer; }
+.stocks-table td { padding-top: 0.85rem; padding-bottom: 0.85rem; }
+.stock-qty { font-size: 1.15rem; font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
+th.stock-qty-head { text-align: right; }
+
+/* ---- シート先頭の対象サマリ (在庫行タップ時) ---- */
+.sheet-head { padding: 0.95rem 1rem 0.55rem; border-bottom: 1px solid var(--line); }
+.sheet-head .sh-name { font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; }
+.sheet-head .sh-meta { color: var(--muted); font-size: 0.85rem; font-weight: 500; margin-top: 0.1rem; }
+
+/* ---- ダッシュボード「やること」タスクカード ---- */
+.task-list { display: grid; gap: 0.6rem; margin-bottom: 0.4rem; }
+.task-card {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  padding: 0.9rem 1.05rem;
+  background: var(--surface);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  color: var(--fg);
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+.task-card:active { transform: scale(0.98); }
+.task-card .row-icon { width: 36px; height: 36px; border-radius: 10px; }
+.count-badge {
+  flex: none;
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 0.5rem;
+  border-radius: 980px;
+  background: #d70015;
+  color: #fff;
+  font-size: 0.95rem;
+  font-weight: 700;
+  display: inline-grid;
+  place-items: center;
+  font-variant-numeric: tabular-nums;
+}
+.count-badge.amber { background: #d97a06; }
+
+/* ---- 数量ステッパー (大きな − / ＋ と中央の数字) ---- */
+.stepper { display: flex; align-items: stretch; gap: 0.5rem; margin-top: 0.25rem; }
+.stepper-btn {
+  flex: none;
+  width: 52px;
+  min-height: 52px;
+  border-radius: 14px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--accent);
+  font-size: 1.55rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: background 0.12s ease, transform 0.1s ease;
+}
+.stepper-btn:active { background: var(--control); transform: scale(0.95); }
+form.grid .stepper input { margin-top: 0; flex: 1; min-width: 0; text-align: center; font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ---- フォームの確定ボタン固定バー (ドックの上) ---- */
+.sticky-actions {
+  grid-column: 1 / -1;
+  position: sticky;
+  bottom: calc(5rem + env(safe-area-inset-bottom));
+  z-index: 20;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.6rem;
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--glass-border);
+  border-top: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+}
+.sticky-actions .btn { flex: 1; padding: 0.8rem 1.25rem; font-size: 1.02rem; font-weight: 600; text-align: center; }
 `;
