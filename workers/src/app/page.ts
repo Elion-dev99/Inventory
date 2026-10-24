@@ -36,6 +36,12 @@ export const APP_HTML = `<!doctype html>
   <p><a class="btn" href="/auth/login">Google でログイン</a></p>
 </div>
 
+<div id="errorBox" class="center-box" style="display:none">
+  <h2>読み込めませんでした</h2>
+  <p class="muted">通信に失敗しました。接続を確認して、もう一度お試しください。</p>
+  <p><button class="btn" id="bootRetryBtn">再試行</button></p>
+</div>
+
 <div id="noAssignBox" class="center-box" style="display:none">
   <h2>権限が付与されていません</h2>
   <p class="muted">ログインはできていますが、このアカウントにはまだロールが割り当てられていません。管理者にロール付与を依頼してください。</p>

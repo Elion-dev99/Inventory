@@ -402,6 +402,7 @@ function lotLabel(id) {
   if (m) { for (var i = 0; i < m.lots.length; i++) { if (m.lots[i].id === id) return m.lots[i].lotCode; } }
   return 'ロット#' + id;
 }
+/* 場所ラベル: 倉庫 / 親 / … / 自身 の階層パス + コード (0015 で階層対応) */
 function locationLabel(id) {
   var m = state.master;
   if (m) {
@@ -410,9 +411,19 @@ function locationLabel(id) {
         var loc = m.locations[i];
         var wh = '';
         for (var j = 0; j < m.warehouses.length; j++) {
-          if (m.warehouses[j].id === loc.warehouseId) wh = m.warehouses[j].name + ' / ';
+          if (m.warehouses[j].id === loc.warehouseId) wh = m.warehouses[j].name;
         }
-        return wh + loc.name + ' (' + loc.code + ')';
+        var names = [loc.name];
+        var parentId = loc.parentId;
+        var guard = 0;
+        while (parentId && guard < 10) {
+          var parent = locationOf(parentId);
+          if (!parent) break;
+          names.unshift(parent.name);
+          parentId = parent.parentId;
+          guard++;
+        }
+        return (wh ? wh + ' / ' : '') + names.join(' / ') + ' (' + loc.code + ')';
       }
     }
   }
@@ -501,6 +512,11 @@ var VIEWS = [
   { id: 'audit', label: '監査ログ', visible: function () { return can('admin.users'); } },
   { id: 'announcements', label: 'お知らせ', visible: function () { return feat('announcements'); } },
   { id: 'announceAdmin', label: 'お知らせ管理', visible: function () { return can('announcements.write') && feat('announcements'); } },
+  { id: 'returns', label: '返品', visible: function () { return can('movements.consume'); } },
+  { id: 'disposal', label: '廃棄', visible: function () { return can('movements.consume'); } },
+  { id: 'reservations', label: '引当', visible: function () { return can('movements.consume'); } },
+  { id: 'picking', label: 'ピッキング', visible: function () { return can('movements.consume') || can('movements.transfer'); } },
+  { id: 'setup', label: 'はじめに', visible: function () { return (can('admin.users') || can('master.write')) && can('master.read'); } },
 ];
 function viewDef(id) { for (var i = 0; i < VIEWS.length; i++) { if (VIEWS[i].id === id) return VIEWS[i]; } return null; }
 function viewVisible(id) { var v = viewDef(id); return v ? v.visible() : false; }
@@ -534,8 +550,8 @@ function icon(name, size) {
 }
 
 /* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
-var RECORD_VIEWS = ['inbound', 'consume', 'transfer'];
-var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin'];
+var RECORD_VIEWS = ['inbound', 'consume', 'transfer', 'returns', 'disposal'];
+var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup'];
 function tabOf(view) {
   if (view === 'dashboard') return 'dashboard';
   if (view === 'stocks') return 'stocks';
@@ -590,6 +606,8 @@ var SHEET_ITEMS = [
   { view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する', maintKeys: ['inbound'] },
   { view: 'consume', icon: 'out', color: '#ff9500', label: '消費する', maintKeys: ['outbound'] },
   { view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する', maintKeys: ['transfers'] },
+  { view: 'returns', icon: 'in', color: '#30b0c7', label: '返品する', maintKeys: ['inbound'] },
+  { view: 'disposal', icon: 'out', color: '#ff3b30', label: '廃棄する', maintKeys: ['outbound'] },
   { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫 (申請・承認)', maintKeys: ['outbound'] },
 ];
 function openSheet() {
@@ -893,12 +911,15 @@ function loadAnnounceAdmin() {
 
 /* ---- その他 (iOS 設定風グループリスト) ---- */
 var MORE_ITEMS = [
+  { view: 'setup', icon: 'clip', color: '#34c759', label: 'はじめに (セットアップ)', maintKeys: [] },
   { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理', maintKeys: ['master_products', 'master_locations', 'suppliers', 'csv_import'] },
   { view: 'purchases', icon: 'cart', color: '#5e5ce6', label: '発注', maintKeys: ['purchase_orders'] },
   { view: 'analytics', icon: 'chart', color: '#0091ff', label: '分析レポート', maintKeys: ['analytics'] },
   { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し', maintKeys: ['stocktakes'] },
   { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート', maintKeys: ['alerts'] },
   { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫', maintKeys: ['outbound'] },
+  { view: 'reservations', icon: 'clip', color: '#30b0c7', label: '引当', maintKeys: ['outbound'] },
+  { view: 'picking', icon: 'list', color: '#34c759', label: 'ピッキング', maintKeys: ['outbound'] },
   { view: 'announcements', icon: 'mega', color: '#ff9500', label: 'お知らせ', maintKeys: [] },
   { view: 'announceAdmin', icon: 'mega', color: '#64d2ff', label: 'お知らせ管理', maintKeys: [] },
   { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ', maintKeys: [] },
@@ -956,6 +977,11 @@ function showView(id) {
     audit: loadAudit,
     announcements: loadAnnouncements,
     announceAdmin: loadAnnounceAdmin,
+    returns: loadReturns,
+    disposal: loadDisposal,
+    reservations: loadReservations,
+    picking: loadPicking,
+    setup: loadSetup,
     more: loadMore,
   };
   var fn = loaders[id];
@@ -994,6 +1020,10 @@ function loadDashboard() {
   jobs.push(can('purchases.read') && feat('purchase_orders')
     ? getJson('/api/v1/purchase-orders').catch(function () { return null; })
     : Promise.resolve(null));
+  /* セットアップ進捗 (管理者のみ)。未完了の間だけ「はじめに」カードを出す */
+  jobs.push(viewVisible('setup')
+    ? getJson('/api/v1/setup/status').catch(function () { return null; })
+    : Promise.resolve(null));
   Promise.all(jobs).then(function (r) {
     var alerts = r[0];
     var stocks = r[1];
@@ -1002,6 +1032,7 @@ function loadDashboard() {
     var suggestions = r[4];
     var annData = r[5];
     var orders = r[6];
+    var setupData = r[7];
     var h = '<h2>ダッシュボード</h2>';
     var active = null;
     for (var i = 0; i < stocktakes.length; i++) {
@@ -1042,6 +1073,14 @@ function loadDashboard() {
         (latest ? esc(latest.title) : 'お知らせはありません') +
         '</span></span><span class="chev">' + icon('chevR', 18) + '</span></button>';
     }
+    /* セットアップカード: 管理者に未完了の間だけ出す */
+    if (setupData && !setupData.complete) {
+      h += '<button class="notice-card" id="dashSetup">' +
+        '<span class="row-icon" style="background:#34c759">' + icon('clip', 19) + '</span>' +
+        '<span class="notice-main"><span class="notice-head">はじめに</span>' +
+        '<span class="notice-latest">セットアップ ' + setupData.doneCount + ' / ' + setupData.totalCount + '</span></span>' +
+        '<span class="chev">' + icon('chevR', 18) + '</span></button>';
+    }
     /* 「やること」タスクカード: 件数バッジ付きで、タップすると該当画面へ */
     var tasks = [];
     if (negApprovals) {
@@ -1061,6 +1100,11 @@ function loadDashboard() {
       var overdueN = 0;
       for (var oi = 0; oi < orders.length; oi++) { if (orders[oi].overdue) overdueN++; }
       if (overdueN > 0) tasks.push({ view: 'purchases', icon: 'cart', color: '#ff3b30', label: '納期超過の発注', count: overdueN, amber: false });
+      var genDrafts = 0;
+      for (var gi = 0; gi < orders.length; gi++) {
+        if (orders[gi].status === 'draft' && orders[gi].source && orders[gi].source !== 'manual') genDrafts++;
+      }
+      if (genDrafts > 0) tasks.push({ view: 'purchases', icon: 'cart', color: '#30b0c7', label: 'テンプレート生成の下書き', count: genDrafts, amber: true });
     }
     if (tasks.length > 0) {
       h += '<h3>やること</h3><div class="task-list">';
@@ -1118,6 +1162,8 @@ function loadDashboard() {
     el('view').innerHTML = h;
     var da = el('dashAnnounce');
     if (da) da.onclick = function () { showView('announcements'); };
+    var dsu = el('dashSetup');
+    if (dsu) dsu.onclick = function () { showView('setup'); };
     var b = el('dashToAlerts');
     if (b) b.onclick = function () { showView('alerts'); };
     var tcs = el('view').querySelectorAll('.task-card[data-task]');
@@ -1136,6 +1182,48 @@ function loadDashboard() {
     }
   }).catch(function (e) {
     el('view').innerHTML = '<h2>ダッシュボード</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+
+/* ---------------- はじめに (初期セットアップ) ---------------- */
+/* 進捗は GET /api/v1/setup/status の実データ判定。そのまま該当画面へ誘導する */
+function loadSetup() {
+  viewLoading('はじめに', 'rows');
+  getJson('/api/v1/setup/status').then(function (d) {
+    var defs = [
+      { key: 'locations', label: '保管場所を登録', detail: '現在 ' + d.counts.locations + ' 件', view: 'master', btn: 'マスタ管理' },
+      { key: 'products', label: '商品を登録', detail: '現在 ' + d.counts.products + ' 件', view: 'master', btn: 'マスタ管理' },
+      { key: 'members', label: 'ユーザーを2人以上割り当てる', detail: '現在 ' + d.counts.members + ' 人', href: '/admin/permissions', btn: '権限管理' },
+      { key: 'features', label: '機能設定を確認', detail: '使う機能のオン/オフ', href: '/admin/permissions', btn: '権限管理' },
+    ];
+    var h = '<h2>はじめに</h2>';
+    h += '<p class="muted">セットアップ ' + d.doneCount + ' / ' + d.totalCount + (d.complete ? ' — 完了しています' : '') + '</p>';
+    h += '<div class="group">';
+    defs.forEach(function (def) {
+      var done = !!d.items[def.key];
+      h += '<div class="group-row static"><span class="row-label">' + esc(def.label) +
+        ' <small class="muted">' + esc(def.detail) + '</small></span>' +
+        (done ? '<span class="badge badge-ok">完了</span>' : '<span class="badge">未完了</span>');
+      if (!done) {
+        if (def.view) h += '<button class="btn small secondary" data-setup-view="' + def.view + '">' + esc(def.btn) + '</button>';
+        else h += '<a class="btn small secondary" href="' + def.href + '">' + esc(def.btn) + '</a>';
+      }
+      h += '</div>';
+    });
+    h += '</div>';
+    h += '<h3>CSV テンプレート</h3><div class="group">';
+    h += '<a class="group-row" href="/api/v1/setup/template/products.csv"><span class="row-label">商品テンプレート <small class="muted">sku,name,unit,requires_expiry,unit_cost</small></span><span class="chev">' + icon('chevR', 18) + '</span></a>';
+    h += '<div class="group-row static"><span class="row-label"><small class="muted">商品はマスタ管理の「商品 CSV インポート」から取り込めます。</small></span></div>';
+    h += '<a class="group-row" href="/api/v1/setup/template/locations.csv"><span class="row-label">保管場所テンプレート <small class="muted">warehouse_code,code,name,parent_code</small></span><span class="chev">' + icon('chevR', 18) + '</span></a>';
+    h += '<div class="group-row static"><span class="row-label"><small class="muted">保管場所はマスタ管理から登録します (parent_code は階層の親コード)。</small></span></div>';
+    h += '</div>';
+    el('view').innerHTML = h;
+    var btns = el('view').querySelectorAll('button[data-setup-view]');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].onclick = function () { showView(this.getAttribute('data-setup-view')); };
+    }
+  }).catch(function (e) {
+    el('view').innerHTML = '<h2>はじめに</h2>' + msgHtml('error', errMsg(e));
   });
 }
 
@@ -1776,10 +1864,13 @@ function stockRowHtml(s, idx) {
   var p = productOf(s.productId);
   var low = s.quantity < 0 || stockIsLow(s);
   var thumb = p && p.imageKey ? '<img class="thumb" src="/api/v1/products/' + p.id + '/image" alt="" loading="lazy">' : '';
-  return '<tr data-stock="' + idx + '"><td>' + thumb + esc(productLabel(s.productId)) + '</td>' +
+  /* フリー在庫は引当がある商品の行だけに併記する (サーバーが freeQuantity を付けた行のみ) */
+  var freeNote = (s.freeQuantity !== null && s.freeQuantity !== undefined)
+    ? '<div class="free-note">フリー ' + s.freeQuantity + '</div>' : '';
+  return '<tr data-stock="' + idx + '"><td>' + thumb + esc(productLabel(s.productId)) + (p && p.isBundle ? ' <span class="badge">セット</span>' : '') + '</td>' +
     '<td>' + esc(s.lotCode) + '</td>' +
     '<td>' + esc(locationLabel(s.locationId)) + '</td>' +
-    '<td class="stock-qty' + (low ? ' qty-neg' : '') + '">' + s.quantity + '</td>' +
+    '<td class="stock-qty' + (low ? ' qty-neg' : '') + '">' + s.quantity + freeNote + '</td>' +
     '<td>' + expiryBadge(s.expiryDate, p ? p.expiryAlertDays : null) + '</td></tr>';
 }
 /* ケース換算の注記 (入数がある商品のみ)。例: 36個 (3ケース) / 38個 (3ケース＋2個) */
@@ -1794,11 +1885,14 @@ function caseNoteHtml(quantity, p) {
 function openStockSheet(s) {
   var p = productOf(s.productId);
   var h = '<div class="sheet-head"><div class="sh-name">' + (p && p.imageKey ? '<img class="thumb" src="/api/v1/products/' + p.id + '/image" alt="" loading="lazy">' : '') + esc(productLabel(s.productId)) + '</div>' +
-    '<div class="sh-meta">ロット ' + esc(s.lotCode) + ' ・ ' + esc(locationLabel(s.locationId)) + ' ・ 現在 ' + s.quantity + (p ? ' ' + esc(p.unit) : '') + caseNoteHtml(s.quantity, p) + '</div></div>';
+    '<div class="sh-meta">ロット ' + esc(s.lotCode) + ' ・ ' + esc(locationLabel(s.locationId)) + ' ・ 現在 ' + s.quantity + (p ? ' ' + esc(p.unit) : '') + caseNoteHtml(s.quantity, p) +
+    (s.freeQuantity !== null && s.freeQuantity !== undefined ? ' ・ フリー ' + s.freeQuantity : '') + '</div></div>';
   var items = [];
   if (viewVisible('inbound')) items.push({ view: 'inbound', icon: 'in', color: '#34c759', label: '入庫する' });
   if (viewVisible('consume')) items.push({ view: 'consume', icon: 'out', color: '#ff9500', label: '消費する' });
   if (viewVisible('transfer')) items.push({ view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する' });
+  if (viewVisible('returns')) items.push({ view: 'returns', icon: 'in', color: '#30b0c7', label: '返品する' });
+  if (viewVisible('disposal')) items.push({ view: 'disposal', icon: 'out', color: '#ff3b30', label: '廃棄する' });
   for (var i = 0; i < items.length; i++) {
     var it = items[i];
     h += '<button class="sheet-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 18) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
@@ -1823,6 +1917,63 @@ function openStockSheet(s) {
     };
   }
 }
+/* ---------------- 在庫の保存検索 (端末の localStorage のみ、最大 10 件) ---------------- */
+var SAVED_SEARCH_KEY = 'stockSavedSearches.v1';
+var SAVED_SEARCH_MAX = 10;
+function loadSavedSearches() {
+  try {
+    var raw = localStorage.getItem(SAVED_SEARCH_KEY);
+    var arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) { return []; }
+}
+function storeSavedSearches(arr) {
+  try { localStorage.setItem(SAVED_SEARCH_KEY, JSON.stringify(arr)); } catch (e) {}
+}
+function renderSavedSearches(applyFn) {
+  var box = el('stSaved');
+  if (!box) return;
+  var arr = loadSavedSearches();
+  var h = '';
+  for (var i = 0; i < arr.length; i++) {
+    h += '<span class="saved-wrap"><button type="button" class="chip" data-saved="' + i + '">' + esc(arr[i].name) + '</button>' +
+      '<button type="button" class="saved-del" data-saved-del="' + i + '" aria-label="保存検索を削除">×</button></span>';
+  }
+  box.innerHTML = h;
+  var applyBtns = box.querySelectorAll('button[data-saved]');
+  for (var ai = 0; ai < applyBtns.length; ai++) {
+    applyBtns[ai].onclick = function () {
+      var item = loadSavedSearches()[Number(this.getAttribute('data-saved'))];
+      if (item) applyFn(item);
+    };
+  }
+  var delBtns = box.querySelectorAll('button[data-saved-del]');
+  for (var di = 0; di < delBtns.length; di++) {
+    delBtns[di].onclick = function () {
+      var list = loadSavedSearches();
+      list.splice(Number(this.getAttribute('data-saved-del')), 1);
+      storeSavedSearches(list);
+      renderSavedSearches(applyFn);
+    };
+  }
+}
+/* セット品の組立可能数 (在庫一覧の下部セクション) */
+function renderStockBundles() {
+  var box = el('stBundles');
+  if (!box) return;
+  api('/api/v1/bundles').then(function (rows) {
+    if (!rows || rows.length === 0) { box.innerHTML = ''; return; }
+    var h = '<h3>セット品</h3><div class="table-wrap"><table><thead><tr><th>商品</th><th>組立可能数</th><th>構成品</th></tr></thead><tbody>';
+    for (var i = 0; i < rows.length; i++) {
+      var b = rows[i];
+      var comps = (b.components || []).map(function (cm) { return esc(productLabel(cm.productId)) + ' ×' + cm.quantity; }).join('、');
+      h += '<tr><td>' + esc(b.sku + ' ' + b.name) + '</td><td class="stock-qty">' + b.assemblable + '</td><td class="small muted">' + comps + '</td></tr>';
+    }
+    h += '</tbody></table></div>';
+    box.innerHTML = h;
+  }).catch(function () { box.innerHTML = ''; });
+}
+
 function loadStocks() {
   var chipsHtml = '<div class="chips" id="stChips">';
   for (var ci = 0; ci < STOCK_CHIPS.length; ci++) {
@@ -1838,11 +1989,13 @@ function loadStocks() {
     '<div><label>倉庫</label><select id="stWh"><option value="">すべて</option></select></div>' +
     '<div><label>保管場所</label><select id="stLoc"><option value="">すべて</option></select></div>' +
     '<div><button class="btn" id="stReload">再読み込み</button></div>' +
+    '<div><label>&nbsp;</label><button class="btn secondary" id="stSaveSearch" type="button">条件を保存</button></div>' +
     (feat('csv') ? '<div><label>&nbsp;</label><a class="btn secondary" href="/api/v1/stocks.csv">CSV ダウンロード</a></div>' : '') +
     '</div>' +
     chipsHtml +
+    '<div class="chips" id="stSaved"></div>' +
     '</div>' +
-    '<div id="stMsg"></div><div id="stBody">' + skeletonRows() + '</div>';
+    '<div id="stMsg"></div><div id="stBody">' + skeletonRows() + '</div><div id="stBundles"></div>';
   try {
     var pq = sessionStorage.getItem('pendingStockQuery');
     if (pq) { el('stQ').value = pq; sessionStorage.removeItem('pendingStockQuery'); }
@@ -1859,6 +2012,30 @@ function loadStocks() {
       fetchStocks();
     };
   }
+  var applySavedSearch = function (item) {
+    el('stQ').value = item.q || '';
+    stocksChip = item.chip || 'all';
+    var all = el('stChips').querySelectorAll('button[data-chip]');
+    for (var sk = 0; sk < all.length; sk++) {
+      if (all[sk].getAttribute('data-chip') === stocksChip) all[sk].classList.add('active');
+      else all[sk].classList.remove('active');
+    }
+    fetchStocks();
+  };
+  renderSavedSearches(applySavedSearch);
+  var saveSearchBtn = el('stSaveSearch');
+  if (saveSearchBtn) saveSearchBtn.onclick = function () {
+    var arr = loadSavedSearches();
+    if (arr.length >= SAVED_SEARCH_MAX) {
+      el('stMsg').innerHTML = msgHtml('error', '保存検索は最大 ' + SAVED_SEARCH_MAX + ' 件です。不要なものを削除してください。');
+      return;
+    }
+    var name = window.prompt('検索条件の名前');
+    if (!name) return;
+    arr.push({ name: name, q: el('stQ').value || '', chip: stocksChip });
+    storeSavedSearches(arr);
+    renderSavedSearches(applySavedSearch);
+  };
   ensureMaster().then(function (m) {
     el('stWh').innerHTML = '<option value="">すべて</option>' + optionsHtml(m.warehouses, function (w) { return w.id; }, function (w) { return w.name; }, '');
     var fillLocs = function () {
@@ -1898,6 +2075,7 @@ function loadStocks() {
       });
     };
     fetchStocks();
+    renderStockBundles();
     if (state.flash) { el('stMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
   });
   function fetchStocks() {
@@ -2019,7 +2197,8 @@ function loadConsume() {
     var h = '<h2>消費 (FEFO: 期限の早いロットから自動で引きます)</h2><div class="mnt-form-note" id="mntNoteConsume" style="display:none"></div><div id="coMsg"></div>' +
       '<form class="grid" id="coForm">' +
       '<div><label>商品</label><select id="coProduct" required>' +
-      optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
+      optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name + (p.isBundle ? ' (セット)' : ''); }, '') + '</select>' +
+      '<div class="small muted" id="coBundleNote"></div>' +
       (scanSupported() ? '<div style="margin-top:0.4rem;"><button class="btn small secondary" type="button" id="coScan">スキャンで商品を選ぶ</button></div>' : '') + '</div>' +
       '<div><label>保管場所 (任意: 指定しない場合は全場所から)</label><select id="coLocation">' +
       optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '', '指定しない') + '</select></div>' +
@@ -2041,6 +2220,19 @@ function loadConsume() {
     }
     var coScan = el('coScan');
     if (coScan) coScan.onclick = function () { openSheetScanner('coProduct', 'coQty', 'consume'); };
+    /* セット品を選んだら組立可能数を出す (消費は構成品へ展開される) */
+    var refreshBundleNote = function () {
+      var note = el('coBundleNote');
+      if (!note) return;
+      var p = productOf(Number(el('coProduct').value));
+      if (!p || !p.isBundle) { note.textContent = ''; return; }
+      note.textContent = 'セット品: 構成品を消費します';
+      api('/api/v1/products/' + p.id + '/bundle').then(function (b) {
+        if (el('coBundleNote')) el('coBundleNote').textContent = 'セット品: 組立可能数 ' + b.assemblable + ' (構成品を消費します)';
+      }).catch(function () {});
+    };
+    el('coProduct').onchange = refreshBundleNote;
+    refreshBundleNote();
     el('coForm').onsubmit = function (ev) {
       ev.preventDefault();
       var btn = el('coSubmit');
@@ -2055,6 +2247,26 @@ function loadConsume() {
       };
       var loc = el('coLocation').value;
       if (loc) body.locationId = Number(loc);
+      var selectedProduct = productOf(body.productId);
+      if (selectedProduct && selectedProduct.isBundle) {
+        api('/api/v1/movements/bundle-consumption', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
+          .then(function (r) {
+            var hh = msgHtml('success', 'セット品の消費を登録しました。') +
+              '<div class="table-wrap"><table><thead><tr><th>構成品</th><th>ロット</th><th>保管場所</th><th>数量</th></tr></thead><tbody>';
+            for (var bi = 0; bi < r.allocations.length; bi++) {
+              var ba = r.allocations[bi];
+              hh += '<tr><td>' + esc(productLabel(ba.productId)) + '</td><td>' + esc(lotLabel(ba.lotId)) + '</td><td>' + esc(locationLabel(ba.locationId)) + '</td><td>' + ba.quantity + '</td></tr>';
+            }
+            hh += '</tbody></table></div>';
+            el('coResult').innerHTML = hh;
+            btn.disabled = false;
+          })
+          .catch(function (e) {
+            el('coMsg').innerHTML = msgHtml('error', errMsg(e));
+            btn.disabled = false;
+          });
+        return;
+      }
       var ap = el('coApproval').value;
       if (ap) body.negativeApprovalId = Number(ap);
       api('/api/v1/movements/consumption', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
@@ -2153,6 +2365,163 @@ function loadTransfer() {
   });
 }
 
+/* ---------------- returns (返品) ---------------- */
+var REASON_CODE_OPTIONS = [
+  { value: 'damaged', label: '破損' },
+  { value: 'expired', label: '期限切れ' },
+  { value: 'defective', label: '不良' },
+  { value: 'other', label: 'その他' },
+];
+function reasonCodeSelectHtml(id) {
+  return '<select id="' + id + '" required>' +
+    optionsHtml(REASON_CODE_OPTIONS, function (o) { return o.value; }, function (o) { return o.label; }, '') + '</select>';
+}
+function loadReturns() {
+  viewLoading('返品', 'form');
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>返品</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var products = m.products.filter(function (p) { return !p.isBundle; });
+    var h = '<h2>返品 (社内から戻り)</h2><div class="mnt-form-note" id="mntNoteReturn" style="display:none"></div><div id="rtMsg"></div>' +
+      '<form class="grid" id="rtForm">' +
+      '<div><label>商品</label><select id="rtProduct" required>' +
+      optionsHtml(products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
+      (scanSupported() ? '<div style="margin-top:0.4rem;"><button class="btn small secondary" type="button" id="rtScan">スキャンで商品を選ぶ</button></div>' : '') + '</div>' +
+      '<div><label>保管場所</label><select id="rtLocation" required>' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+      '<div><label>ロット番号</label><input id="rtLot" type="text" required placeholder="例: LOT-2026-001"></div>' +
+      '<div><label>有効期限 (期限管理対象の商品は必須)</label><input id="rtExpiry" type="date"></div>' +
+      '<div><label>数量</label>' + qtyStepperHtml('rtQty') + '</div>' +
+      '<div><label>理由</label>' + reasonCodeSelectHtml('rtReasonCode') + '</div>' +
+      '<div><label>メモ</label><input id="rtReason" type="text" required></div>' +
+      '<div class="sticky-actions"><button class="btn" type="submit" id="rtSubmit">返品を登録</button></div>' +
+      '</form>';
+    el('view').innerHTML = h;
+    bindSteppers();
+    if (state.flash) { el('rtMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
+    setMaintFormNote('mntNoteReturn', ['inbound'], ['#rtSubmit']);
+    var rtPreset = takeFormPreset('returns');
+    if (rtPreset) {
+      if (rtPreset.productId) el('rtProduct').value = String(rtPreset.productId);
+      if (rtPreset.locationId) el('rtLocation').value = String(rtPreset.locationId);
+      if (rtPreset.lotId) {
+        var rtLot = lotOf(rtPreset.lotId);
+        if (rtLot) {
+          el('rtLot').value = rtLot.lotCode;
+          if (rtLot.expiryDate) el('rtExpiry').value = rtLot.expiryDate;
+        }
+      }
+    }
+    var rtScan = el('rtScan');
+    if (rtScan) rtScan.onclick = function () { openSheetScanner('rtProduct', 'rtQty', 'returns'); };
+    el('rtForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      var btn = el('rtSubmit');
+      btn.disabled = true;
+      el('rtMsg').innerHTML = '';
+      var body = {
+        locationId: Number(el('rtLocation').value),
+        productId: Number(el('rtProduct').value),
+        lotCode: el('rtLot').value,
+        quantity: Number(el('rtQty').value),
+        reasonCode: el('rtReasonCode').value,
+        reason: el('rtReason').value,
+      };
+      var exp = el('rtExpiry').value;
+      if (exp) body.expiryDate = exp;
+      api('/api/v1/movements/return', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
+        .then(function (r) {
+          el('rtMsg').innerHTML = msgHtml('success', '返品を登録しました。在庫ID: ' + r.stockId + ' / 現在数量: ' + r.quantity);
+          btn.disabled = false;
+        })
+        .catch(function (e) {
+          el('rtMsg').innerHTML = msgHtml('error', errMsg(e));
+          btn.disabled = false;
+        });
+    };
+  });
+}
+
+/* ---------------- disposal (廃棄) ---------------- */
+function loadDisposal() {
+  viewLoading('廃棄', 'form');
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>廃棄</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var products = m.products.filter(function (p) { return !p.isBundle; });
+    var h = '<h2>廃棄</h2><div class="mnt-form-note" id="mntNoteDisposal" style="display:none"></div><div id="dpMsg"></div>' +
+      '<form class="grid" id="dpForm">' +
+      '<div><label>商品</label><select id="dpProduct" required>' +
+      optionsHtml(products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select>' +
+      (scanSupported() ? '<div style="margin-top:0.4rem;"><button class="btn small secondary" type="button" id="dpScan">スキャンで商品を選ぶ</button></div>' : '') + '</div>' +
+      '<div><label>保管場所 (任意: 指定しない場合は全場所から)</label><select id="dpLocation">' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '', '指定しない') + '</select></div>' +
+      '<div><label>数量</label>' + qtyStepperHtml('dpQty') + '</div>' +
+      '<div><label>理由</label>' + reasonCodeSelectHtml('dpReasonCode') + '</div>' +
+      '<div><label>メモ</label><input id="dpReason" type="text" required></div>' +
+      '<div class="sticky-actions"><button class="btn danger" type="submit" id="dpSubmit">廃棄内容を確認</button></div>' +
+      '</form><div id="dpConfirm"></div><div id="dpResult"></div>';
+    el('view').innerHTML = h;
+    bindSteppers();
+    if (state.flash) { el('dpMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
+    setMaintFormNote('mntNoteDisposal', ['outbound'], ['#dpSubmit']);
+    var dpPreset = takeFormPreset('disposal');
+    if (dpPreset) {
+      if (dpPreset.productId) el('dpProduct').value = String(dpPreset.productId);
+      if (dpPreset.locationId) el('dpLocation').value = String(dpPreset.locationId);
+    }
+    var dpScan = el('dpScan');
+    if (dpScan) dpScan.onclick = function () { openSheetScanner('dpProduct', 'dpQty', 'disposal'); };
+    /* 廃棄は確定前に確認ステップを挟む (数量と対象を再表示して実行する) */
+    el('dpForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      el('dpMsg').innerHTML = '';
+      el('dpResult').innerHTML = '';
+      var body = {
+        productId: Number(el('dpProduct').value),
+        quantity: Number(el('dpQty').value),
+        reasonCode: el('dpReasonCode').value,
+        reason: el('dpReason').value,
+      };
+      var loc = el('dpLocation').value;
+      if (loc) body.locationId = Number(loc);
+      var p = productOf(body.productId);
+      var box = el('dpConfirm');
+      box.innerHTML = '<div class="section-box"><h3>廃棄の確認</h3>' +
+        '<p>' + esc(p ? p.sku + ' ' + p.name : '商品#' + body.productId) + ' を ' + body.quantity + (p ? ' ' + esc(p.unit) : '') + ' 廃棄します。</p>' +
+        '<p class="small muted">理由: ' + esc(reasonCodeLabel(body.reasonCode)) + ' / ' + esc(body.reason) +
+        (body.locationId ? ' / 場所: ' + esc(locationLabel(body.locationId)) : ' / 場所: 全場所 (FEFO)') + '</p>' +
+        '<p><button class="btn danger" type="button" id="dpExec">廃棄を実行</button> ' +
+        '<button class="btn secondary" type="button" id="dpBack">戻る</button></p></div>';
+      el('dpBack').onclick = function () { box.innerHTML = ''; };
+      el('dpExec').onclick = function () {
+        var execBtn = el('dpExec');
+        execBtn.disabled = true;
+        api('/api/v1/movements/disposal', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
+          .then(function (r) {
+            box.innerHTML = '';
+            var hh = msgHtml('success', '廃棄を登録しました。') +
+              '<div class="table-wrap"><table><thead><tr><th>ロット</th><th>保管場所</th><th>数量</th></tr></thead><tbody>';
+            for (var i = 0; i < r.allocations.length; i++) {
+              var a = r.allocations[i];
+              hh += '<tr><td>' + esc(lotLabel(a.lotId)) + '</td><td>' + esc(locationLabel(a.locationId)) + '</td><td>' + a.quantity + '</td></tr>';
+            }
+            hh += '</tbody></table></div>';
+            el('dpResult').innerHTML = hh;
+          })
+          .catch(function (e) {
+            el('dpMsg').innerHTML = msgHtml('error', errMsg(e));
+            execBtn.disabled = false;
+          });
+      };
+    };
+  });
+}
+
 /* ---------------- history ---------------- */
 var MOVEMENT_TYPE_LABELS = {
   IN: ['入庫', 'badge-ok'],
@@ -2161,7 +2530,11 @@ var MOVEMENT_TYPE_LABELS = {
   TRANSFER_OUT: ['移動 (出)', ''],
   ADJUST: ['調整', 'badge-warn'],
   CANCEL: ['取消', 'badge-danger'],
+  RETURN: ['返品', 'badge-ok'],
+  DISPOSAL: ['廃棄', 'badge-danger'],
 };
+var REASON_CODE_LABELS = { damaged: '破損', expired: '期限切れ', defective: '不良', other: 'その他' };
+function reasonCodeLabel(code) { return code ? (REASON_CODE_LABELS[code] || code) : ''; }
 function loadHistory() {
   viewLoading('入出庫履歴', 'list');
   ensureMaster().then(function () {
@@ -2182,7 +2555,7 @@ function loadHistory() {
           '<td>' + esc(locationLabel(r.locationId)) + '</td>' +
           '<td>' + (r.quantityChange > 0 ? '<span class="qty-pos">+' + r.quantityChange + '</span>' : '<span class="qty-neg">' + r.quantityChange + '</span>') + '</td>' +
           '<td>' + r.quantityBefore + ' → ' + r.quantityAfter + '</td>' +
-          '<td>' + esc([r.department, r.purpose].filter(Boolean).join(' / ') || r.reason || '') + '</td>' +
+          '<td>' + esc([r.department, r.purpose].filter(Boolean).join(' / ') || [reasonCodeLabel(r.reasonCode), r.reason].filter(Boolean).join(' / ') || '') + (r.groupId ? ' <span class="badge">セット/一括</span>' : '') + '</td>' +
           '<td><button class="btn small secondary" data-mphotos="' + r.id + '">写真' + (r.photoCount ? ' (' + r.photoCount + ')' : '') + '</button></td></tr>';
       }
       h += '</tbody></table></div>';
@@ -2269,6 +2642,71 @@ function masterFail(e) {
   var box = el('maMsg');
   if (box) box.innerHTML = msgHtml('error', errMsg(e));
 }
+/* セット品の構成品エディタ (商品編集モーダル内)。構成品の追加・数量・削除を
+   ローカルで編集し、「構成品を保存」で PUT /products/:id/bundle へ送る */
+function initBundleEditor(productId) {
+  var box = el('edBundleBox');
+  if (!box) return;
+  var comps = [];
+  function render() {
+    var candidates = (state.master ? state.master.products : []).filter(function (p) {
+      return !p.isBundle && p.id !== productId && !comps.some(function (cm) { return cm.productId === p.id; });
+    });
+    var h = '';
+    if (comps.length === 0) h += '<p class="small muted">構成品がありません。</p>';
+    comps.forEach(function (cm) {
+      h += '<div class="toolbar"><div><span class="small">' + esc(productLabel(cm.productId)) + '</span></div>' +
+        '<div><label>必要数</label><input type="number" min="1" step="1" value="' + cm.quantity + '" data-bcomp-qty="' + cm.productId + '" style="width:6em"></div>' +
+        '<div><label>&nbsp;</label><button class="btn small danger" type="button" data-bcomp-del="' + cm.productId + '">削除</button></div></div>';
+    });
+    h += '<div class="toolbar"><div><label>構成品を追加</label><select id="edBundleAdd">' +
+      optionsHtml(candidates, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+      '<div><label>必要数</label><input type="number" min="1" step="1" value="1" id="edBundleAddQty" style="width:6em"></div>' +
+      '<div><label>&nbsp;</label><button class="btn small" type="button" id="edBundleAddBtn">追加</button></div></div>' +
+      '<p><button class="btn small" type="button" id="edBundleSave">構成品を保存</button> <span class="small" id="edBundleMsg"></span></p>' +
+      '<p class="small muted">セット品の中にセット品は入れられません。単価は構成品の合算で計算されます。</p>';
+    box.innerHTML = h;
+    var delBtns = box.querySelectorAll('button[data-bcomp-del]');
+    for (var di = 0; di < delBtns.length; di++) {
+      delBtns[di].onclick = function () {
+        var pid = Number(this.getAttribute('data-bcomp-del'));
+        comps = comps.filter(function (cm) { return cm.productId !== pid; });
+        render();
+      };
+    }
+    var addBtn = el('edBundleAddBtn');
+    if (addBtn) addBtn.onclick = function () {
+      var pid = Number(el('edBundleAdd').value);
+      var qty = Number(el('edBundleAddQty').value);
+      if (!pid || !(qty >= 1)) return;
+      comps.push({ productId: pid, quantity: qty });
+      render();
+    };
+    var saveBtn = el('edBundleSave');
+    if (saveBtn) saveBtn.onclick = function () {
+      var qtyInputs = box.querySelectorAll('input[data-bcomp-qty]');
+      var payload = [];
+      for (var qi = 0; qi < qtyInputs.length; qi++) {
+        payload.push({ productId: Number(qtyInputs[qi].getAttribute('data-bcomp-qty')), quantity: Number(qtyInputs[qi].value) });
+      }
+      el('edBundleMsg').textContent = '保存中…';
+      api('/api/v1/products/' + productId + '/bundle', { method: 'PUT', body: { components: payload } })
+        .then(function (r) {
+          comps = (r.components || []).map(function (cm) { return { productId: cm.productId, quantity: cm.quantity }; });
+          el('edBundleMsg').textContent = '保存しました。組立可能数: ' + r.assemblable;
+          state.master = null;
+        })
+        .catch(function (e) { el('edBundleMsg').textContent = errMsg(e); });
+    };
+  }
+  api('/api/v1/products/' + productId + '/bundle').then(function (b) {
+    comps = (b.components || []).map(function (cm) { return { productId: cm.productId, quantity: cm.quantity }; });
+    render();
+  }).catch(function (e) {
+    box.innerHTML = msgHtml('error', errMsg(e));
+  });
+}
+
 function onMasterAction(act, id) {
   var kind = act.split('-')[1];
   var base = '/api/v1/master/' + kind + 's/' + id;
@@ -2290,6 +2728,8 @@ function onMasterAction(act, id) {
       fieldHtml('アラート日数 (空欄で解除)', '<input id="edDays" type="number" min="0" step="1" value="' + (p.expiryAlertDays === null || p.expiryAlertDays === undefined ? '' : p.expiryAlertDays) + '">') +
       fieldHtml('1ケースの入数 (空欄で未設定)', '<input id="edCase" type="number" min="2" step="1" value="' + (p.caseSize === null || p.caseSize === undefined ? '' : p.caseSize) + '">') +
       fieldHtml('リードタイム (日、空欄で未設定)', '<input id="edLead" type="number" min="0" step="1" value="' + (p.leadTimeDays === null || p.leadTimeDays === undefined ? '' : p.leadTimeDays) + '">') +
+      fieldHtml('セット品', '<select id="edBundle"><option value="">通常商品</option><option value="1"' + (p.isBundle ? ' selected' : '') + '>セット品</option></select>') +
+      (p.isBundle ? fieldHtml('構成品 (セット品)', '<div id="edBundleBox"><span class="small muted">読み込み中…</span></div>') : '') +
       fieldHtml('商品画像', '<span id="edImgPrev">' + (p.imageKey ? '<img class="thumb-lg" src="/api/v1/products/' + p.id + '/image" alt="商品画像">' : '<span class="muted">画像なし</span>') + '</span> ' +
         '<input type="file" id="edImgFile" accept="image/*"> ' +
         '<button class="btn small danger" type="button" id="edImgDel"' + (p.imageKey ? '' : ' style="display:none"') + '>画像を削除</button><span id="edImgMsg" class="small"></span>');
@@ -2304,9 +2744,11 @@ function onMasterAction(act, id) {
         unitCost: el('edCost').value === '' ? null : Number(el('edCost').value),
         caseSize: el('edCase').value === '' ? null : Number(el('edCase').value),
         leadTimeDays: el('edLead').value === '' ? null : Number(el('edLead').value),
+        isBundle: el('edBundle').value === '1',
       };
       return api(base, { method: 'PUT', body: body }).then(function () { return '商品を更新しました。'; });
     });
+    if (p.isBundle) initBundleEditor(id);
     /* 画像は保存ボタンとは独立に即時アップロード/削除する */
     bindThumbFallbacks();
     var imgFile = el('edImgFile');
@@ -2363,8 +2805,20 @@ function onMasterAction(act, id) {
     var wFields =
       fieldHtml('コード', '<input id="edCode" required value="' + esc(row.code) + '">') +
       fieldHtml('名前', '<input id="edWName" required value="' + esc(row.name) + '">');
+    if (kind === 'location') {
+      var parentCandidates = (state.master ? state.master.locations : []).filter(function (l) {
+        return l.warehouseId === row.warehouseId && l.id !== id;
+      });
+      wFields += fieldHtml('親の場所 (任意)', '<select id="edParent">' +
+        optionsHtml(parentCandidates, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, row.parentId || '', 'なし (倉庫直下)') + '</select>');
+    }
     openModal((kind === 'warehouse' ? '倉庫' : '保管場所') + 'を編集', wFields, function () {
-      return api(base, { method: 'PUT', body: { code: el('edCode').value, name: el('edWName').value } })
+      var wBody = { code: el('edCode').value, name: el('edWName').value };
+      if (kind === 'location') {
+        var parentSel = el('edParent');
+        wBody.parentId = parentSel && parentSel.value ? Number(parentSel.value) : null;
+      }
+      return api(base, { method: 'PUT', body: wBody })
         .then(function () { return '更新しました。'; });
     });
     return;
@@ -2438,7 +2892,8 @@ function loadMasterView() {
     }
     var prow = '';
     m.products.forEach(function (p) {
-      prow += '<tr><td><input type="checkbox" data-label-product="' + p.id + '"></td><td>' + esc(p.sku) + '</td><td>' + esc(p.name) + '</td><td>' + esc(p.unit) + '</td><td>' + p.safetyStock + '</td><td>' +
+      prow += '<tr><td><input type="checkbox" data-label-product="' + p.id + '"></td><td>' + esc(p.sku) + '</td><td>' + esc(p.name) +
+        (p.isBundle ? ' <span class="badge">セット</span>' + (p.assemblable !== undefined && p.assemblable !== null ? ' <span class="small muted">組立可能 ' + p.assemblable + '</span>' : '') : '') + '</td><td>' + esc(p.unit) + '</td><td>' + p.safetyStock + '</td><td>' +
         (p.caseSize ? p.caseSize : '-') + '</td><td>' +
         (p.unitCost === null || p.unitCost === undefined ? '-' : '¥' + Number(p.unitCost).toLocaleString('ja-JP')) + '</td><td>' +
         (p.requiresExpiry ? '必須' : '-') + '</td><td>' + (p.expiryAlertDays === null || p.expiryAlertDays === undefined ? '-' : p.expiryAlertDays + '日前') + '</td>' +
@@ -2457,9 +2912,21 @@ function loadMasterView() {
         '<div><label>有効期限</label><select id="mpExpiry"><option value="">不要</option><option value="1">必須</option></select></div>' +
         '<div><label>1ケースの入数 (任意)</label><input id="mpCase" type="number" min="2"></div>' +
         '<div><label>リードタイム (日、任意)</label><input id="mpLead" type="number" min="0"></div>' +
+        '<div><label>セット品</label><select id="mpBundle"><option value="">通常商品</option><option value="1">セット品 (構成品は編集画面で設定)</option></select></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">商品を追加</button></div></form>';
     }
     var plabel = '<p><button class="btn secondary" type="button" id="maLabelProducts">選択した商品のラベルを印刷</button></p>';
+    if (writable) {
+      plabel += '<div class="section-box"><h4>選択した商品の一括編集</h4>' +
+        '<div class="grid">' +
+        '<div><label>安全在庫</label><input id="bkSafety" type="number" min="0" placeholder="変更しない場合は空欄"></div>' +
+        '<div><label>単価 (円)</label><input id="bkCost" type="number" min="0" placeholder="変更しない場合は空欄"></div>' +
+        '<div><label>入数</label><input id="bkCase" type="number" min="1" placeholder="変更しない場合は空欄"></div>' +
+        '<div><label>リードタイム (日)</label><input id="bkLead" type="number" min="0" placeholder="変更しない場合は空欄"></div>' +
+        '<div><label>有効/無効</label><select id="bkActive"><option value="">変更しない</option><option value="1">有効化</option><option value="0">無効化</option></select></div>' +
+        '<div><label>&nbsp;</label><button class="btn" type="button" id="maBulkApply">一括適用</button></div>' +
+        '</div><div id="bkMsg"></div></div>';
+    }
     h += masterSection('商品', simpleTable('<th></th><th>SKU</th><th>商品名</th><th>単位</th><th>安全在庫</th><th>入数</th><th>単価</th><th>期限</th><th>アラート</th>' + actHead, prow), plabel + pform, 'mntNoteMasterProducts');
 
     if (writable && feat('csv')) {
@@ -2494,6 +2961,7 @@ function loadMasterView() {
         '<div><label>倉庫</label><select id="mlWarehouse">' + optionsHtml(m.warehouses, function (w) { return w.id; }, function (w) { return w.name; }, '') + '</select></div>' +
         '<div><label>場所コード</label><input id="mlCode" required></div>' +
         '<div><label>場所名</label><input id="mlName" required></div>' +
+        '<div><label>親の場所 (任意)</label><select id="mlParent"></select></div>' +
         '<div><label>&nbsp;</label><button class="btn" type="submit">保管場所を追加</button></div></form>';
     }
     var llabel = '<p><button class="btn secondary" type="button" id="maLabelLocations">選択した保管場所のラベルを印刷</button></p>';
@@ -2583,6 +3051,36 @@ function loadMasterView() {
     }
     bindLabelButton('maLabelProducts', 'data-label-product', 'products');
     bindLabelButton('maLabelLocations', 'data-label-location', 'locations');
+    /* 商品の一括編集: ラベル印刷と同じチェック選択を対象にする */
+    var bulkBtn = el('maBulkApply');
+    if (bulkBtn) bulkBtn.onclick = function () {
+      var boxes = el('view').querySelectorAll('input[data-label-product]');
+      var ids = [];
+      for (var bi = 0; bi < boxes.length; bi++) {
+        if (boxes[bi].checked) ids.push(Number(boxes[bi].getAttribute('data-label-product')));
+      }
+      if (ids.length === 0) {
+        el('bkMsg').innerHTML = msgHtml('error', '対象の商品を選択してください。');
+        return;
+      }
+      var patch = {};
+      if (el('bkSafety').value !== '') patch.safetyStock = Number(el('bkSafety').value);
+      if (el('bkCost').value !== '') patch.unitCost = Number(el('bkCost').value);
+      if (el('bkCase').value !== '') patch.caseSize = Number(el('bkCase').value);
+      if (el('bkLead').value !== '') patch.leadTimeDays = Number(el('bkLead').value);
+      if (el('bkActive').value !== '') patch.active = el('bkActive').value === '1';
+      if (Object.keys(patch).length === 0) {
+        el('bkMsg').innerHTML = msgHtml('error', '変更する項目を 1 つ以上入力してください。');
+        return;
+      }
+      api('/api/v1/admin/products/bulk', { method: 'PUT', body: { ids: ids, patch: patch } })
+        .then(function (r) {
+          state.flash = ids.length + ' 件の商品を一括編集しました (更新 ' + r.updated + ' 件)。';
+          state.master = null;
+          loadMasterView();
+        })
+        .catch(function (e) { el('bkMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
     /* 商品の追加は bindForm と別に扱う: スキャナーの「商品を登録」から来た
        場合は、作成後に元の文脈へ戻す (記録シートは商品をセットして戻る、
        棚卸しは一覧の明細からスキャンを再開できる、在庫検索は SKU で絞り込む)。
@@ -2592,6 +3090,7 @@ function loadMasterView() {
     if (productFormEl) productFormEl.onsubmit = function (ev) {
       ev.preventDefault();
       var b = { sku: el('mpSku').value, name: el('mpName').value, unit: el('mpUnit').value, safetyStock: Number(el('mpSafety').value || 0), requiresExpiry: el('mpExpiry').value === '1' };
+      if (el('mpBundle') && el('mpBundle').value === '1') b.isBundle = true;
       if (el('mpBarcode').value) b.barcode = el('mpBarcode').value;
       if (el('mpAlertDays').value) b.expiryAlertDays = Number(el('mpAlertDays').value);
       if (el('mpCost').value) b.unitCost = Number(el('mpCost').value);
@@ -2623,8 +3122,22 @@ function loadMasterView() {
     bindForm('maWarehouseForm', { path: '/api/v1/master/warehouses', body: function () {
       return { code: el('mwCode').value, name: el('mwName').value };
     } }, '倉庫を追加しました。');
+    /* 親の場所は選択中の倉庫の場所だけを候補にする */
+    var fillLocationParents = function () {
+      var sel = el('mlParent');
+      var whSel = el('mlWarehouse');
+      if (!sel || !whSel) return;
+      var wh = Number(whSel.value);
+      var locs = m.locations.filter(function (l) { return l.warehouseId === wh; });
+      sel.innerHTML = optionsHtml(locs, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '', 'なし (倉庫直下)');
+    };
+    var mlWhSel = el('mlWarehouse');
+    if (mlWhSel) { mlWhSel.onchange = fillLocationParents; fillLocationParents(); }
     bindForm('maLocationForm', { path: '/api/v1/master/locations', body: function () {
-      return { warehouseId: Number(el('mlWarehouse').value), code: el('mlCode').value, name: el('mlName').value };
+      var b = { warehouseId: Number(el('mlWarehouse').value), code: el('mlCode').value, name: el('mlName').value };
+      var parent = el('mlParent');
+      if (parent && parent.value) b.parentId = Number(parent.value);
+      return b;
     } }, '保管場所を追加しました。');
     bindForm('maLotForm', { path: '/api/v1/master/lots', body: function () {
       var b = { productId: Number(el('mlotProduct').value), lotCode: el('mlotCode').value };
@@ -3029,6 +3542,377 @@ function openStocktakeScanner(t, detail, locationId) {
   });
 }
 
+/* ---------------- reservations (引当) ---------------- */
+function loadReservations() {
+  viewLoading('引当', 'list');
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>引当</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var products = m.products.filter(function (p) { return !p.isBundle; });
+    var h = '<h2>引当</h2><div id="rsMsg"></div>';
+    if (state.flash) { h += msgHtml('success', state.flash); state.flash = ''; }
+    h += '<div class="section-box"><h3>引当を作成</h3>' +
+      '<form class="grid" id="rsForm">' +
+      '<div><label>商品</label><select id="rsProduct" required>' +
+      optionsHtml(products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+      '<div><label>保管場所 (任意: 指定しない場合は店舗全体)</label><select id="rsLocation">' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '', '指定しない') + '</select></div>' +
+      '<div><label>数量</label>' + qtyStepperHtml('rsQty') + '</div>' +
+      '<div><label>理由</label><input id="rsReason" type="text" required></div>' +
+      '<div><label>期限 (任意)</label><input id="rsExpires" type="date"></div>' +
+      '<div class="sticky-actions"><button class="btn" type="submit">引当を作成</button></div>' +
+      '</form></div>' +
+      '<h3>有効な引当</h3><div id="rsList">' + skeletonRows() + '</div>';
+    el('view').innerHTML = h;
+    bindSteppers();
+    el('rsForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      var body = {
+        productId: Number(el('rsProduct').value),
+        quantity: Number(el('rsQty').value),
+        reason: el('rsReason').value,
+      };
+      var loc = el('rsLocation').value;
+      if (loc) body.locationId = Number(loc);
+      var exp = el('rsExpires').value;
+      if (exp) body.expiresAt = new Date(exp + 'T23:59:59').getTime();
+      api('/api/v1/reservations', { method: 'POST', body: body })
+        .then(function () {
+          state.flash = '引当を作成しました。';
+          loadReservations();
+        })
+        .catch(function (e) { el('rsMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+    api('/api/v1/reservations').then(function (rows) {
+      var box = el('rsList');
+      if (!box) return;
+      if (!rows || rows.length === 0) {
+        box.innerHTML = '<p class="muted">有効な引当はありません。</p>';
+        return;
+      }
+      var hh = '<div class="table-wrap"><table><thead><tr><th>商品</th><th>場所</th><th>数量</th><th>理由</th><th>期限</th><th></th></tr></thead><tbody>';
+      rows.forEach(function (r) {
+        hh += '<tr><td>' + esc(productLabel(r.productId)) + '</td>' +
+          '<td>' + (r.locationId ? esc(locationLabel(r.locationId)) : '店舗全体') + '</td>' +
+          '<td>' + r.quantity + '</td><td>' + esc(r.reason) + '</td>' +
+          '<td>' + (r.expiresAt ? fmtDateTime(r.expiresAt) : '-') + '</td>' +
+          '<td><button class="btn small" data-rs-consume="' + r.id + '">消費する</button> ' +
+          '<button class="btn small secondary" data-rs-release="' + r.id + '">解放</button></td></tr>';
+      });
+      hh += '</tbody></table></div>';
+      box.innerHTML = hh;
+      var consumeBtns = box.querySelectorAll('button[data-rs-consume]');
+      for (var ci = 0; ci < consumeBtns.length; ci++) {
+        consumeBtns[ci].onclick = function () {
+          var rid = this.getAttribute('data-rs-consume');
+          this.disabled = true;
+          api('/api/v1/reservations/' + rid + '/consume', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: {} })
+            .then(function () {
+              state.flash = '引当を消費しました。';
+              loadReservations();
+            })
+            .catch(function (e) { el('rsMsg').innerHTML = msgHtml('error', errMsg(e)); loadReservations(); });
+        };
+      }
+      var releaseBtns = box.querySelectorAll('button[data-rs-release]');
+      for (var ri = 0; ri < releaseBtns.length; ri++) {
+        releaseBtns[ri].onclick = function () {
+          var rid2 = this.getAttribute('data-rs-release');
+          api('/api/v1/reservations/' + rid2 + '/release', { method: 'POST', body: {} })
+            .then(function () {
+              state.flash = '引当を解放しました。';
+              loadReservations();
+            })
+            .catch(function (e) { el('rsMsg').innerHTML = msgHtml('error', errMsg(e)); });
+        };
+      }
+    }).catch(function (e) {
+      var box = el('rsList');
+      if (box) box.innerHTML = msgHtml('error', errMsg(e));
+    });
+  });
+}
+
+/* ---------------- picking (ピッキング + スキャン検品) ---------------- */
+var pickOpenId = null;
+var PICK_STATUS_LABELS = { open: ['検品中', 'badge-warn'], done: ['完了', 'badge-ok'], cancelled: ['取消', 'badge-danger'] };
+function pickStatusBadge(st) {
+  var def = PICK_STATUS_LABELS[st] || [st, ''];
+  return '<span class="badge ' + def[1] + '">' + esc(def[0]) + '</span>';
+}
+function loadPicking() {
+  viewLoading('ピッキング', 'list');
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>ピッキング</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var canCreate = can('movements.consume');
+    var h = '<h2>ピッキング</h2><div id="pkMsg"></div>';
+    if (state.flash) { h += msgHtml('success', state.flash); state.flash = ''; }
+    if (canCreate) {
+      h += '<div class="section-box"><h3>リストを作成</h3>' +
+        '<form class="grid" id="pkForm">' +
+        '<div><label>種別</label><select id="pkType"><option value="consume">消費</option>' +
+        (can('movements.transfer') ? '<option value="transfer">移動</option>' : '') + '</select></div>' +
+        '<div id="pkToWrap" style="display:none"><label>移動先 保管場所</label><select id="pkTo">' +
+        optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+        '</form>' +
+        '<div id="pkItems"></div>' +
+        '<p><button class="btn secondary" type="button" id="pkAddItem">明細を追加</button> ' +
+        '<button class="btn" type="button" id="pkCreate">リストを作成</button></p></div>';
+    }
+    h += '<h3>リスト一覧</h3><div id="pkList">' + skeletonRows() + '</div><div id="pkDetail"></div>';
+    el('view').innerHTML = h;
+
+    function appendPickItemRow() {
+      var box = el('pkItems');
+      if (!box) return;
+      var row = document.createElement('div');
+      row.className = 'toolbar';
+      row.innerHTML =
+        '<div><label>商品</label><select data-pk-product>' +
+        optionsHtml(m.products.filter(function (p) { return !p.isBundle; }), function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+        '<div><label>出発場所</label><select data-pk-from>' +
+        optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+        '<div><label>数量</label><input type="number" min="1" step="1" value="1" data-pk-qty></div>' +
+        '<div><label>&nbsp;</label><button class="btn small danger" type="button" data-pk-remove>削除</button></div>';
+      row.querySelector('[data-pk-remove]').onclick = function () { row.remove(); };
+      box.appendChild(row);
+    }
+    var addBtn = el('pkAddItem');
+    if (addBtn) { addBtn.onclick = appendPickItemRow; appendPickItemRow(); }
+    var typeSel = el('pkType');
+    if (typeSel) typeSel.onchange = function () {
+      el('pkToWrap').style.display = typeSel.value === 'transfer' ? '' : 'none';
+    };
+    var createBtn = el('pkCreate');
+    if (createBtn) createBtn.onclick = function () {
+      var rows = el('pkItems').querySelectorAll('.toolbar');
+      var items = [];
+      for (var i = 0; i < rows.length; i++) {
+        var qty = Number(rows[i].querySelector('[data-pk-qty]').value);
+        if (qty > 0) {
+          items.push({
+            productId: Number(rows[i].querySelector('[data-pk-product]').value),
+            fromLocationId: Number(rows[i].querySelector('[data-pk-from]').value),
+            plannedQty: qty,
+          });
+        }
+      }
+      if (items.length === 0) { el('pkMsg').innerHTML = msgHtml('error', '明細を 1 件以上追加してください。'); return; }
+      var body = { type: el('pkType').value, items: items };
+      if (body.type === 'transfer') body.toLocationId = Number(el('pkTo').value);
+      api('/api/v1/pick-lists', { method: 'POST', body: body })
+        .then(function (created) {
+          pickOpenId = created.id;
+          state.flash = 'ピッキングリスト #' + created.id + ' を作成しました。';
+          loadPicking();
+        })
+        .catch(function (e) { el('pkMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+
+    api('/api/v1/pick-lists').then(function (lists) {
+      var box = el('pkList');
+      if (!box) return;
+      if (!lists || lists.length === 0) {
+        box.innerHTML = '<p class="muted">ピッキングリストがありません。</p>';
+        return;
+      }
+      var hh = '<div class="table-wrap"><table><thead><tr><th>#</th><th>種別</th><th>状態</th><th>進捗</th><th>作成</th><th></th></tr></thead><tbody>';
+      lists.forEach(function (l) {
+        var planned = 0;
+        var picked = 0;
+        (l.items || []).forEach(function (it) { planned += it.plannedQty; picked += it.pickedQty; });
+        hh += '<tr><td>#' + l.id + '</td><td>' + (l.type === 'transfer' ? '移動' : '消費') + '</td>' +
+          '<td>' + pickStatusBadge(l.status) + '</td><td>' + picked + ' / ' + planned + '</td>' +
+          '<td>' + fmtDateTime(l.createdAt) + '</td>' +
+          '<td><button class="btn small" data-pk-open="' + l.id + '">' + (l.status === 'open' ? '検品' : '詳細') + '</button></td></tr>';
+      });
+      hh += '</tbody></table></div>';
+      box.innerHTML = hh;
+      var openBtns = box.querySelectorAll('button[data-pk-open]');
+      for (var oi = 0; oi < openBtns.length; oi++) {
+        openBtns[oi].onclick = function () {
+          pickOpenId = Number(this.getAttribute('data-pk-open'));
+          renderPickDetail();
+        };
+      }
+      if (pickOpenId !== null) renderPickDetail();
+    }).catch(function (e) {
+      var box = el('pkList');
+      if (box) box.innerHTML = msgHtml('error', errMsg(e));
+    });
+
+    function renderPickDetail() {
+      var box = el('pkDetail');
+      if (!box || pickOpenId === null) return;
+      api('/api/v1/pick-lists/' + pickOpenId).then(function (l) {
+        var isOpen = l.status === 'open';
+        var editable = isOpen && can('movements.consume');
+        var hh = '<div class="section-box"><h3>リスト #' + l.id + ' ' + (l.type === 'transfer' ? '移動' : '消費') + ' ' + pickStatusBadge(l.status) +
+          (l.type === 'transfer' && l.toLocationId ? ' <span class="small muted">移動先: ' + esc(locationLabel(l.toLocationId)) + '</span>' : '') + '</h3>';
+        hh += '<div id="pkDetailMsg"></div>';
+        if (isOpen && scanSupported()) {
+          hh += '<p><button class="btn" type="button" id="pkScan">スキャンで検品</button> ' +
+            '<span class="small muted">バーコードを読み取るごとに該当行の実績が 1 増えます</span></p>';
+        }
+        hh += '<div class="table-wrap"><table><thead><tr><th>商品</th><th>出発場所</th><th>計画</th><th>実績</th><th>状態</th>' + (editable ? '<th></th>' : '') + '</tr></thead><tbody>';
+        (l.items || []).forEach(function (it) {
+          var done = it.pickedQty >= it.plannedQty;
+          hh += '<tr><td>' + esc(productLabel(it.productId)) + '</td><td>' + esc(locationLabel(it.fromLocationId)) + '</td>' +
+            '<td>' + (editable ? '<input type="number" min="0" step="1" value="' + it.plannedQty + '" id="pkp-' + it.id + '" style="width:5em">' : it.plannedQty) + '</td>' +
+            '<td>' + (editable ? '<input type="number" min="0" step="1" value="' + it.pickedQty + '" id="pkk-' + it.id + '" style="width:5em">' : it.pickedQty) + '</td>' +
+            '<td>' + (done ? '<span class="badge badge-ok">完了</span>' : '<span class="badge badge-warn">未達</span>') + '</td>' +
+            (editable ? '<td><button class="btn small" data-pk-save="' + it.id + '">保存</button></td>' : '') + '</tr>';
+        });
+        hh += '</tbody></table></div>';
+        if (isOpen && editable) {
+          var allDone = (l.items || []).every(function (it) { return it.pickedQty >= it.plannedQty; });
+          var anyPicked = (l.items || []).some(function (it) { return it.pickedQty > 0; });
+          hh += '<p><button class="btn" type="button" id="pkConfirm"' + (allDone && anyPicked ? '' : ' disabled') + '>確定 (' + (l.type === 'transfer' ? '移動' : '消費') + 'を実行)</button> ' +
+            '<button class="btn small danger" type="button" id="pkCancel">リストを取消</button></p>' +
+            (allDone ? '' : '<p class="small muted">全行が計画数に達すると確定できます。未達の行は計画数を実績に合わせて保存してください。</p>');
+        }
+        hh += '</div>';
+        box.innerHTML = hh;
+        var scanBtn = el('pkScan');
+        if (scanBtn) scanBtn.onclick = function () { openPickScanner(l); };
+        var saveBtns = box.querySelectorAll('button[data-pk-save]');
+        for (var si = 0; si < saveBtns.length; si++) {
+          saveBtns[si].onclick = function () {
+            var itemId = this.getAttribute('data-pk-save');
+            var planned = Number(el('pkp-' + itemId).value);
+            var picked = Number(el('pkk-' + itemId).value);
+            api('/api/v1/pick-lists/' + l.id + '/items/' + itemId, { method: 'PUT', body: { plannedQty: planned, pickedQty: picked } })
+              .then(function () { renderPickDetail(); })
+              .catch(function (e) { el('pkDetailMsg').innerHTML = msgHtml('error', errMsg(e)); });
+          };
+        }
+        var confirmBtn = el('pkConfirm');
+        if (confirmBtn) confirmBtn.onclick = function () {
+          confirmBtn.disabled = true;
+          api('/api/v1/pick-lists/' + l.id + '/confirm', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: {} })
+            .then(function () {
+              state.flash = 'ピッキングリスト #' + l.id + ' を確定しました。';
+              pickOpenId = null;
+              loadPicking();
+            })
+            .catch(function (e) {
+              el('pkDetailMsg').innerHTML = msgHtml('error', errMsg(e));
+              confirmBtn.disabled = false;
+            });
+        };
+        var cancelBtn = el('pkCancel');
+        if (cancelBtn) cancelBtn.onclick = function () {
+          if (!window.confirm('ピッキングリスト #' + l.id + ' を取り消しますか?')) return;
+          api('/api/v1/pick-lists/' + l.id + '/cancel', { method: 'POST', body: {} })
+            .then(function () {
+              state.flash = 'ピッキングリスト #' + l.id + ' を取り消しました。';
+              pickOpenId = null;
+              loadPicking();
+            })
+            .catch(function (e) { el('pkDetailMsg').innerHTML = msgHtml('error', errMsg(e)); });
+        };
+      }).catch(function (e) {
+        box.innerHTML = msgHtml('error', errMsg(e));
+      });
+    }
+
+    /* 検品スキャン: 該当行の実績を +1 し、絶対値を直列化して保存する (棚卸しスキャンと同じ作法) */
+    function openPickScanner(list) {
+      var items = (list.items || []).map(function (it) {
+        return { id: it.id, productId: it.productId, fromLocationId: it.fromLocationId, plannedQty: it.plannedQty, pickedQty: it.pickedQty };
+      });
+      var saveQueue = Promise.resolve();
+      var saving = 0;
+      var saveError = '';
+      var sessionApi = null;
+      function enqueueSave(item) {
+        saving++;
+        if (sessionApi) sessionApi.refreshPanel();
+        var value = item.pickedQty;
+        var planned = item.plannedQty;
+        saveQueue = saveQueue.then(function () {
+          return api('/api/v1/pick-lists/' + list.id + '/items/' + item.id, { method: 'PUT', body: { plannedQty: planned, pickedQty: value } })
+            .then(function () { saveError = ''; })
+            .catch(function (e) { saveError = errMsg(e); })
+            .then(function () {
+              saving--;
+              if (sessionApi) sessionApi.refreshPanel();
+            });
+        });
+      }
+      function pickedTotal() {
+        var t = 0;
+        items.forEach(function (it) { t += it.pickedQty; });
+        return t;
+      }
+      function plannedTotal() {
+        var t = 0;
+        items.forEach(function (it) { t += it.plannedQty; });
+        return t;
+      }
+      openScanner({
+        title: 'ピッキング検品 #' + list.id,
+        continuous: true,
+        registerReturn: null,
+        onOpen: function (api_) { sessionApi = api_; },
+        panelTitle: function () {
+          return '検品 ' + pickedTotal() + ' / ' + plannedTotal();
+        },
+        syncHtml: function () {
+          if (saveError) return '<span class="scan-sync error">保存エラー</span>';
+          if (saving > 0) return '<span class="scan-sync saving">同期中…</span>';
+          return '<span class="scan-sync">保存済み</span>';
+        },
+        renderPanel: function (sess) {
+          var h = '<div class="scan-recent">';
+          items.forEach(function (it) {
+            var done = it.pickedQty >= it.plannedQty;
+            h += '<div class="scan-recent-row"><span class="scan-recent-name">' + esc(productLabel(it.productId)) + ' (' + esc(locationLabel(it.fromLocationId)) + ')</span>' +
+              '<span class="scan-recent-qty">' + it.pickedQty + ' / ' + it.plannedQty + (done ? ' 完了' : '') + '</span></div>';
+          });
+          return h + '</div>';
+        },
+        onCode: function (code, format, api_) {
+          var p = productByBarcode(code);
+          if (!p) return 'unknown';
+          var target = null;
+          var inList = false;
+          for (var i = 0; i < items.length; i++) {
+            if (items[i].productId !== p.id) continue;
+            inList = true;
+            if (items[i].pickedQty < items[i].plannedQty && !target) target = items[i];
+          }
+          if (!inList) {
+            api_.setStatus('対象外: ' + p.sku + ' ' + p.name + ' はこのリストにありません');
+            return 'out';
+          }
+          if (!target) {
+            api_.setStatus('計画数に達しています: ' + p.sku + ' ' + p.name);
+            return 'out';
+          }
+          target.pickedQty += 1;
+          enqueueSave(target);
+          var savedItem = target;
+          api_.pushUndo(function () {
+            savedItem.pickedQty = Math.max(0, savedItem.pickedQty - 1);
+            enqueueSave(savedItem);
+            api_.refreshPanel();
+          });
+          api_.refreshPanel();
+          return 'ok';
+        },
+        onBeforeClose: function () { return saveQueue; },
+        onClose: function () { renderPickDetail(); },
+      });
+    }
+  });
+}
+
 /* ---------------- alerts ---------------- */
 var ALERT_LABELS = { EXPIRED: '期限切れ', EXPIRING: '期限接近', LOW_STOCK: '在庫不足', NEGATIVE_STOCK: 'マイナス在庫' };
 function loadAlerts() {
@@ -3076,8 +3960,9 @@ function loadPurchases() {
     return Promise.all([
       api('/api/v1/purchase-orders'),
       api('/api/v1/purchase-orders/suggestions').catch(function () { return []; }),
+      api('/api/v1/purchase-order-templates').catch(function () { return []; }),
     ]).then(function (r) {
-      renderPurchases(m, r[0] || [], r[1] || []);
+      renderPurchases(m, r[0] || [], r[1] || [], r[2] || []);
     });
   }).catch(function (e) {
     el('view').innerHTML = '<h2>発注</h2>' + msgHtml('error', errMsg(e));
@@ -3110,7 +3995,20 @@ function appendPoLine(m, productId, quantity, unitCost, unitMode) {
   refreshUnit();
   box.appendChild(row);
 }
-function renderPurchases(m, orders, suggestions) {
+function appendTplLine(m, productId, quantity) {
+  var box = el('tplLines');
+  if (!box) return;
+  var row = document.createElement('div');
+  row.className = 'toolbar';
+  row.innerHTML =
+    '<div><label>商品</label><select data-tpl-product>' +
+    optionsHtml(m.products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, productId || '') + '</select></div>' +
+    '<div><label>数量</label><input type="number" min="1" step="1" value="' + (quantity || 1) + '" data-tpl-qty></div>' +
+    '<div><label>&nbsp;</label><button class="btn small danger" type="button" data-tpl-remove>削除</button></div>';
+  row.querySelector('[data-tpl-remove]').onclick = function () { row.remove(); };
+  box.appendChild(row);
+}
+function renderPurchases(m, orders, suggestions, templates) {
   var writable = can('purchases.write');
   var h = '<h2>発注</h2><div class="mnt-form-note" id="mntNotePurchases" style="display:none"></div><div id="poMsg"></div>';
   if (state.flash) { h += msgHtml('success', state.flash); state.flash = ''; }
@@ -3155,11 +4053,49 @@ function renderPurchases(m, orders, suggestions) {
       '<button class="btn" type="button" id="poSubmit">発注書を作成 (下書き)</button></p></div>';
   }
 
+  /* 発注テンプレートと定期発注 (下書き生成のみ、自動発注はしない) */
+  h += '<div class="section-box"><h3>発注テンプレート</h3><div id="tplMsg"></div>';
+  if (!templates || templates.length === 0) {
+    h += '<p class="muted">テンプレートがありません。</p>';
+  }
+  (templates || []).forEach(function (t) {
+    var lineText = (t.lines || []).map(function (ln) { return esc(productLabel(ln.productId)) + ' ×' + (ln.quantity || ln.inputQuantity || 0); }).join('、');
+    h += '<div class="section-box"><h4>' + esc(t.name) + ' <span class="small muted">' + esc(supplierOf(t.supplierId) ? supplierOf(t.supplierId).name : '仕入先#' + t.supplierId) + '</span></h4>' +
+      '<p class="small muted">' + lineText + '</p>';
+    if (t.schedule) {
+      h += '<p class="small">定期: ' + t.schedule.intervalDays + ' 日ごと / ' + (t.schedule.enabled ? '有効' : '無効') +
+        ' / 次回: ' + fmtDateTime(t.schedule.nextRunAt) + (t.schedule.lastRunAt ? ' / 前回: ' + fmtDateTime(t.schedule.lastRunAt) : '') + '</p>';
+    } else {
+      h += '<p class="small muted">定期: 未設定</p>';
+    }
+    if (writable) {
+      h += '<p><button class="btn small" type="button" data-tpl-gen="' + t.id + '">下書きを生成</button> ' +
+        '<button class="btn small danger" type="button" data-tpl-del="' + t.id + '">テンプレートを削除</button></p>' +
+        '<div class="grid"><div><label>定期の間隔 (日)</label><input type="number" min="1" max="365" step="1" value="' + (t.schedule ? t.schedule.intervalDays : 7) + '" id="tplInt-' + t.id + '"></div>' +
+        '<div><label>定期生成</label><select id="tplEn-' + t.id + '"><option value="1"' + (t.schedule && t.schedule.enabled ? ' selected' : '') + '>有効</option><option value="0"' + (t.schedule && !t.schedule.enabled ? ' selected' : '') + '>無効</option></select></div>' +
+        '<div><label>&nbsp;</label><button class="btn small secondary" type="button" data-tpl-sched="' + t.id + '">定期設定を保存</button></div></div>';
+    }
+    h += '</div>';
+  });
+  if (writable) {
+    h += '<h4>テンプレートを作成</h4>' +
+      '<form class="grid" id="tplHeadForm">' +
+      '<div><label>テンプレート名</label><input id="tplName" type="text" required></div>' +
+      '<div><label>仕入先</label><select id="tplSupplier" required>' +
+      optionsHtml(m.suppliers || [], function (s) { return s.id; }, function (s) { return s.name; }, '') + '</select></div>' +
+      '</form>' +
+      '<div id="tplLines"></div>' +
+      '<p><button class="btn secondary" type="button" id="tplAddLine">明細を追加</button> ' +
+      '<button class="btn" type="button" id="tplCreate">テンプレートを作成</button></p>';
+  }
+  h += '</div>';
+
   h += '<h3>発注書一覧</h3>';
   if (!orders.length) h += '<p class="muted">発注書がありません。</p>';
   orders.forEach(function (po) {
     var partial = po.status === 'ordered' && po.lines.some(function (ln) { return ln.receivedQuantity > 0; });
-    h += '<div class="section-box"><h3>#' + po.id + ' ' + esc(po.supplierName || ('仕入先#' + po.supplierId)) + ' ' + poStatusBadge(po.status) +
+    var sourceBadge = po.source === 'schedule' ? ' <span class="badge">定期生成</span>' : (po.source === 'template' ? ' <span class="badge">テンプレート</span>' : '');
+    h += '<div class="section-box"><h3>#' + po.id + ' ' + esc(po.supplierName || ('仕入先#' + po.supplierId)) + ' ' + poStatusBadge(po.status) + sourceBadge +
       (partial ? ' <span class="badge badge-warn">一部入荷</span>' : '') + (po.overdue ? ' <span class="badge badge-danger">納期超過</span>' : '') + '</h3>' +
       '<p class="small muted">作成: ' + fmtDateTime(po.createdAt) + (po.expectedDate ? ' / 納期: ' + esc(po.expectedDate) : '') + (po.note ? ' / メモ: ' + esc(po.note) : '') + '</p>';
     h += '<div class="table-wrap"><table><thead><tr><th>商品</th><th>発注数</th><th>入荷済み</th><th>残</th><th>入力</th><th>単価</th></tr></thead><tbody>';
@@ -3188,7 +4124,69 @@ function renderPurchases(m, orders, suggestions) {
     h += '</div>';
   });
   el('view').innerHTML = h;
-  setMaintFormNote('mntNotePurchases', ['purchase_orders'], ['#poSubmit', 'form[data-receive] button[type="submit"]', 'button[data-suggest]']);
+  setMaintFormNote('mntNotePurchases', ['purchase_orders'], ['#poSubmit', 'form[data-receive] button[type="submit"]', 'button[data-suggest]', '#tplCreate', 'button[data-tpl-gen]']);
+
+  var tplAddBtn = el('tplAddLine');
+  if (tplAddBtn) { tplAddBtn.onclick = function () { appendTplLine(m); }; appendTplLine(m); }
+  var tplCreateBtn = el('tplCreate');
+  if (tplCreateBtn) tplCreateBtn.onclick = function () {
+    var rows = el('tplLines').querySelectorAll('.toolbar');
+    var lines = [];
+    for (var ti = 0; ti < rows.length; ti++) {
+      var qty = Number(rows[ti].querySelector('[data-tpl-qty]').value);
+      if (qty > 0) lines.push({ productId: Number(rows[ti].querySelector('[data-tpl-product]').value), quantity: qty });
+    }
+    if (!el('tplName').value) { el('tplMsg').innerHTML = msgHtml('error', 'テンプレート名を入力してください。'); return; }
+    if (!el('tplSupplier').value) { el('tplMsg').innerHTML = msgHtml('error', '仕入先を選んでください。'); return; }
+    if (lines.length === 0) { el('tplMsg').innerHTML = msgHtml('error', '明細を 1 件以上追加してください。'); return; }
+    api('/api/v1/purchase-order-templates', { method: 'POST', body: { name: el('tplName').value, supplierId: Number(el('tplSupplier').value), lines: lines } })
+      .then(function () {
+        state.flash = 'テンプレートを作成しました。';
+        loadPurchases();
+      })
+      .catch(function (e) { el('tplMsg').innerHTML = msgHtml('error', errMsg(e)); });
+  };
+  var tplGenBtns = el('view').querySelectorAll('button[data-tpl-gen]');
+  for (var tg = 0; tg < tplGenBtns.length; tg++) {
+    tplGenBtns[tg].onclick = function () {
+      var tid = this.getAttribute('data-tpl-gen');
+      api('/api/v1/purchase-order-templates/' + tid + '/generate', { method: 'POST', body: {} })
+        .then(function (po) {
+          state.flash = '下書きの発注書 #' + po.id + ' を生成しました。';
+          loadPurchases();
+        })
+        .catch(function (e) { el('tplMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+  }
+  var tplDelBtns = el('view').querySelectorAll('button[data-tpl-del]');
+  for (var td = 0; td < tplDelBtns.length; td++) {
+    tplDelBtns[td].onclick = function () {
+      var tid2 = this.getAttribute('data-tpl-del');
+      if (!window.confirm('テンプレートを削除しますか? (定期設定も削除されます)')) return;
+      api('/api/v1/purchase-order-templates/' + tid2, { method: 'DELETE' })
+        .then(function () {
+          state.flash = 'テンプレートを削除しました。';
+          loadPurchases();
+        })
+        .catch(function (e) { el('tplMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+  }
+  var tplSchedBtns = el('view').querySelectorAll('button[data-tpl-sched]');
+  for (var ts = 0; ts < tplSchedBtns.length; ts++) {
+    tplSchedBtns[ts].onclick = function () {
+      var tid3 = this.getAttribute('data-tpl-sched');
+      var body = {
+        intervalDays: Number(el('tplInt-' + tid3).value),
+        enabled: el('tplEn-' + tid3).value === '1',
+      };
+      api('/api/v1/purchase-order-templates/' + tid3 + '/schedule', { method: 'PUT', body: body })
+        .then(function () {
+          state.flash = '定期設定を保存しました。';
+          loadPurchases();
+        })
+        .catch(function (e) { el('tplMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+  }
 
   var sugs = el('view').querySelectorAll('button[data-suggest]');
   for (var si = 0; si < sugs.length; si++) {
@@ -3344,6 +4342,7 @@ function loadAnalytics() {
       '<div class="card"><div class="num">' + yen(r.valuation.totalValue) + '</div><div class="lbl">在庫評価額 (単価設定分)</div></div>' +
       '<div class="card"><div class="num">' + Math.round(r.valuation.coverageRate * 100) + '%</div><div class="lbl">単価設定済み (' + r.valuation.pricedProducts + ' / ' + r.valuation.totalProducts + ' 商品)</div></div>' +
       '<div class="card"><div class="num' + (r.deadStock.length > 0 ? ' qty-neg' : '') + '">' + r.deadStock.length + '</div><div class="lbl">滞留在庫 (最終移動から90日超)</div></div>' +
+      (r.disposal ? '<div class="card"><div class="num">' + r.disposal.quantity + '</div><div class="lbl">廃棄数量 (直近6ヶ月、評価額 ' + yen(r.disposal.value) + ')</div></div>' : '') +
       '</div>';
     h += '<h3>月別の入庫・消費 (直近6ヶ月)</h3><div class="chart-wrap">' + monthlyChartSvg(r.monthly) + '</div>';
     h += '<h3>滞留在庫</h3>';
@@ -3575,9 +4574,21 @@ function boot() {
     getJson('/api/v1/stocktakes').catch(function () {});
   }).catch(function (err) {
     el('loadingBox').style.display = 'none';
-    if (err && err.status === 403) el('noAssignBox').style.display = '';
-    else el('loginBox').style.display = '';
+    el('loginBox').style.display = 'none';
+    el('noAssignBox').style.display = 'none';
+    el('errorBox').style.display = 'none';
+    if (err && err.status === 401) el('loginBox').style.display = '';
+    else if (err && err.status === 403) el('noAssignBox').style.display = '';
+    else el('errorBox').style.display = '';
   });
+  var retryBtn = el('bootRetryBtn');
+  if (retryBtn) {
+    retryBtn.onclick = function () {
+      el('errorBox').style.display = 'none';
+      el('loadingBox').style.display = '';
+      boot();
+    };
+  }
 }
 document.addEventListener('DOMContentLoaded', boot);
 `;

@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './env';
 import { planConsumption, type CandidateRow, type NegativeApprovalInfo } from './allocation';
-import { proposeFefoAllocation } from './fefo';
+import { proposeFefoAllocation, type FefoCandidate } from './fefo';
 import {
   ApiError,
   badRequest,
@@ -50,6 +50,12 @@ export interface InboundInput extends MovementContext {
   /** UTC 0時のミリ秒。null = 期限なし */
   expiryDateMs: number | null;
   quantity: number;
+  /** 台帳の種別。未指定 = 'IN' (入庫)。'RETURN' は返品 (0015、理由必須) */
+  kind?: 'IN' | 'RETURN';
+  /** 返品・廃棄の理由コード (0015) */
+  reasonCode?: string | null;
+  /** 理由の自由メモ (返品では必須、台帳の reason に入る) */
+  reason?: string | null;
 }
 
 export interface TransferInput extends MovementContext {
@@ -71,6 +77,42 @@ export interface ConsumeInput extends MovementContext {
   negativeApprovalId?: number;
   /** 消費してよい location の一覧。null = 全 location (全倉庫スコープ) */
   allowedLocationIds: number[] | null;
+  /** 台帳の種別。未指定 = 'OUT' (消費)。'DISPOSAL' は廃棄 (0015) */
+  movementType?: 'OUT' | 'DISPOSAL';
+  /** 返品・廃棄の理由コード (0015) */
+  reasonCode?: string | null;
+  /** 理由の自由メモ (廃棄では必須、台帳の reason に入る) */
+  reason?: string | null;
+  /** 一括処理の束 (セット品展開など)。台帳の group_id に入る (0015) */
+  groupId?: string | null;
+  /** 監査ログのアクション名。未指定 = 'stock.consume' */
+  auditAction?: string;
+}
+
+/** セット品の消費入力 (0015)。構成品を FEFO で展開し、同一 group_id で記録する */
+export interface BundleConsumeInput extends MovementContext {
+  bundleProductId: number;
+  locationId?: number;
+  quantity: number;
+  department: string;
+  purpose: string;
+  allowedLocationIds: number[] | null;
+  components: { productId: number; quantity: number }[];
+}
+
+/** ピッキング確定の 1 明細 (検品済み数量をそのまま動かす) */
+export interface PickConfirmItem {
+  productId: number;
+  fromLocationId: number;
+  quantity: number;
+}
+
+/** ピッキングリストの確定入力 (0015)。全明細を 1 batch で原子的に実行する */
+export interface PickConfirmInput extends MovementContext {
+  pickListId: number;
+  type: 'consume' | 'transfer';
+  toLocationId?: number;
+  items: PickConfirmItem[];
 }
 
 interface StockRow {
@@ -320,6 +362,101 @@ export class InventoryCoordinator extends DurableObject<Env> {
     return found;
   }
 
+  private extMovementColumnsCache: boolean | null = null;
+
+  /** 0015 の拡張列 (group_id / reason_code) が stock_movements にあるか */
+  private async hasExtMovementColumns(): Promise<boolean> {
+    if (this.extMovementColumnsCache !== null) return this.extMovementColumnsCache;
+    const found =
+      (await this.hasColumn('stock_movements', 'group_id')) &&
+      (await this.hasColumn('stock_movements', 'reason_code'));
+    this.extMovementColumnsCache = found;
+    return found;
+  }
+
+  /**
+   * 出庫系 1 配分分の文 (条件付き UPDATE + ガード + 台帳) を statements へ追加する。
+   * 消費・廃棄・セット品展開で共用する。呼び出し側が batch 全体を組み立てる。
+   */
+  private appendOutflowAllocation(
+    statements: D1PreparedStatement[],
+    expected: Map<number, number>,
+    args: {
+      batchId: string;
+      documentId: string;
+      now: number;
+      actorId: number;
+      storeId: number;
+      alloc: { stockId: number; quantity: number; before: number; after: number; version: number; negative: boolean };
+      type: string;
+      department: string | null;
+      purpose: string | null;
+      reason: string | null;
+      groupId: string | null;
+      reasonCode: string | null;
+      ext: boolean;
+      /** マイナス配分の下限 (承認数量)。negative のときのみ使う */
+      negativeFloor: number;
+    },
+  ): void {
+    const db = this.env.DB;
+    const { alloc } = args;
+    const idx = statements.length;
+    if (alloc.negative) {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE stocks SET quantity = quantity - ?1, version = version + 1, updated_at = ?2
+              WHERE id = ?3 AND version = ?4 AND quantity - ?1 >= ?5`,
+          )
+          .bind(alloc.quantity, args.now, alloc.stockId, alloc.version, args.negativeFloor),
+      );
+    } else {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE stocks SET quantity = quantity - ?1, version = version + 1, updated_at = ?2
+              WHERE id = ?3 AND version = ?4 AND quantity >= ?1`,
+          )
+          .bind(alloc.quantity, args.now, alloc.stockId, alloc.version),
+      );
+    }
+    expected.set(idx, 1);
+    statements.push(
+      this.guardStmt(
+        args.batchId,
+        `stock-${alloc.stockId}`,
+        'EXISTS (SELECT 1 FROM stocks WHERE id = ? AND version = ? AND quantity = ?)',
+        [alloc.stockId, alloc.version + 1, alloc.after],
+      ),
+    );
+    const cols =
+      'document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, department, purpose, reason, store_id, created_at' +
+      (args.ext ? ', group_id, reason_code' : '');
+    const placeholders =
+      '?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12' + (args.ext ? ', ?13, ?14' : '');
+    const binds: unknown[] = [
+      args.documentId,
+      alloc.stockId,
+      args.type,
+      -alloc.quantity,
+      alloc.before,
+      alloc.after,
+      args.actorId,
+      args.department,
+      args.purpose,
+      args.reason,
+      args.storeId,
+      args.now,
+    ];
+    if (args.ext) binds.push(args.groupId, args.reasonCode);
+    statements.push(
+      db
+        .prepare(`INSERT INTO stock_movements (${cols}) VALUES (${placeholders})`)
+        .bind(...binds),
+    );
+  }
+
   /**
    * 実施中・承認待ちの棚卸しのロック範囲を返す。無ければ null。
    * - full (および 0014 未適用環境): 店舗の全在庫が停止
@@ -390,14 +527,27 @@ export class InventoryCoordinator extends DurableObject<Env> {
     const batchId = crypto.randomUUID();
 
     // 商品・保管場所・ロットはすべて対象店舗のものだけを引く (他店舗の ID は存在しない扱い)
+    const withBundle = await this.hasColumn('products', 'is_bundle');
     const product = await db
-      .prepare('SELECT id, requires_expiry FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+      .prepare(
+        `SELECT id, requires_expiry${withBundle ? ', is_bundle' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+      )
       .bind(input.productId, input.storeId)
-      .first<{ id: number; requires_expiry: number }>();
+      .first<{ id: number; requires_expiry: number; is_bundle?: number }>();
     if (!product) throw badRequest('Product not found');
+    if (product.is_bundle === 1) {
+      // セット品は自前の在庫を持たないため入庫・返品の対象にできない
+      throw new ApiError(422, 'BUNDLE_NO_STOCK', 'Bundle products do not hold stock and cannot be received');
+    }
     if (product.requires_expiry === 1 && input.expiryDateMs === null) {
       throw badRequest('expiryDate is required for this product');
     }
+    const movementType = input.kind ?? 'IN';
+    const ext = await this.hasExtMovementColumns();
+    const mvCols =
+      'document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, reason, store_id, created_at' +
+      (ext ? ', group_id, reason_code' : '');
+    const auditAction = movementType === 'RETURN' ? 'stock.return' : 'stock.inbound';
     const location = await db
       .prepare(
         `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
@@ -441,16 +591,21 @@ export class InventoryCoordinator extends DurableObject<Env> {
           [stock.id, stock.version + 1, after],
         ),
       );
+      const inBinds: unknown[] = [
+        documentId, stock.id, movementType, input.quantity, stock.quantity, after,
+        input.actorId, input.reason ?? null, input.storeId, now,
+      ];
+      if (ext) inBinds.push(null, input.reasonCode ?? null);
       statements.push(
         db
           .prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
-             VALUES (?1, ?2, 'IN', ?3, ?4, ?5, ?6, ?7, ?8)`,
+            `INSERT INTO stock_movements (${mvCols})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10${ext ? ', ?11, ?12' : ''})`,
           )
-          .bind(documentId, stock.id, input.quantity, stock.quantity, after, input.actorId, input.storeId, now),
+          .bind(...inBinds),
       );
       const body = { documentId, stockId: stock.id, quantity: after };
-      statements.push(this.auditStmt(input.actorId, 'stock.inbound', 'stock', String(stock.id), {
+      statements.push(this.auditStmt(input.actorId, auditAction, 'stock', String(stock.id), {
         documentId,
         quantity: input.quantity,
       }, input.storeId));
@@ -487,19 +642,24 @@ export class InventoryCoordinator extends DurableObject<Env> {
         [input.locationId, input.productId, input.lotCode, input.quantity],
       ),
     );
+    const newBinds: unknown[] = [
+      documentId, movementType, input.quantity, input.actorId, input.reason ?? null, input.storeId, now,
+    ];
+    if (ext) newBinds.push(null, input.reasonCode ?? null);
+    newBinds.push(input.locationId, input.productId, input.lotCode);
     statements.push(
       db.prepare(
-        `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, store_id, created_at)
-         SELECT ?1, s.id, 'IN', ?2, 0, ?2, ?3, ?4, ?5
+        `INSERT INTO stock_movements (${mvCols})
+         SELECT ?1, s.id, ?2, ?3, 0, ?3, ?4, ?5, ?6, ?7${ext ? ', ?8, ?9' : ''}
            FROM stocks s JOIN lots l ON l.id = s.lot_id
-          WHERE s.location_id = ?6 AND l.product_id = ?7 AND l.lot_code = ?8`,
-      ).bind(documentId, input.quantity, input.actorId, input.storeId, now, input.locationId, input.productId, input.lotCode),
+          WHERE s.location_id = ?${ext ? 10 : 8} AND l.product_id = ?${ext ? 11 : 9} AND l.lot_code = ?${ext ? 12 : 10}`,
+      ).bind(...newBinds),
     );
 
     // 作成された stock の ID を引く (batch 実行前に body が要るため、実行後にもう一度引く)
     const bodyPlaceholder = { documentId, stockId: 0, quantity: input.quantity };
     statements.push(
-      this.auditStmt(input.actorId, 'stock.inbound', 'product', String(input.productId), {
+      this.auditStmt(input.actorId, auditAction, 'product', String(input.productId), {
         documentId,
         quantity: input.quantity,
       }, input.storeId),
@@ -643,60 +803,30 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
     const statements: D1PreparedStatement[] = [];
     const expected = new Map<number, number>();
+    const ext = await this.hasExtMovementColumns();
 
     // stocks.id 昇順に更新してロック順序を統一する (DO では直列だが作法として揃える)
     const ordered = [...plan.allocations].sort((a, b) => a.stockId - b.stockId);
     for (const alloc of ordered) {
-      const idx = statements.length;
-      if (alloc.negative) {
+      this.appendOutflowAllocation(statements, expected, {
+        batchId,
+        documentId,
+        now,
+        actorId: input.actorId,
+        storeId: input.storeId,
+        alloc,
+        type: input.movementType ?? 'OUT',
+        department: input.department,
+        purpose: input.purpose,
+        reason: alloc.negative
+          ? 'negative-stock-approved'
+          : (input.reason ?? input.fefoDeviationReason ?? null),
+        groupId: input.groupId ?? null,
+        reasonCode: input.reasonCode ?? null,
+        ext,
         // 例外パス: 承認数量の範囲でのみマイナスを許す (quantity - q >= -承認数量)
-        statements.push(
-          db
-            .prepare(
-              `UPDATE stocks SET quantity = quantity - ?1, version = version + 1, updated_at = ?2
-                WHERE id = ?3 AND version = ?4 AND quantity - ?1 >= ?5`,
-            )
-            .bind(alloc.quantity, now, alloc.stockId, alloc.version, -(approval?.quantity ?? 0)),
-        );
-      } else {
-        statements.push(
-          db
-            .prepare(
-              `UPDATE stocks SET quantity = quantity - ?1, version = version + 1, updated_at = ?2
-                WHERE id = ?3 AND version = ?4 AND quantity >= ?1`,
-            )
-            .bind(alloc.quantity, now, alloc.stockId, alloc.version),
-        );
-      }
-      expected.set(idx, 1);
-      statements.push(
-        this.guardStmt(
-          batchId,
-          `stock-${alloc.stockId}`,
-          'EXISTS (SELECT 1 FROM stocks WHERE id = ? AND version = ? AND quantity = ?)',
-          [alloc.stockId, alloc.version + 1, alloc.after],
-        ),
-      );
-      statements.push(
-        db
-          .prepare(
-            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, department, purpose, reason, store_id, created_at)
-             VALUES (?1, ?2, 'OUT', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
-          )
-          .bind(
-            documentId,
-            alloc.stockId,
-            -alloc.quantity,
-            alloc.before,
-            alloc.after,
-            input.actorId,
-            input.department,
-            input.purpose,
-            alloc.negative ? 'negative-stock-approved' : (input.fefoDeviationReason ?? null),
-            input.storeId,
-            now,
-          ),
-      );
+        negativeFloor: -(approval?.quantity ?? 0),
+      });
     }
 
     if (plan.usedApprovalId !== null) {
@@ -736,7 +866,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       ...(plan.usedApprovalId !== null ? { negativeApprovalId: plan.usedApprovalId } : {}),
     };
     statements.push(
-      this.auditStmt(input.actorId, 'stock.consume', 'product', String(input.productId), {
+      this.auditStmt(input.actorId, input.auditAction ?? 'stock.consume', 'product', String(input.productId), {
         documentId,
         quantity: input.quantity,
         ...(plan.usedApprovalId !== null ? { negativeApprovalId: plan.usedApprovalId } : {}),
@@ -984,6 +1114,473 @@ export class InventoryCoordinator extends DurableObject<Env> {
       storeId: input.storeId,
       at: now,
     });
+    return this.envelope(201, body);
+  }
+
+  // ------------------------------------------------- セット品消費 / ピッキング確定 (0015)
+
+  /** FEFO 候補の読み取り (消費と同じ形)。locationId 未指定は店舗全体 */
+  private async loadFefoCandidates(
+    storeId: number,
+    productId: number,
+    locationId: number | undefined,
+    allowedLocationIds: number[] | null,
+  ): Promise<CandidateRow[]> {
+    const db = this.env.DB;
+    let sql = `SELECT s.id AS stock_id, s.lot_id AS lot_id, s.location_id AS location_id,
+                      loc.warehouse_id AS warehouse_id, s.quantity AS quantity, s.version AS version,
+                      l.expiry_date AS expiry_date, l.received_at AS received_at
+                 FROM stocks s
+                 JOIN lots l ON l.id = s.lot_id
+                 JOIN locations loc ON loc.id = s.location_id
+                WHERE l.product_id = ? AND s.store_id = ?`;
+    const params: unknown[] = [productId, storeId];
+    if (locationId !== undefined) {
+      sql += ' AND s.location_id = ?';
+      params.push(locationId);
+    }
+    if (allowedLocationIds !== null) {
+      if (allowedLocationIds.length === 0) return [];
+      sql += ` AND s.location_id IN (${allowedLocationIds.map(() => '?').join(',')})`;
+      params.push(...allowedLocationIds);
+    }
+    sql += ' ORDER BY s.id ASC';
+    const { results } = await db.prepare(sql).bind(...params).all<CandidateDbRow>();
+    return results.map((r) => ({
+      stockId: r.stock_id,
+      lotId: r.lot_id,
+      expiryDate: r.expiry_date,
+      quantity: r.quantity,
+      receivedAt: r.received_at,
+      version: r.version,
+      locationId: r.location_id,
+      warehouseId: r.warehouse_id,
+    }));
+  }
+
+  async consumeBundle(input: BundleConsumeInput): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.consumeBundleInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  /**
+   * セット品の消費: 構成品を必要数 × セット数だけ FEFO で消費する。
+   * 全構成品の計画が揃ってから 1 batch で確定するため、どれか 1 つでも
+   * 不足すれば全体が失敗する (中途半端な展開を残さない)。
+   * 台帳は構成品ごとの OUT で、group_id (= document_id) で束ねる。
+   */
+  private async consumeBundleInternal(input: BundleConsumeInput): Promise<Envelope> {
+    const stored = await this.findStoredResponse(input);
+    if (stored) return stored;
+    const activeTake = await this.activeStocktakeScope(input.storeId);
+    if (activeTake?.scopeType === 'full') throw stocktakeLocked();
+    if (
+      activeTake?.scopeType === 'locations' &&
+      input.locationId !== undefined &&
+      activeTake.locationIds.has(input.locationId)
+    ) {
+      throw stocktakeLocked();
+    }
+
+    const db = this.env.DB;
+    const now = Date.now();
+    const documentId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const ext = await this.hasExtMovementColumns();
+
+    const withBundle = await this.hasColumn('products', 'is_bundle');
+    const bundle = await db
+      .prepare(
+        `SELECT id${withBundle ? ', is_bundle' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+      )
+      .bind(input.bundleProductId, input.storeId)
+      .first<{ id: number; is_bundle?: number }>();
+    if (!bundle) throw badRequest('Product not found');
+    if (withBundle && bundle.is_bundle !== 1) {
+      throw new ApiError(422, 'NOT_A_BUNDLE', 'Product is not a bundle');
+    }
+    if (input.components.length === 0) {
+      throw new ApiError(422, 'BUNDLE_HAS_NO_COMPONENTS', 'Bundle has no components');
+    }
+
+    interface ComponentPlan {
+      productId: number;
+      required: number;
+      allocations: { stockId: number; lotId: number; locationId: number; quantity: number; before: number; after: number; version: number; negative: boolean }[];
+    }
+    const plans: ComponentPlan[] = [];
+    for (const comp of input.components) {
+      const required = comp.quantity * input.quantity;
+      let candidates = await this.loadFefoCandidates(
+        input.storeId,
+        comp.productId,
+        input.locationId,
+        input.allowedLocationIds,
+      );
+      let needsLockedStock = false;
+      if (activeTake?.scopeType === 'locations' && input.locationId === undefined) {
+        const all = candidates;
+        candidates = all.filter((cd) => !activeTake.locationIds.has(cd.locationId));
+        if (planConsumption(candidates, required, now, null).shortfall > 0) {
+          needsLockedStock = planConsumption(all, required, now, null).shortfall === 0;
+        }
+      }
+      const plan = planConsumption(candidates, required, now, null);
+      if (plan.shortfall > 0) {
+        if (needsLockedStock) throw stocktakeLocked();
+        throw insufficientStock(
+          `Component product ${comp.productId}: requested ${required}, available ${required - plan.shortfall} (expired lots excluded)`,
+        );
+      }
+      plans.push({ productId: comp.productId, required, allocations: plan.allocations });
+    }
+
+    const statements: D1PreparedStatement[] = [];
+    const expected = new Map<number, number>();
+    const bodyAllocations: { productId: number; stockId: number; lotId: number; locationId: number; quantity: number }[] = [];
+    for (const plan of plans) {
+      const ordered = [...plan.allocations].sort((a, b) => a.stockId - b.stockId);
+      for (const alloc of ordered) {
+        this.appendOutflowAllocation(statements, expected, {
+          batchId,
+          documentId,
+          now,
+          actorId: input.actorId,
+          storeId: input.storeId,
+          alloc,
+          type: 'OUT',
+          department: input.department,
+          purpose: input.purpose,
+          reason: null,
+          groupId: documentId,
+          reasonCode: null,
+          ext,
+          negativeFloor: 0,
+        });
+        bodyAllocations.push({
+          productId: plan.productId,
+          stockId: alloc.stockId,
+          lotId: alloc.lotId,
+          locationId: alloc.locationId,
+          quantity: alloc.quantity,
+        });
+      }
+    }
+    const body = { documentId, groupId: documentId, allocations: bodyAllocations };
+    statements.push(
+      this.auditStmt(input.actorId, 'stock.consume_bundle', 'product', String(input.bundleProductId), {
+        documentId,
+        quantity: input.quantity,
+        components: plans.map((p) => ({ productId: p.productId, quantity: p.required })),
+      }, input.storeId),
+    );
+    statements.push(this.idempotencyStmt(input, 201, body));
+    statements.push(this.cleanupGuardsStmt(batchId));
+    await this.runBatch(statements, expected);
+    this.broadcast({
+      type: 'stock.changed',
+      stockIds: bodyAllocations.map((a) => a.stockId),
+      documentId,
+      storeId: input.storeId,
+      at: now,
+    });
+    return this.envelope(201, body);
+  }
+
+  async confirmPick(input: PickConfirmInput): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.confirmPickInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  /**
+   * ピッキングリストの確定: 検品済み数量を消費または移動として一括実行する。
+   * 計画はメモリ上の残高 (オーバーレイ) に対して組み立て、全明細の計画が
+   * 揃ってから 1 batch で確定するため、在庫不足があれば全体が失敗する。
+   * 同一 batch 内で pick_lists を done に進めることも含めて原子的。
+   */
+  private async confirmPickInternal(input: PickConfirmInput): Promise<Envelope> {
+    const stored = await this.findStoredResponse(input);
+    if (stored) return stored;
+    const touchedLocationIds = input.items.map((i) => i.fromLocationId);
+    if (input.type === 'transfer' && input.toLocationId !== undefined) {
+      touchedLocationIds.push(input.toLocationId);
+    }
+    await this.assertLocationsUnlocked(input.storeId, touchedLocationIds);
+
+    const db = this.env.DB;
+    const now = Date.now();
+    const documentId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+    const ext = await this.hasExtMovementColumns();
+
+    if (input.type === 'transfer') {
+      if (input.toLocationId === undefined) throw badRequest('toLocationId is required for transfer pick lists');
+      for (const item of input.items) {
+        if (item.fromLocationId === input.toLocationId) {
+          throw badRequest('fromLocationId and toLocationId must differ');
+        }
+      }
+    }
+
+    interface StockState {
+      id: number;
+      lotId: number;
+      locationId: number;
+      /** batch 実行前の数量・version (条件付き UPDATE の期待値) */
+      initialQuantity: number;
+      version: number;
+      /** オーバーレイ上の現在数量 */
+      quantity: number;
+    }
+    const stockState = new Map<number, StockState>();
+    /** 新規に作る移動先 stocks (locationId:lotId -> 数量) */
+    const destNew = new Map<string, { locationId: number; lotId: number; quantity: number }>();
+    interface Op {
+      stockId: number | null;
+      destKey: string | null;
+      type: string;
+      quantityChange: number;
+      before: number;
+      after: number;
+    }
+    const ops: Op[] = [];
+
+    const registerStock = (row: { id: number; lot_id: number; location_id: number; quantity: number; version: number }): StockState => {
+      const existing = stockState.get(row.id);
+      if (existing) return existing;
+      const st: StockState = {
+        id: row.id,
+        lotId: row.lot_id,
+        locationId: row.location_id,
+        initialQuantity: row.quantity,
+        version: row.version,
+        quantity: row.quantity,
+      };
+      stockState.set(row.id, st);
+      return st;
+    };
+
+    for (const item of input.items) {
+      if (item.quantity <= 0) continue;
+      const product = await db
+        .prepare('SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+        .bind(item.productId, input.storeId)
+        .first<{ id: number }>();
+      if (!product) throw badRequest('Product not found');
+      const { results } = await db
+        .prepare(
+          `SELECT s.id, s.lot_id, s.location_id, s.quantity, s.version,
+                  l.expiry_date, l.received_at
+             FROM stocks s JOIN lots l ON l.id = s.lot_id
+            WHERE s.location_id = ? AND l.product_id = ? AND s.store_id = ?
+            ORDER BY s.id ASC`,
+        )
+        .bind(item.fromLocationId, item.productId, input.storeId)
+        .all<{ id: number; lot_id: number; location_id: number; quantity: number; version: number; expiry_date: number | null; received_at: number }>();
+      const candidates: FefoCandidate[] = results.map((r) => {
+        const st = registerStock(r);
+        return {
+          stockId: r.id,
+          lotId: r.lot_id,
+          expiryDate: r.expiry_date,
+          quantity: st.quantity,
+          receivedAt: r.received_at,
+        };
+      });
+      const plan = proposeFefoAllocation(candidates, item.quantity, now);
+      if (plan.shortfall > 0) {
+        throw insufficientStock(
+          `Product ${item.productId} at location ${item.fromLocationId}: requested ${item.quantity}, available ${item.quantity - plan.shortfall} (expired lots excluded)`,
+        );
+      }
+      for (const alloc of plan.allocations) {
+        const st = stockState.get(alloc.stockId);
+        if (!st) throw stockConflict();
+        const before = st.quantity;
+        const after = before - alloc.quantity;
+        st.quantity = after;
+        ops.push({
+          stockId: st.id,
+          destKey: null,
+          type: input.type === 'consume' ? 'OUT' : 'TRANSFER_OUT',
+          quantityChange: -alloc.quantity,
+          before,
+          after,
+        });
+        if (input.type === 'transfer') {
+          const toLocationId = input.toLocationId as number;
+          const destRow = await db
+            .prepare('SELECT id, lot_id, location_id, quantity, version FROM stocks WHERE location_id = ?1 AND lot_id = ?2 AND store_id = ?3')
+            .bind(toLocationId, alloc.lotId, input.storeId)
+            .first<{ id: number; lot_id: number; location_id: number; quantity: number; version: number }>();
+          if (destRow) {
+            const dst = registerStock(destRow);
+            const dBefore = dst.quantity;
+            dst.quantity += alloc.quantity;
+            ops.push({
+              stockId: dst.id,
+              destKey: null,
+              type: 'TRANSFER_IN',
+              quantityChange: alloc.quantity,
+              before: dBefore,
+              after: dst.quantity,
+            });
+          } else {
+            const key = `${toLocationId}:${alloc.lotId}`;
+            const dn = destNew.get(key) ?? { locationId: toLocationId, lotId: alloc.lotId, quantity: 0 };
+            const dBefore = dn.quantity;
+            dn.quantity += alloc.quantity;
+            destNew.set(key, dn);
+            ops.push({
+              stockId: null,
+              destKey: key,
+              type: 'TRANSFER_IN',
+              quantityChange: alloc.quantity,
+              before: dBefore,
+              after: dn.quantity,
+            });
+          }
+        }
+      }
+    }
+    if (ops.length === 0) throw badRequest('No picked items to confirm');
+
+    const statements: D1PreparedStatement[] = [];
+    const expected = new Map<number, number>();
+    const mvCols =
+      'document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, department, purpose, reason, store_id, created_at' +
+      (ext ? ', group_id, reason_code' : '');
+    const purpose = input.type === 'consume' ? `ピッキング #${input.pickListId}` : null;
+
+    // 既存 stocks の更新は stock ごとに 1 回に集約する (同一行への二重更新を避ける)
+    const touched = [...stockState.values()]
+      .filter((st) => st.quantity !== st.initialQuantity)
+      .sort((a, b) => a.id - b.id);
+    for (const st of touched) {
+      const delta = st.quantity - st.initialQuantity;
+      const idx = statements.length;
+      if (delta < 0) {
+        statements.push(
+          db
+            .prepare(
+              `UPDATE stocks SET quantity = quantity - ?1, version = version + 1, updated_at = ?2
+                WHERE id = ?3 AND version = ?4 AND quantity >= ?1`,
+            )
+            .bind(-delta, now, st.id, st.version),
+        );
+      } else {
+        statements.push(
+          db
+            .prepare(
+              'UPDATE stocks SET quantity = quantity + ?1, version = version + 1, updated_at = ?2 WHERE id = ?3 AND version = ?4',
+            )
+            .bind(delta, now, st.id, st.version),
+        );
+      }
+      expected.set(idx, 1);
+      statements.push(
+        this.guardStmt(
+          batchId,
+          `pick-stock-${st.id}`,
+          'EXISTS (SELECT 1 FROM stocks WHERE id = ? AND version = ? AND quantity = ?)',
+          [st.id, st.version + 1, st.quantity],
+        ),
+      );
+    }
+    // 新規の移動先 stocks
+    for (const dn of destNew.values()) {
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO stocks (location_id, lot_id, quantity, version, store_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)`,
+          )
+          .bind(dn.locationId, dn.lotId, dn.quantity, input.storeId, now),
+      );
+      statements.push(
+        this.guardStmt(
+          batchId,
+          `pick-new-${dn.locationId}-${dn.lotId}`,
+          'EXISTS (SELECT 1 FROM stocks WHERE location_id = ? AND lot_id = ? AND quantity = ? AND version = 1)',
+          [dn.locationId, dn.lotId, dn.quantity],
+        ),
+      );
+    }
+    // 台帳 (計画順)
+    for (const op of ops) {
+      if (op.stockId !== null) {
+        const binds: unknown[] = [
+          documentId, op.stockId, op.type, op.quantityChange, op.before, op.after,
+          input.actorId, null, op.type === 'OUT' ? purpose : null, null, input.storeId, now,
+        ];
+        if (ext) binds.push(documentId, null);
+        statements.push(
+          db
+            .prepare(
+              `INSERT INTO stock_movements (${mvCols}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12${ext ? ', ?13, ?14' : ''})`,
+            )
+            .bind(...binds),
+        );
+      } else {
+        const dn = destNew.get(op.destKey as string);
+        if (!dn) throw stockConflict();
+        const binds: unknown[] = [
+          documentId, op.type, op.quantityChange, op.before, op.after, input.actorId, input.storeId, now,
+        ];
+        if (ext) binds.push(documentId, null);
+        binds.push(dn.locationId, dn.lotId);
+        statements.push(
+          db.prepare(
+            `INSERT INTO stock_movements (${mvCols})
+             SELECT ?1, s.id, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7, ?8${ext ? ', ?9, ?10' : ''}
+               FROM stocks s WHERE s.location_id = ?${ext ? 11 : 9} AND s.lot_id = ?${ext ? 12 : 10}`,
+          ).bind(...binds),
+        );
+      }
+    }
+    // リストを done に進める (同一 batch で原子的に)
+    if (await this.hasColumn('pick_lists', 'status')) {
+      const idx = statements.length;
+      statements.push(
+        db
+          .prepare(
+            "UPDATE pick_lists SET status = 'done', completed_at = ?1 WHERE id = ?2 AND store_id = ?3 AND status = 'open'",
+          )
+          .bind(now, input.pickListId, input.storeId),
+      );
+      expected.set(idx, 1);
+    }
+    statements.push(
+      this.auditStmt(input.actorId, 'pick_list.confirm', 'pick_list', String(input.pickListId), {
+        documentId,
+        type: input.type,
+        items: input.items.filter((i) => i.quantity > 0).length,
+      }, input.storeId),
+    );
+    const body = { documentId, groupId: documentId, movements: ops.length };
+    statements.push(this.idempotencyStmt(input, 201, body));
+    statements.push(this.cleanupGuardsStmt(batchId));
+    await this.runBatch(statements, expected);
+
+    const stockIds = touched.map((st) => st.id);
+    for (const dn of destNew.values()) {
+      const created = await db
+        .prepare('SELECT id FROM stocks WHERE location_id = ?1 AND lot_id = ?2 AND store_id = ?3')
+        .bind(dn.locationId, dn.lotId, input.storeId)
+        .first<{ id: number }>();
+      if (created) stockIds.push(created.id);
+    }
+    this.broadcast({ type: 'stock.changed', stockIds, documentId, storeId: input.storeId, at: now });
     return this.envelope(201, body);
   }
 

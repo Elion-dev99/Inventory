@@ -40,6 +40,9 @@ const EXTRA_CSS = `
 .mnt-preset-row { flex-wrap: wrap; }
 .mnt-preset-chip { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.42rem 0.75rem; border: 1px solid var(--line-strong); border-radius: 980px; background: var(--surface-2); color: var(--fg); font-size: 0.92rem; white-space: nowrap; }
 .mnt-preset-del { border: 0; background: transparent; color: var(--danger); cursor: pointer; font: inherit; padding: 0 0.1rem; }
+/* 利用量の容量バー (単色のみ) */
+.usage-bar { height: 8px; background: var(--control); border-radius: 4px; overflow: hidden; margin: 0.4rem 0; }
+.usage-bar > div { height: 100%; background: var(--accent); }
 /* 中幅以下ではフォーム行を 1 カラムに積み、コントロールを全幅にする
    (.group-row は折り返しなしの flex のため、狭幅ではラベルが潰れ入力欄がはみ出す) */
 @media (max-width: 900px) {
@@ -251,6 +254,15 @@ export const CONSOLE_HTML = `<!doctype html>
   <h3>データベース</h3>
   <div id="sysTables"><div class="skl skl-row"></div></div>
   <p class="small muted" id="sysSessions"></p>
+  <h3>利用量</h3>
+  <div id="sysUsage"><div class="skl skl-row"></div></div>
+  <h3>バックアップ</h3>
+  <p class="small muted">業務データ一式のスナップショットです。自動分は1日1回作成されます。復元は業務データだけが対象で、ユーザー・割当・セッションは戻りません。復元前に現在の状態が自動で保存されます。</p>
+  <div class="group">
+    <div class="group-row"><span class="row-label">手動バックアップ</span><button class="btn small" id="backupCreateBtn">今すぐ作成</button></div>
+  </div>
+  <p class="small" id="backupMsg"></p>
+  <div id="backupList"><div class="skl skl-row"></div></div>
   <h3>操作</h3>
   <div class="group">
     <div class="group-row"><span class="row-label">全データエクスポート (全店舗)</span><a class="btn small" href="/api/platform/export.json">ダウンロード</a></div>
@@ -690,6 +702,126 @@ async function loadSystem() {
   }
   fillMaintenanceForms();
   loadMaintenance();
+  loadUsage();
+  loadBackups();
+}
+
+/* ---------------- 利用量 ---------------- */
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+async function loadUsage() {
+  try {
+    const data = await api('/api/platform/usage');
+    const db = data.database || {};
+    let html = '';
+    const dbSize = (db.sizeBytes !== null && db.sizeBytes !== undefined) ? db.sizeBytes : db.sizeEstimateBytes;
+    if (dbSize) {
+      const FREE_LIMIT = 5 * 1024 * 1024 * 1024;
+      const pct = Math.min(100, Math.round((dbSize / FREE_LIMIT) * 1000) / 10);
+      const estimated = db.sizeBytes === null || db.sizeBytes === undefined;
+      html += '<div class="group"><div class="group-row static"><span class="row-label">DB 容量 ' +
+        (estimated ? '約 ' : '') + fmtBytes(dbSize) + ' / 5 GB (無料枠)</span><span>' + pct + '%</span></div>' +
+        '<div style="padding:0 1rem 0.6rem;"><div class="usage-bar"><div style="width:' + pct + '%"></div></div></div></div>';
+    }
+    html += '<p class="small muted">全テーブル行数: ' + (db.totalRows || 0) + ' 行 / 有効なセッション: ' +
+      data.activeSessions + ' 件 / バックアップ: ' + data.backups.count + ' 件 (' + fmtBytes(data.backups.totalBytes) + ')</p>';
+    html += '<div class="table-wrap"><table><thead><tr><th>店舗</th><th>商品</th><th>在庫レコード</th><th>移動 (当月)</th><th>ユーザー</th></tr></thead><tbody>';
+    for (const s of data.stores || []) {
+      html += '<tr><td>' + esc(s.name) + ' <small class="muted">' + esc(s.code) + '</small></td>' +
+        '<td>' + s.products + '</td><td>' + s.stockRows + '</td><td>' + s.movementsThisMonth + '</td><td>' + s.users + '</td></tr>';
+    }
+    el('sysUsage').innerHTML = html + '</tbody></table></div>';
+  } catch (e) {
+    el('sysUsage').innerHTML = '<p class="small muted">利用量を取得できませんでした: ' + esc(errText(e)) + '</p>';
+  }
+}
+
+/* ---------------- バックアップ ---------------- */
+let restoreConfirmId = null;
+async function loadBackups() {
+  try {
+    const data = await api('/api/platform/backups');
+    const items = data.items || [];
+    if (items.length === 0) {
+      el('backupList').innerHTML = '<p class="small muted">バックアップはまだありません。</p>';
+      return;
+    }
+    let html = '<div class="table-wrap"><table><thead><tr><th>日時</th><th>種別</th><th>サイズ</th><th>メモ</th><th></th></tr></thead><tbody>';
+    for (const b of items) {
+      const kindLabel = b.note === 'pre-restore' ? '復元前' : (b.kind === 'auto' ? '自動' : '手動');
+      html += '<tr><td>' + fmtDate(b.createdAt) + '</td><td>' + kindLabel + '</td><td>' + fmtBytes(b.sizeBytes) + '</td>' +
+        '<td>' + esc(b.note || '') + '</td><td style="white-space:nowrap;">' +
+        '<a class="btn small secondary" href="/api/platform/backups/' + b.id + '/download">ダウンロード</a> ';
+      if (restoreConfirmId === b.id) {
+        html += '<span class="small">この内容で復元しますか？ <button class="btn small danger" data-restore-yes="' + b.id + '">復元する</button> ' +
+          '<button class="btn small secondary" data-restore-no="1">やめる</button></span>';
+      } else {
+        html += '<button class="btn small danger" data-restore="' + b.id + '">復元</button>';
+      }
+      html += '</td></tr>';
+    }
+    el('backupList').innerHTML = html + '</tbody></table></div>';
+    el('backupList').querySelectorAll('button[data-restore]').forEach((btn) => {
+      btn.onclick = () => { restoreConfirmId = Number(btn.dataset.restore); loadBackups(); };
+    });
+    el('backupList').querySelectorAll('button[data-restore-no]').forEach((btn) => {
+      btn.onclick = () => { restoreConfirmId = null; loadBackups(); };
+    });
+    el('backupList').querySelectorAll('button[data-restore-yes]').forEach((btn) => {
+      btn.onclick = () => restoreBackupById(Number(btn.dataset.restoreYes));
+    });
+  } catch (e) {
+    el('backupList').innerHTML = '<p class="small muted">バックアップ一覧を取得できませんでした: ' + esc(errText(e)) + '</p>';
+  }
+}
+async function createBackupNow() {
+  const btn = el('backupCreateBtn');
+  btn.disabled = true;
+  el('backupMsg').textContent = '';
+  try {
+    const created = await api('/api/platform/backups', { method: 'POST', body: {} });
+    el('backupMsg').textContent = 'バックアップを作成しました (' + fmtDate(created.createdAt) + ' / ' + fmtBytes(created.sizeBytes) + ')。';
+    loadBackups();
+    loadUsage();
+  } catch (e) {
+    el('backupMsg').textContent = '作成に失敗しました: ' + errText(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+async function restoreBackupById(id) {
+  restoreConfirmId = null;
+  el('backupMsg').textContent = '復元しています…';
+  try {
+    const res = await api('/api/platform/backups/' + id + '/restore', { method: 'POST', body: {} });
+    el('backupMsg').textContent = '復元しました。復元前の状態はバックアップ #' + res.preRestoreBackupId + ' に保存されています。';
+    loadBackups();
+    loadUsage();
+    loadSystemTablesOnly();
+  } catch (e) {
+    el('backupMsg').textContent = '復元に失敗しました: ' + errText(e);
+    loadBackups();
+  }
+}
+/* 復元後にデータベース行数だけを更新する (loadSystem 全体はメンテナンス欄も触るため分ける) */
+async function loadSystemTablesOnly() {
+  try {
+    const data = await api('/api/platform/system');
+    const labels = {
+      stores: '店舗', users: 'ユーザー', products: '商品', stocks: '在庫',
+      stock_movements: '在庫移動', audit_logs: '監査ログ', sessions: 'セッション', purchase_orders: '発注',
+    };
+    let html = '<div class="table-wrap"><table><thead><tr><th>テーブル</th><th>行数</th></tr></thead><tbody>';
+    for (const key of Object.keys(data.tables || {})) {
+      html += '<tr><td>' + esc(labels[key] || key) + ' <small class="muted">' + esc(key) + '</small></td><td>' + data.tables[key] + '</td></tr>';
+    }
+    el('sysTables').innerHTML = html + '</tbody></table></div>';
+  } catch (e) { /* 次回表示時に再取得する */ }
 }
 
 /* ---------------- メンテナンス ---------------- */
@@ -1260,6 +1392,7 @@ el('auditSearchBtn').onclick = loadAudit;
 el('mntStartBtn').onclick = startMaintenanceNow;
 el('mntAddBtn').onclick = addWindow;
 el('revokeAllBtn').onclick = revokeAllSessions;
+el('backupCreateBtn').onclick = createBackupNow;
 el('annCreateBtn').onclick = createAnnouncement;
 loadAll();
 </script>

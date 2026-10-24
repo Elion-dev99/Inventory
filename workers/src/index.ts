@@ -3,9 +3,11 @@ import { z } from 'zod';
 import type { Env } from './env';
 import {
   InventoryCoordinator,
+  type BundleConsumeInput,
   type ConsumeInput,
   type Envelope,
   type InboundInput,
+  type PickConfirmInput,
   type StartStocktakeInput,
   type TransferInput,
 } from './coordinator';
@@ -55,9 +57,16 @@ import { PWA_HEAD, manifestResponse, iconResponse, serviceWorkerResponse } from 
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
 import {
+  bulkProductsSchema,
+  bundleComponentsSchema,
+  bundleConsumptionSchema,
   consumptionSchema,
+  consumeReservationSchema,
   countedQuantitySchema,
   createApprovalSchema,
+  createPickListSchema,
+  createPoTemplateSchema,
+  createReservationSchema,
   createStocktakeSchema,
   createLocationSchema,
   createLotSchema,
@@ -67,17 +76,33 @@ import {
   createWarehouseSchema,
   decideApprovalSchema,
   decideStocktakeSchema,
+  disposalSchema,
   formatDateOnly,
   inboundSchema,
   parseDateOnly,
+  poScheduleSchema,
   receivePurchaseOrderSchema,
+  returnMovementSchema,
   transferSchema,
   updateLocationSchema,
   updateLotSchema,
+  updatePickItemSchema,
   updateProductSchema,
   updateSupplierSchema,
   updateWarehouseSchema,
 } from './lib/schemas';
+import {
+  activeReservationRows,
+  bundleAvailability,
+  bundleComponentRows,
+  createDraftPurchaseOrder,
+  reservationJson,
+  runScheduledPoDrafts,
+  storeStockRows,
+  type ReservationDbRow,
+} from './lib/commercial';
+import { computeFreeQuantities } from './lib/free-stock';
+import { maybeAutoBackup } from './lib/backup';
 import {
   defaultFeatures,
   FEATURE_CATALOG,
@@ -844,8 +869,15 @@ function maintenanceFeatureFor(method: string, path: string): string | null {
   if (p === '/stocks.csv' || p === '/admin/export.json') return 'csv_export';
   if (p === '/products/import' || p === '/master/products/import') return 'csv_import';
   if (p === '/movements/inbound') return 'inbound';
+  if (p === '/movements/return') return 'inbound';
   if (p === '/movements/consumption') return 'outbound';
+  if (p === '/movements/disposal') return 'outbound';
+  if (p === '/movements/bundle-consumption') return 'outbound';
   if (p === '/movements/transfer') return 'transfers';
+  if (p === '/reservations' || p.startsWith('/reservations/')) return 'outbound';
+  if (p === '/pick-lists' || p.startsWith('/pick-lists/')) return 'outbound';
+  if (p === '/purchase-order-templates' || p.startsWith('/purchase-order-templates/')) return 'purchase_orders';
+  if (p === '/admin/products/bulk') return 'master_products';
   if (p === '/negative-approvals' || p.startsWith('/negative-approvals/')) return 'outbound';
   if (p === '/stocktakes' || p.startsWith('/stocktakes/')) return 'stocktakes';
   if (p === '/purchase-orders' || p.startsWith('/purchase-orders/')) return 'purchase_orders';
@@ -1144,6 +1176,8 @@ async function sha256Hex(text: string): Promise<string> {
 interface CoordinatorStub {
   inbound: (input: InboundInput) => Promise<Envelope>;
   consume: (input: ConsumeInput) => Promise<Envelope>;
+  consumeBundle: (input: BundleConsumeInput) => Promise<Envelope>;
+  confirmPick: (input: PickConfirmInput) => Promise<Envelope>;
   transfer: (input: TransferInput) => Promise<Envelope>;
   startStocktake: (input: StartStocktakeInput) => Promise<Envelope>;
   finishStocktake: (input: { actorId: number; stocktakeId: number; storeId: number }) => Promise<Envelope>;
@@ -1296,6 +1330,90 @@ app.post('/api/v1/session/store', async (c) => {
   return c.json({ currentStore: store });
 });
 
+// ------------------------------------------------------- 初期セットアップ
+
+/**
+ * セットアップ進捗 (現在店舗)。「はじめに」画面とホームのカードが使う。
+ * 判定はすべて実データから行う (保存された進捗フラグは持たない):
+ * - locations: 保管場所が 1 件以上 (削除済みを除く)
+ * - products: 商品が 1 件以上 (削除済みを除く)
+ * - members: 現在店舗に割当のあるユーザーが 2 人以上
+ * - features: 機能フラグが 1 件でも明示設定されていれば「確認済み」とみなす
+ */
+app.get('/api/v1/setup/status', async (c) => {
+  await requirePermission(c, Permission.MASTER_READ);
+  const ctx = await storeContext(c);
+  const db = c.env.DB;
+  const count = async (sql: string, ...params: number[]): Promise<number> => {
+    try {
+      const row = await db.prepare(sql).bind(...params).first<{ n: number }>();
+      return row?.n ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+  const locationCount = await count(
+    `SELECT COUNT(*) AS n FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+      WHERE w.store_id = ?1 AND loc.deleted_at IS NULL`,
+    ctx.store.id,
+  );
+  const productCount = await count(
+    'SELECT COUNT(*) AS n FROM products WHERE store_id = ?1 AND deleted_at IS NULL',
+    ctx.store.id,
+  );
+  const memberCount = await count(
+    'SELECT COUNT(DISTINCT user_id) AS n FROM user_roles WHERE store_id = ?1',
+    ctx.store.id,
+  );
+  const featureFlagCount = await count(
+    'SELECT COUNT(*) AS n FROM feature_flags WHERE store_id = ?1',
+    ctx.store.id,
+  );
+  const items = {
+    locations: locationCount >= 1,
+    products: productCount >= 1,
+    members: memberCount >= 2,
+    features: featureFlagCount >= 1,
+  };
+  const doneCount = Object.values(items).filter(Boolean).length;
+  return c.json({
+    items,
+    counts: { locations: locationCount, products: productCount, members: memberCount },
+    doneCount,
+    totalCount: 4,
+    complete: doneCount === 4,
+  });
+});
+
+/** 商品 CSV テンプレート (取込と同じ列 sku,name,unit,requires_expiry,unit_cost) */
+app.get('/api/v1/setup/template/products.csv', async (c) => {
+  await requirePermission(c, Permission.MASTER_READ);
+  await storeContext(c);
+  const rows: string[][] = [
+    ['SAMPLE-001', 'サンプル商品A', '個', 'false', '120'],
+    ['SAMPLE-002', 'サンプル商品B (期限管理あり)', '箱', 'true', ''],
+  ];
+  return c.body('\uFEFF' + toCsv(['sku', 'name', 'unit', 'requires_expiry', 'unit_cost'], rows), 200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="products-template.csv"',
+  });
+});
+
+/** 保管場所 CSV テンプレート (warehouse_code,code,name,parent_code の参考形式) */
+app.get('/api/v1/setup/template/locations.csv', async (c) => {
+  await requirePermission(c, Permission.MASTER_READ);
+  await storeContext(c);
+  const rows: string[][] = [
+    ['WH-01', 'ZONE-A', 'ゾーンA', ''],
+    ['WH-01', 'A-01', '棚A-01', 'ZONE-A'],
+    ['WH-01', 'A-02', '棚A-02', 'ZONE-A'],
+  ];
+  return c.body('\uFEFF' + toCsv(['warehouse_code', 'code', 'name', 'parent_code'], rows), 200, {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': 'attachment; filename="locations-template.csv"',
+  });
+});
+
 // ------------------------------------------------------------ 機能フラグ
 
 /** 解決済みの機能フラグ (現在店舗)。/app の出し分けと管理画面の初期表示用 */
@@ -1390,11 +1508,15 @@ app.get('/api/v1/movements', async (c) => {
   const photoCountSql = (await hasTable(c, 'movement_photos'))
     ? '(SELECT COUNT(*) FROM movement_photos mp WHERE mp.movement_id = mv.id) AS photoCount'
     : '0 AS photoCount';
+  // 0015 の拡張列 (セット品の束・返品/廃棄の理由コード)
+  const extSql = (await hasColumn(c, 'stock_movements', 'group_id'))
+    ? 'mv.group_id AS groupId, mv.reason_code AS reasonCode,'
+    : 'NULL AS groupId, NULL AS reasonCode,';
   const sql =
     `SELECT mv.id, mv.document_id AS documentId, mv.stock_id AS stockId, mv.type,
             mv.quantity_change AS quantityChange, mv.quantity_before AS quantityBefore,
             mv.quantity_after AS quantityAfter, mv.actor_id AS actorId,
-            mv.department, mv.purpose, mv.reason, mv.created_at AS createdAt,
+            mv.department, mv.purpose, mv.reason, ${extSql} mv.created_at AS createdAt,
             s.location_id AS locationId, loc.warehouse_id AS warehouseId,
             l.product_id AS productId, l.lot_code AS lotCode, p.sku, ${photoCountSql}
        FROM stock_movements mv
@@ -1525,6 +1647,8 @@ interface ProductRow {
   image_key?: string | null;
   case_size?: number | null;
   lead_time_days?: number | null;
+  /** 0015 で追加 (セット品フラグ)。同上 */
+  is_bundle?: number;
   created_at: number;
   updated_at: number;
 }
@@ -1543,6 +1667,7 @@ function productJson(r: ProductRow): Record<string, unknown> {
     imageKey: r.image_key ?? null,
     caseSize: r.case_size ?? null,
     leadTimeDays: r.lead_time_days ?? null,
+    isBundle: r.is_bundle === 1,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -1558,7 +1683,17 @@ async function listProducts(c: AppContext): Promise<Response> {
   )
     .bind(ctx.store.id, take, skip)
     .all<ProductRow>();
-  return c.json(results.map(productJson));
+  const out = results.map(productJson);
+  // セット品の単価は構成品の合算で出す (0015。セット品自体は単価を持たない)
+  if (results.some((r) => r.is_bundle === 1) && (await hasTable(c, 'product_bundles'))) {
+    for (let i = 0; i < results.length; i++) {
+      if (results[i]?.is_bundle === 1) {
+        const avail = await bundleAvailability(c.env.DB, ctx.store.id, results[i]?.id as number);
+        out[i] = { ...out[i], unitCost: avail.unitCost, assemblable: avail.assemblable };
+      }
+    }
+  }
+  return c.json(out);
 }
 
 async function createProduct(c: AppContext): Promise<Response> {
@@ -1578,6 +1713,7 @@ async function createProduct(c: AppContext): Promise<Response> {
   if (await hasColumn(c, 'products', 'unit_cost')) { cols.push('unit_cost'); binds.push(dto.unitCost ?? null); }
   if (await hasColumn(c, 'products', 'case_size')) { cols.push('case_size'); binds.push(dto.caseSize ?? null); }
   if (await hasColumn(c, 'products', 'lead_time_days')) { cols.push('lead_time_days'); binds.push(dto.leadTimeDays ?? null); }
+  if (await hasColumn(c, 'products', 'is_bundle')) { cols.push('is_bundle'); binds.push(dto.isBundle ? 1 : 0); }
   cols.push('created_at', 'updated_at');
   binds.push(now, now);
   const placeholders = cols.map((_, i) => `?${i + 1}`).join(', ');
@@ -1631,7 +1767,8 @@ async function listLocations(c: AppContext): Promise<Response> {
   const ctx = await storeContext(c);
   const reachable = reachableWarehouseIds(ctx.assignments);
   const warehouseId = c.req.query('warehouseId');
-  let sql = `SELECT loc.id, loc.warehouse_id AS warehouseId, loc.code, loc.name
+  const withParent = await hasColumn(c, 'locations', 'parent_id');
+  let sql = `SELECT loc.id, loc.warehouse_id AS warehouseId, loc.code, loc.name${withParent ? ', loc.parent_id AS parentId' : ', NULL AS parentId'}
                FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
               WHERE loc.deleted_at IS NULL AND w.store_id = ?`;
   const params: number[] = [ctx.store.id];
@@ -1663,17 +1800,65 @@ async function createLocation(c: AppContext): Promise<Response> {
   if (!canAccessWarehouse(ctx.assignments, dto.warehouseId)) {
     throw forbidden('Out of warehouse scope');
   }
+  const withParent = await hasColumn(c, 'locations', 'parent_id');
+  let parentId: number | null = null;
+  if (withParent && dto.parentId !== undefined && dto.parentId !== null) {
+    parentId = await validateLocationParent(c, ctx.store.id, dto.warehouseId, dto.parentId, null);
+  }
   const now = Date.now();
   try {
-    const res = await c.env.DB.prepare(
-      'INSERT INTO locations (warehouse_id, code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)',
-    )
-      .bind(dto.warehouseId, dto.code, dto.name, now)
-      .run();
-    return c.json({ id: Number(res.meta.last_row_id), warehouseId: dto.warehouseId, code: dto.code, name: dto.name }, 201);
+    const res = withParent
+      ? await c.env.DB.prepare(
+          'INSERT INTO locations (warehouse_id, code, name, parent_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)',
+        )
+          .bind(dto.warehouseId, dto.code, dto.name, parentId, now)
+          .run()
+      : await c.env.DB.prepare(
+          'INSERT INTO locations (warehouse_id, code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)',
+        )
+          .bind(dto.warehouseId, dto.code, dto.name, now)
+          .run();
+    return c.json({ id: Number(res.meta.last_row_id), warehouseId: dto.warehouseId, code: dto.code, name: dto.name, parentId }, 201);
   } catch {
     throw new ApiError(409, 'DUPLICATE', 'Location with this code already exists in the warehouse');
   }
+}
+
+/**
+ * 親ロケーションの検証: 同じ店舗・同じ倉庫の場所であること、自分自身や
+ * 自分の子孫を親にして循環しないこと。問題があれば 422 を投げ、親 ID を返す。
+ */
+async function validateLocationParent(
+  c: AppContext,
+  storeId: number,
+  warehouseId: number,
+  parentId: number,
+  selfId: number | null,
+): Promise<number> {
+  let current: number | null = parentId;
+  const seen = new Set<number>();
+  while (current !== null) {
+    if (selfId !== null && current === selfId) {
+      throw new ApiError(422, 'LOCATION_PARENT_CYCLE', 'A location cannot be its own ancestor');
+    }
+    if (seen.has(current)) {
+      throw new ApiError(422, 'LOCATION_PARENT_CYCLE', 'Location parent chain contains a cycle');
+    }
+    seen.add(current);
+    const row: { warehouse_id: number; parent_id: number | null } | null = await c.env.DB.prepare(
+      `SELECT loc.warehouse_id AS warehouse_id, loc.parent_id AS parent_id
+         FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+        WHERE loc.id = ?1 AND loc.deleted_at IS NULL AND w.store_id = ?2`,
+    )
+      .bind(current, storeId)
+      .first<{ warehouse_id: number; parent_id: number | null }>();
+    if (!row) throw notFound('Parent location not found');
+    if (current === parentId && row.warehouse_id !== warehouseId) {
+      throw new ApiError(422, 'LOCATION_PARENT_WAREHOUSE', 'Parent location must belong to the same warehouse');
+    }
+    current = row.parent_id ?? null;
+  }
+  return parentId;
 }
 
 async function listLots(c: AppContext): Promise<Response> {
@@ -1778,6 +1963,10 @@ async function updateProduct(c: AppContext): Promise<Response> {
   if (dto.leadTimeDays !== undefined && (await hasColumn(c, 'products', 'lead_time_days'))) {
     sets.push('lead_time_days = ?');
     params.push(dto.leadTimeDays);
+  }
+  if (dto.isBundle !== undefined && (await hasColumn(c, 'products', 'is_bundle'))) {
+    sets.push('is_bundle = ?');
+    params.push(dto.isBundle ? 1 : 0);
   }
   if (sets.length > 0) {
     const now = Date.now();
@@ -1928,9 +2117,17 @@ async function updateLocation(c: AppContext): Promise<Response> {
     throw forbidden('Out of warehouse scope');
   }
   const sets: string[] = [];
-  const params: (string | number)[] = [];
+  const params: (string | number | null)[] = [];
   if (dto.code !== undefined) { sets.push('code = ?'); params.push(dto.code); }
   if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (dto.parentId !== undefined && (await hasColumn(c, 'locations', 'parent_id'))) {
+    let parentId: number | null = null;
+    if (dto.parentId !== null) {
+      parentId = await validateLocationParent(c, ctx.store.id, row.warehouse_id, dto.parentId, id);
+    }
+    sets.push('parent_id = ?');
+    params.push(parentId);
+  }
   if (sets.length > 0) {
     try {
       await c.env.DB.prepare(
@@ -1942,8 +2139,9 @@ async function updateLocation(c: AppContext): Promise<Response> {
       throw new ApiError(409, 'DUPLICATE', 'Location with this code already exists in the warehouse');
     }
   }
+  const withParent = await hasColumn(c, 'locations', 'parent_id');
   const updated = await c.env.DB.prepare(
-    'SELECT id, warehouse_id AS warehouseId, code, name FROM locations WHERE id = ?1',
+    `SELECT id, warehouse_id AS warehouseId, code, name${withParent ? ', parent_id AS parentId' : ''} FROM locations WHERE id = ?1`,
   )
     .bind(id)
     .first();
@@ -2304,7 +2502,7 @@ interface StockViewRow {
   expiry_date: number | null;
 }
 
-function stockJson(r: StockViewRow): Record<string, unknown> {
+function stockJson(r: StockViewRow, freeQuantity?: number | null): Record<string, unknown> {
   return {
     id: r.id,
     locationId: r.location_id,
@@ -2316,7 +2514,42 @@ function stockJson(r: StockViewRow): Record<string, unknown> {
     sku: r.sku,
     lotCode: r.lot_code,
     expiryDate: formatDateOnly(r.expiry_date),
+    // 引当がある商品の行だけフリー在庫を併記する (無い場合は null)
+    freeQuantity: freeQuantity ?? null,
   };
+}
+
+/**
+ * 在庫行に対するフリー在庫 (stockId -> フリー数量)。
+ * 引当が 1 件も無い・0015 未適用の場合は null を返し、呼び出し側は
+ * freeQuantity を付けない (画面を煩雑にしないため)。
+ */
+async function freeQuantitiesForStocks(
+  c: AppContext,
+  storeId: number,
+  rows: readonly StockViewRow[],
+): Promise<Map<number, number> | null> {
+  if (rows.length === 0) return null;
+  if (!(await hasTable(c, 'reservations'))) return null;
+  const reservations = await activeReservationRows(c.env.DB, storeId, Date.now());
+  if (reservations.length === 0) return null;
+  const productIds = [...new Set(rows.map((r) => r.product_id))];
+  const relevant = reservations.filter((r) => productIds.includes(r.product_id));
+  if (relevant.length === 0) return null;
+  const stocks = await storeStockRows(c.env.DB, storeId, productIds);
+  const computed = computeFreeQuantities(
+    stocks,
+    relevant.map((r) => ({ productId: r.product_id, locationId: r.location_id, quantity: r.quantity })),
+  );
+  // 表示するのは引当がある商品の行だけ (他商品の行にまで付けると煩雑になる)
+  const reservedProducts = new Set(relevant.map((r) => r.product_id));
+  const out = new Map<number, number>();
+  for (const s of stocks) {
+    if (!reservedProducts.has(s.productId)) continue;
+    const v = computed.get(s.stockId);
+    if (v !== undefined) out.set(s.stockId, v);
+  }
+  return out;
 }
 
 const STOCK_VIEW_SQL = `SELECT s.id, s.location_id, s.lot_id, s.quantity, s.version,
@@ -2355,7 +2588,8 @@ app.get('/api/v1/stocks', async (c) => {
     ' ORDER BY s.id ASC LIMIT ? OFFSET ?';
   params.push(take, skip);
   const { results } = await c.env.DB.prepare(sql).bind(...params).all<StockViewRow>();
-  return c.json(results.map(stockJson));
+  const freeMap = await freeQuantitiesForStocks(c, ctx.store.id, results);
+  return c.json(results.map((r) => stockJson(r, freeMap ? (freeMap.get(r.id) ?? null) : null)));
 });
 
 app.get('/api/v1/stocks/:id', async (c) => {
@@ -2370,7 +2604,8 @@ app.get('/api/v1/stocks/:id', async (c) => {
     // スコープ外は存在自体を漏らさない (Nest 版の方針)
     throw notFound('Stock not found');
   }
-  return c.json(stockJson(row));
+  const freeMap = await freeQuantitiesForStocks(c, ctx.store.id, [row]);
+  return c.json(stockJson(row, freeMap ? (freeMap.get(row.id) ?? null) : null));
 });
 
 /** 在庫一覧の CSV エクスポート (stocks.read、倉庫スコープ適用) */
@@ -2520,6 +2755,865 @@ app.post('/api/v1/movements/transfer', async (c) => {
     quantity: dto.quantity,
   });
   return respond(c, envelope);
+});
+
+// ------------------------------------------------------- 返品・廃棄・セット品消費 (0015)
+
+/** 返品 (社内から戻り = 在庫+)。理由コードとメモが必須。台帳は type='RETURN' */
+app.post('/api/v1/movements/return', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(returnMovementSchema, raw);
+  const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
+  if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+    throw forbidden('Out of warehouse scope');
+  }
+  let expiryDateMs: number | null = null;
+  if (dto.expiryDate !== undefined) {
+    expiryDateMs = parseDateOnly(dto.expiryDate);
+    if (expiryDateMs === null) throw badRequest('expiryDate must be a valid YYYY-MM-DD date');
+  }
+  const envelope = await coordinator(c).inbound({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/movements/return',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    locationId: dto.locationId,
+    productId: dto.productId,
+    lotCode: dto.lotCode,
+    expiryDateMs,
+    quantity: dto.quantity,
+    kind: 'RETURN',
+    reasonCode: dto.reasonCode,
+    reason: dto.reason,
+  });
+  return respond(c, envelope);
+});
+
+/** 廃棄 (在庫-)。通常の消費と同じ在庫検証で、マイナス在庫フローには乗せない */
+app.post('/api/v1/movements/disposal', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(disposalSchema, raw);
+  if (dto.locationId !== undefined) {
+    const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
+    if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+      throw forbidden('Out of warehouse scope');
+    }
+  }
+  const envelope = await coordinator(c).consume({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/movements/disposal',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    productId: dto.productId,
+    ...(dto.locationId !== undefined ? { locationId: dto.locationId } : {}),
+    quantity: dto.quantity,
+    department: '廃棄',
+    purpose: dto.reason,
+    movementType: 'DISPOSAL',
+    reasonCode: dto.reasonCode,
+    reason: dto.reason,
+    auditAction: 'stock.disposal',
+    allowedLocationIds: await allowedLocationIds(c),
+  });
+  return respond(c, envelope);
+});
+
+/** セット品の消費 (構成品へ FEFO 展開し、同一 group_id で記録する) */
+app.post('/api/v1/movements/bundle-consumption', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(bundleConsumptionSchema, raw);
+  if (dto.locationId !== undefined) {
+    const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
+    if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+      throw forbidden('Out of warehouse scope');
+    }
+  }
+  if (!(await hasTable(c, 'product_bundles'))) {
+    throw new ApiError(422, 'NOT_A_BUNDLE', 'Product is not a bundle');
+  }
+  const components = await bundleComponentRows(c.env.DB, dto.productId);
+  const envelope = await coordinator(c).consumeBundle({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/movements/bundle-consumption',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    bundleProductId: dto.productId,
+    ...(dto.locationId !== undefined ? { locationId: dto.locationId } : {}),
+    quantity: dto.quantity,
+    department: dto.department,
+    purpose: dto.purpose,
+    allowedLocationIds: await allowedLocationIds(c),
+    components: components.map((comp) => ({
+      productId: comp.component_product_id,
+      quantity: comp.quantity,
+    })),
+  });
+  return respond(c, envelope);
+});
+
+/** セット品の一覧 (組立可能数つき)。在庫表示と消費画面で使う */
+app.get('/api/v1/bundles', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'product_bundles')) || !(await hasColumn(c, 'products', 'is_bundle'))) {
+    return c.json([]);
+  }
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, sku, name, unit FROM products WHERE store_id = ?1 AND deleted_at IS NULL AND is_bundle = 1 ORDER BY id ASC',
+  )
+    .bind(ctx.store.id)
+    .all<{ id: number; sku: string; name: string; unit: string }>();
+  const out: Record<string, unknown>[] = [];
+  for (const p of results) {
+    const avail = await bundleAvailability(c.env.DB, ctx.store.id, p.id);
+    out.push({
+      productId: p.id,
+      sku: p.sku,
+      name: p.name,
+      unit: p.unit,
+      assemblable: avail.assemblable,
+      unitCost: avail.unitCost,
+      components: avail.components,
+    });
+  }
+  return c.json(out);
+});
+
+/** セット品 1 件の構成品と組立可能数 (商品詳細) */
+app.get('/api/v1/products/:id/bundle', async (c) => {
+  await requirePermission(c, Permission.MASTER_READ);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const product = await c.env.DB.prepare(
+    'SELECT id, sku, name, unit FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number; sku: string; name: string; unit: string }>();
+  if (!product) throw notFound('Product not found');
+  if (!(await hasTable(c, 'product_bundles'))) {
+    return c.json({ productId: id, sku: product.sku, name: product.name, unit: product.unit, assemblable: 0, unitCost: 0, components: [] });
+  }
+  const avail = await bundleAvailability(c.env.DB, ctx.store.id, id);
+  return c.json({
+    productId: id,
+    sku: product.sku,
+    name: product.name,
+    unit: product.unit,
+    assemblable: avail.assemblable,
+    unitCost: avail.unitCost,
+    components: avail.components,
+  });
+});
+
+/**
+ * セット品の構成品を置き換える (master.write)。
+ * セットの中にセットは入れない (循環防止を単純化)。自分自身も不可。
+ * 構成が 1 件以上あれば is_bundle を自動で有効にする。
+ */
+app.put('/api/v1/products/:id/bundle', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  if (!(await hasTable(c, 'product_bundles'))) {
+    throw new ApiError(503, 'BUNDLES_NOT_CONFIGURED', 'Bundles are not configured (migration 0015)');
+  }
+  const dto = parseWith(bundleComponentsSchema, await parseJson(c));
+  const product = await c.env.DB.prepare(
+    'SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number }>();
+  if (!product) throw notFound('Product not found');
+  const seen = new Set<number>();
+  for (const comp of dto.components) {
+    if (comp.productId === id) {
+      throw new ApiError(422, 'BUNDLE_SELF_REFERENCE', 'A bundle cannot contain itself');
+    }
+    if (seen.has(comp.productId)) {
+      throw badRequest(`Duplicate component product: ${comp.productId}`);
+    }
+    seen.add(comp.productId);
+    const target = await c.env.DB.prepare(
+      'SELECT id, is_bundle FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+    )
+      .bind(comp.productId, ctx.store.id)
+      .first<{ id: number; is_bundle: number }>();
+    if (!target) throw notFound(`Component product not found: ${comp.productId}`);
+    if (target.is_bundle === 1) {
+      throw new ApiError(422, 'BUNDLE_NESTING_FORBIDDEN', 'Bundles cannot contain other bundles');
+    }
+  }
+  const now = Date.now();
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare('DELETE FROM product_bundles WHERE bundle_product_id = ?1').bind(id),
+  ];
+  for (const comp of dto.components) {
+    stmts.push(
+      c.env.DB
+        .prepare('INSERT INTO product_bundles (bundle_product_id, component_product_id, quantity) VALUES (?1, ?2, ?3)')
+        .bind(id, comp.productId, comp.quantity),
+    );
+  }
+  if (dto.components.length > 0 && (await hasColumn(c, 'products', 'is_bundle'))) {
+    stmts.push(
+      c.env.DB.prepare('UPDATE products SET is_bundle = 1, updated_at = ?1 WHERE id = ?2').bind(now, id),
+    );
+  }
+  stmts.push(
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'product.bundle.update', 'product', ?2, ?3, ?4, ?5)`,
+      )
+      .bind(user(c).userId, String(id), JSON.stringify({ components: dto.components }), ctx.store.id, now),
+  );
+  await c.env.DB.batch(stmts);
+  const avail = await bundleAvailability(c.env.DB, ctx.store.id, id);
+  return c.json({ productId: id, assemblable: avail.assemblable, unitCost: avail.unitCost, components: avail.components });
+});
+
+/**
+ * 商品の一括編集 (master.write)。安全在庫・単価・入数・リードタイム・
+ * 有効/無効 (論理削除) を複数商品へ一括 PUT する。監査は 1 件に集約。
+ */
+app.put('/api/v1/admin/products/bulk', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const dto = parseWith(bulkProductsSchema, await parseJson(c));
+  const now = Date.now();
+  const patch = dto.patch;
+  const sets: string[] = [];
+  const params: (string | number | null)[] = [];
+  if (patch.safetyStock !== undefined) { sets.push('safety_stock = ?'); params.push(patch.safetyStock); }
+  if (patch.unitCost !== undefined && (await hasColumn(c, 'products', 'unit_cost'))) { sets.push('unit_cost = ?'); params.push(patch.unitCost); }
+  if (patch.caseSize !== undefined && (await hasColumn(c, 'products', 'case_size'))) { sets.push('case_size = ?'); params.push(patch.caseSize); }
+  if (patch.leadTimeDays !== undefined && (await hasColumn(c, 'products', 'lead_time_days'))) { sets.push('lead_time_days = ?'); params.push(patch.leadTimeDays); }
+  if (patch.active !== undefined) {
+    sets.push(patch.active ? 'deleted_at = NULL' : 'deleted_at = ?');
+    if (!patch.active) params.push(now);
+  }
+  if (sets.length === 0) throw badRequest('patch has no applicable fields');
+  const ids = [...new Set(dto.ids)];
+  const placeholders = ids.map(() => '?').join(',');
+  // 有効/無効の切替は論理削除状態によらず対象にする。それ以外の項目変更は
+  // 削除済み商品には適用しない (通常の一覧に出ないため)
+  const deletedCond = patch.active !== undefined ? '' : ' AND deleted_at IS NULL';
+  const res = await c.env.DB.prepare(
+    `UPDATE products SET ${sets.join(', ')}, updated_at = ? WHERE store_id = ? AND id IN (${placeholders})${deletedCond}`,
+  )
+    .bind(...params, now, ctx.store.id, ...ids)
+    .run();
+  await c.env.DB
+    .prepare(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+       VALUES (?1, 'product.bulk_update', 'product', ?2, ?3, ?4, ?5)`,
+    )
+    .bind(user(c).userId, ids.join(','), JSON.stringify({ ids, patch, updated: res.meta.changes }), ctx.store.id, now)
+    .run();
+  return c.json({ updated: res.meta.changes, ids });
+});
+
+// ------------------------------------------------------- 在庫の引当 (0015)
+
+async function loadReservationInStore(
+  c: AppContext,
+  id: number,
+  storeId: number,
+): Promise<ReservationDbRow> {
+  const row = await c.env.DB.prepare('SELECT * FROM reservations WHERE id = ?1 AND store_id = ?2')
+    .bind(id, storeId)
+    .first<ReservationDbRow>();
+  if (!row) throw notFound('Reservation not found');
+  return row;
+}
+
+/** 引当の作成 (movements.consume)。フリー在庫を超える引当は 422 */
+app.post('/api/v1/reservations', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'reservations'))) {
+    throw new ApiError(503, 'RESERVATIONS_NOT_CONFIGURED', 'Reservations are not configured (migration 0015)');
+  }
+  const dto = parseWith(createReservationSchema, await parseJson(c));
+  const withBundle = await hasColumn(c, 'products', 'is_bundle');
+  const productRow = await c.env.DB.prepare(
+    `SELECT id${withBundle ? ', is_bundle' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+  )
+    .bind(dto.productId, ctx.store.id)
+    .first<{ id: number; is_bundle?: number }>();
+  if (!productRow) throw notFound('Product not found');
+  if (productRow.is_bundle === 1) {
+    throw new ApiError(422, 'BUNDLE_NO_STOCK', 'Bundle products do not hold stock and cannot be reserved');
+  }
+  let locationId: number | null = null;
+  if (dto.locationId !== undefined && dto.locationId !== null) {
+    locationId = dto.locationId;
+    const warehouseId = await warehouseIdOfLocation(c, locationId);
+    if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+      throw forbidden('Out of warehouse scope');
+    }
+  }
+  // フリー在庫の判定: 場所指定があればその場所、無ければ店舗全体
+  const now = Date.now();
+  const stocks = await storeStockRows(c.env.DB, ctx.store.id, [dto.productId]);
+  const reservations = await activeReservationRows(c.env.DB, ctx.store.id, now);
+  const free = computeFreeQuantities(
+    stocks,
+    reservations
+      .filter((r) => r.product_id === dto.productId)
+      .map((r) => ({ productId: r.product_id, locationId: r.location_id, quantity: r.quantity })),
+  );
+  let available = 0;
+  for (const s of stocks) {
+    if (locationId !== null && s.locationId !== locationId) continue;
+    available += free.get(s.stockId) ?? 0;
+  }
+  if (dto.quantity > available) {
+    throw new ApiError(
+      422,
+      'RESERVATION_EXCEEDS_FREE_STOCK',
+      `Requested ${dto.quantity} exceeds free stock ${available}`,
+    );
+  }
+  const res = await c.env.DB.prepare(
+    `INSERT INTO reservations (store_id, product_id, location_id, quantity, reason, status, expires_at, created_by, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?8)`,
+  )
+    .bind(ctx.store.id, dto.productId, locationId, dto.quantity, dto.reason, dto.expiresAt ?? null, user(c).userId, now)
+    .run();
+  const created = await loadReservationInStore(c, Number(res.meta.last_row_id), ctx.store.id);
+  return c.json(reservationJson(created), 201);
+});
+
+/** 有効な引当の一覧 (期限切れは自動で除外する) */
+app.get('/api/v1/reservations', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'reservations'))) return c.json([]);
+  const rows = await activeReservationRows(c.env.DB, ctx.store.id, Date.now());
+  return c.json(rows.map(reservationJson));
+});
+
+/** 引当の解放 */
+app.post('/api/v1/reservations/:id/release', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'reservations'))) throw notFound('Reservation not found');
+  const id = Number(c.req.param('id'));
+  const row = await loadReservationInStore(c, id, ctx.store.id);
+  if (row.status !== 'active') {
+    throw new ApiError(409, 'RESERVATION_NOT_ACTIVE', `Reservation is ${row.status}`);
+  }
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare("UPDATE reservations SET status = 'released', updated_at = ?1 WHERE id = ?2")
+      .bind(now, id),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'reservation.release', 'reservation', ?2, ?3, ?4, ?5)`,
+      )
+      .bind(user(c).userId, String(id), JSON.stringify({ productId: row.product_id, quantity: row.quantity }), ctx.store.id, now),
+  ]);
+  const updated = await loadReservationInStore(c, id, ctx.store.id);
+  return c.json(reservationJson(updated));
+});
+
+/** 引当を消費に変換する: 実消費を Coordinator 経由で実行し、引当を consumed にする */
+app.post('/api/v1/reservations/:id/consume', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'reservations'))) throw notFound('Reservation not found');
+  const id = Number(c.req.param('id'));
+  const raw = (await parseJson(c).catch(() => ({}))) as Record<string, unknown>;
+  const dto = parseWith(consumeReservationSchema, raw);
+  const row = await loadReservationInStore(c, id, ctx.store.id);
+  if (row.status !== 'active' || (row.expires_at !== null && row.expires_at <= Date.now())) {
+    throw new ApiError(409, 'RESERVATION_NOT_ACTIVE', 'Reservation is not active');
+  }
+  const locationId = dto.locationId ?? row.location_id ?? undefined;
+  if (locationId !== undefined) {
+    const warehouseId = await warehouseIdOfLocation(c, locationId);
+    if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+      throw forbidden('Out of warehouse scope');
+    }
+  }
+  const envelope = await coordinator(c).consume({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/reservations/:id/consume',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify({ reservationId: id, ...raw })),
+    storeId: ctx.store.id,
+    productId: row.product_id,
+    ...(locationId !== undefined ? { locationId } : {}),
+    quantity: row.quantity,
+    department: '引当消費',
+    purpose: row.reason,
+    auditAction: 'stock.consume_reservation',
+    allowedLocationIds: await allowedLocationIds(c),
+  });
+  if (envelope.status !== 201) return respond(c, envelope);
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare("UPDATE reservations SET status = 'consumed', updated_at = ?1 WHERE id = ?2 AND status = 'active'")
+      .bind(now, id),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'reservation.consume', 'reservation', ?2, ?3, ?4, ?5)`,
+      )
+      .bind(
+        user(c).userId,
+        String(id),
+        JSON.stringify({ productId: row.product_id, quantity: row.quantity, documentId: (envelope.body as { documentId?: string }).documentId ?? null }),
+        ctx.store.id,
+        now,
+      ),
+  ]);
+  const updated = await loadReservationInStore(c, id, ctx.store.id);
+  return c.json({ reservation: reservationJson(updated), movement: envelope.body }, 201);
+});
+
+// ------------------------------------------------------- ピッキングリスト (0015)
+
+interface PickListDbRow {
+  id: number;
+  store_id: number;
+  type: string;
+  to_location_id: number | null;
+  status: string;
+  created_by: number;
+  created_at: number;
+  completed_at: number | null;
+}
+
+interface PickItemDbRow {
+  id: number;
+  list_id: number;
+  product_id: number;
+  from_location_id: number;
+  planned_qty: number;
+  picked_qty: number;
+}
+
+function pickItemJson(r: PickItemDbRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    listId: r.list_id,
+    productId: r.product_id,
+    fromLocationId: r.from_location_id,
+    plannedQty: r.planned_qty,
+    pickedQty: r.picked_qty,
+  };
+}
+
+async function loadPickList(c: AppContext, id: number, storeId: number): Promise<Record<string, unknown>> {
+  const list = await c.env.DB.prepare('SELECT * FROM pick_lists WHERE id = ?1 AND store_id = ?2')
+    .bind(id, storeId)
+    .first<PickListDbRow>();
+  if (!list) throw notFound('Pick list not found');
+  const { results: items } = await c.env.DB.prepare(
+    'SELECT * FROM pick_items WHERE list_id = ?1 ORDER BY id ASC',
+  )
+    .bind(id)
+    .all<PickItemDbRow>();
+  return {
+    id: list.id,
+    type: list.type,
+    toLocationId: list.to_location_id,
+    status: list.status,
+    createdBy: list.created_by,
+    createdAt: list.created_at,
+    completedAt: list.completed_at,
+    items: items.map(pickItemJson),
+  };
+}
+
+function requirePickTables(c: AppContext): Promise<boolean> {
+  return hasTable(c, 'pick_lists');
+}
+
+/** ピッキングリストの作成 (予定) */
+app.post('/api/v1/pick-lists', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) {
+    throw new ApiError(503, 'PICKING_NOT_CONFIGURED', 'Picking is not configured (migration 0015)');
+  }
+  const dto = parseWith(createPickListSchema, await parseJson(c));
+  if (dto.type === 'transfer') {
+    await requirePermission(c, Permission.MOVEMENTS_TRANSFER);
+    if (dto.toLocationId === undefined || dto.toLocationId === null) {
+      throw badRequest('toLocationId is required for transfer pick lists');
+    }
+  }
+  for (const item of dto.items) {
+    const product = await c.env.DB.prepare(
+      'SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+    )
+      .bind(item.productId, ctx.store.id)
+      .first<{ id: number }>();
+    if (!product) throw notFound(`Product not found: ${item.productId}`);
+    await warehouseIdOfLocation(c, item.fromLocationId);
+    if (dto.type === 'transfer' && item.fromLocationId === dto.toLocationId) {
+      throw badRequest('fromLocationId and toLocationId must differ');
+    }
+  }
+  if (dto.type === 'transfer') await warehouseIdOfLocation(c, dto.toLocationId as number);
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO pick_lists (store_id, type, to_location_id, status, created_by, created_at)
+     VALUES (?1, ?2, ?3, 'open', ?4, ?5)`,
+  )
+    .bind(ctx.store.id, dto.type, dto.type === 'transfer' ? dto.toLocationId : null, user(c).userId, now)
+    .run();
+  const listId = Number(res.meta.last_row_id);
+  await c.env.DB.batch(
+    dto.items.map((item) =>
+      c.env.DB
+        .prepare('INSERT INTO pick_items (list_id, product_id, from_location_id, planned_qty, picked_qty) VALUES (?1, ?2, ?3, ?4, 0)')
+        .bind(listId, item.productId, item.fromLocationId, item.plannedQty),
+    ),
+  );
+  return c.json(await loadPickList(c, listId, ctx.store.id), 201);
+});
+
+/** ピッキングリストの一覧と詳細 */
+app.get('/api/v1/pick-lists', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    'SELECT id FROM pick_lists WHERE store_id = ?1 ORDER BY id DESC LIMIT 100',
+  )
+    .bind(ctx.store.id)
+    .all<{ id: number }>();
+  const out: Record<string, unknown>[] = [];
+  for (const r of results) out.push(await loadPickList(c, r.id, ctx.store.id));
+  return c.json(out);
+});
+
+app.get('/api/v1/pick-lists/:id', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) throw notFound('Pick list not found');
+  return c.json(await loadPickList(c, Number(c.req.param('id')), ctx.store.id));
+});
+
+/** 明細の数量修正 (検品の手入力・計画の調整)。open の間だけ変更できる */
+app.put('/api/v1/pick-lists/:id/items/:itemId', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) throw notFound('Pick list not found');
+  const listId = Number(c.req.param('id'));
+  const itemId = Number(c.req.param('itemId'));
+  const dto = parseWith(updatePickItemSchema, await parseJson(c));
+  const list = await c.env.DB.prepare('SELECT * FROM pick_lists WHERE id = ?1 AND store_id = ?2')
+    .bind(listId, ctx.store.id)
+    .first<PickListDbRow>();
+  if (!list) throw notFound('Pick list not found');
+  if (list.status !== 'open') throw new ApiError(409, 'PICK_LIST_NOT_OPEN', `Pick list is ${list.status}`);
+  const item = await c.env.DB.prepare('SELECT * FROM pick_items WHERE id = ?1 AND list_id = ?2')
+    .bind(itemId, listId)
+    .first<PickItemDbRow>();
+  if (!item) throw notFound('Pick item not found');
+  const plannedQty = dto.plannedQty ?? item.planned_qty;
+  const pickedQty = dto.pickedQty ?? item.picked_qty;
+  if (pickedQty > plannedQty) {
+    throw new ApiError(422, 'PICKED_EXCEEDS_PLANNED', 'pickedQty cannot exceed plannedQty');
+  }
+  await c.env.DB.prepare('UPDATE pick_items SET planned_qty = ?1, picked_qty = ?2 WHERE id = ?3')
+    .bind(plannedQty, pickedQty, itemId)
+    .run();
+  return c.json(await loadPickList(c, listId, ctx.store.id));
+});
+
+/** 確定: 検品済み数量を Coordinator 経由で一括・原子的に実行する */
+app.post('/api/v1/pick-lists/:id/confirm', async (c) => {
+  const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) throw notFound('Pick list not found');
+  const listId = Number(c.req.param('id'));
+  const list = await c.env.DB.prepare('SELECT * FROM pick_lists WHERE id = ?1 AND store_id = ?2')
+    .bind(listId, ctx.store.id)
+    .first<PickListDbRow>();
+  if (!list) throw notFound('Pick list not found');
+  if (list.status !== 'open') {
+    // 冪等キーが同じ再送は Coordinator が保存済み応答を返すため、done でも通す
+    const key = c.req.header('idempotency-key');
+    if (!(list.status === 'done' && key)) {
+      throw new ApiError(409, 'PICK_LIST_NOT_OPEN', `Pick list is ${list.status}`);
+    }
+  }
+  if (list.type === 'transfer') {
+    await requirePermission(c, Permission.MOVEMENTS_TRANSFER);
+    if (list.to_location_id !== null) {
+      const toWarehouseId = await warehouseIdOfLocation(c, list.to_location_id);
+      if (!canPerformInStore(ctx, rp, toWarehouseId, Permission.MOVEMENTS_TRANSFER)) {
+        throw forbidden('Out of warehouse scope');
+      }
+    }
+  }
+  const { results: items } = await c.env.DB.prepare(
+    'SELECT * FROM pick_items WHERE list_id = ?1 ORDER BY id ASC',
+  )
+    .bind(listId)
+    .all<PickItemDbRow>();
+  const movable = items.filter((i) => i.picked_qty > 0);
+  if (movable.length === 0) throw badRequest('No picked items to confirm');
+  for (const item of movable) {
+    const warehouseId = await warehouseIdOfLocation(c, item.from_location_id);
+    const perm = list.type === 'transfer' ? Permission.MOVEMENTS_TRANSFER : Permission.MOVEMENTS_CONSUME;
+    if (!canPerformInStore(ctx, rp, warehouseId, perm)) {
+      throw forbidden('Out of warehouse scope');
+    }
+  }
+  const raw = { pickListId: listId, items: movable.map((i) => ({ productId: i.product_id, fromLocationId: i.from_location_id, quantity: i.picked_qty })) };
+  const envelope = await coordinator(c).confirmPick({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/pick-lists/:id/confirm',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    pickListId: listId,
+    type: list.type as 'consume' | 'transfer',
+    ...(list.to_location_id !== null ? { toLocationId: list.to_location_id } : {}),
+    items: raw.items,
+  });
+  return respond(c, envelope);
+});
+
+/** ピッキングリストの取消 */
+app.post('/api/v1/pick-lists/:id/cancel', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  const ctx = await storeContext(c);
+  if (!(await requirePickTables(c))) throw notFound('Pick list not found');
+  const listId = Number(c.req.param('id'));
+  const list = await c.env.DB.prepare('SELECT * FROM pick_lists WHERE id = ?1 AND store_id = ?2')
+    .bind(listId, ctx.store.id)
+    .first<PickListDbRow>();
+  if (!list) throw notFound('Pick list not found');
+  if (list.status !== 'open') {
+    throw new ApiError(409, 'PICK_LIST_NOT_OPEN', `Pick list is ${list.status}`);
+  }
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE pick_lists SET status = 'cancelled' WHERE id = ?1").bind(listId),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'pick_list.cancel', 'pick_list', ?2, '{}', ?3, ?4)`,
+      )
+      .bind(user(c).userId, String(listId), ctx.store.id, Date.now()),
+  ]);
+  return c.json(await loadPickList(c, listId, ctx.store.id));
+});
+
+// ------------------------------------------------------- 発注テンプレート・定期発注 (0015)
+
+interface PoTemplateDbRow {
+  id: number;
+  store_id: number;
+  name: string;
+  supplier_id: number;
+  lines: string;
+  created_by: number;
+  created_at: number;
+}
+
+interface PoScheduleDbRow {
+  id: number;
+  template_id: number;
+  interval_days: number;
+  next_run_at: number;
+  enabled: number;
+  last_run_at: number | null;
+}
+
+async function poTemplateJson(c: AppContext, row: PoTemplateDbRow): Promise<Record<string, unknown>> {
+  let lines: unknown = [];
+  try {
+    lines = JSON.parse(row.lines) as unknown;
+  } catch {
+    lines = [];
+  }
+  let schedule: Record<string, unknown> | null = null;
+  if (await hasTable(c, 'po_schedules')) {
+    const s = await c.env.DB.prepare('SELECT * FROM po_schedules WHERE template_id = ?1')
+      .bind(row.id)
+      .first<PoScheduleDbRow>();
+    if (s) {
+      schedule = {
+        id: s.id,
+        intervalDays: s.interval_days,
+        nextRunAt: s.next_run_at,
+        enabled: s.enabled === 1,
+        lastRunAt: s.last_run_at,
+      };
+    }
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    supplierId: row.supplier_id,
+    lines,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+    schedule,
+  };
+}
+
+async function loadPoTemplate(c: AppContext, id: number, storeId: number): Promise<PoTemplateDbRow> {
+  const row = await c.env.DB.prepare('SELECT * FROM po_templates WHERE id = ?1 AND store_id = ?2')
+    .bind(id, storeId)
+    .first<PoTemplateDbRow>();
+  if (!row) throw notFound('Purchase order template not found');
+  return row;
+}
+
+app.get('/api/v1/purchase-order-templates', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_READ);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'po_templates'))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM po_templates WHERE store_id = ?1 ORDER BY id DESC LIMIT 100',
+  )
+    .bind(ctx.store.id)
+    .all<PoTemplateDbRow>();
+  const out: Record<string, unknown>[] = [];
+  for (const row of results) out.push(await poTemplateJson(c, row));
+  return c.json(out);
+});
+
+app.post('/api/v1/purchase-order-templates', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'po_templates'))) {
+    throw new ApiError(503, 'PO_TEMPLATES_NOT_CONFIGURED', 'PO templates are not configured (migration 0015)');
+  }
+  const dto = parseWith(createPoTemplateSchema, await parseJson(c));
+  const supplier = await c.env.DB.prepare('SELECT id FROM suppliers WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+    .bind(dto.supplierId, ctx.store.id)
+    .first<{ id: number }>();
+  if (!supplier) throw notFound('Supplier not found');
+  for (const line of dto.lines) {
+    const product = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+      .bind(line.productId, ctx.store.id)
+      .first<{ id: number }>();
+    if (!product) throw notFound(`Product not found: ${line.productId}`);
+  }
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO po_templates (store_id, name, supplier_id, lines, created_by, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+  )
+    .bind(ctx.store.id, dto.name, dto.supplierId, JSON.stringify(dto.lines), user(c).userId, now)
+    .run();
+  const row = await loadPoTemplate(c, Number(res.meta.last_row_id), ctx.store.id);
+  return c.json(await poTemplateJson(c, row), 201);
+});
+
+app.delete('/api/v1/purchase-order-templates/:id', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'po_templates'))) throw notFound('Purchase order template not found');
+  const id = Number(c.req.param('id'));
+  await loadPoTemplate(c, id, ctx.store.id);
+  const stmts: D1PreparedStatement[] = [];
+  if (await hasTable(c, 'po_schedules')) {
+    stmts.push(c.env.DB.prepare('DELETE FROM po_schedules WHERE template_id = ?1').bind(id));
+  }
+  stmts.push(c.env.DB.prepare('DELETE FROM po_templates WHERE id = ?1').bind(id));
+  stmts.push(
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'po_template.delete', 'po_template', ?2, '{}', ?3, ?4)`,
+      )
+      .bind(user(c).userId, String(id), ctx.store.id, Date.now()),
+  );
+  await c.env.DB.batch(stmts);
+  return c.json({ id, deleted: true });
+});
+
+/** テンプレートから下書き PO を生成する (source='template') */
+app.post('/api/v1/purchase-order-templates/:id/generate', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'po_templates'))) throw notFound('Purchase order template not found');
+  const id = Number(c.req.param('id'));
+  const row = await loadPoTemplate(c, id, ctx.store.id);
+  let lines: { productId: number; quantity?: number; inputQuantity?: number; inputUnit?: 'base' | 'case'; unitCost?: number }[] = [];
+  try {
+    lines = JSON.parse(row.lines) as typeof lines;
+  } catch {
+    throw badRequest('Template lines are corrupted');
+  }
+  const now = Date.now();
+  const poId = await createDraftPurchaseOrder(c.env.DB, {
+    storeId: ctx.store.id,
+    supplierId: row.supplier_id,
+    actorId: user(c).userId,
+    source: 'template',
+    lines,
+    nowMs: now,
+  });
+  await c.env.DB
+    .prepare(
+      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+       VALUES (?1, 'purchase_order.create_from_template', 'po_template', ?2, ?3, ?4, ?5)`,
+    )
+    .bind(user(c).userId, String(id), JSON.stringify({ purchaseOrderId: poId }), ctx.store.id, now)
+    .run();
+  return c.json(await loadPurchaseOrder(c, poId, ctx.store.id), 201);
+});
+
+/** 定期発注スケジュールの設定 (テンプレートに 1 つ、間隔日数と有効/無効) */
+app.put('/api/v1/purchase-order-templates/:id/schedule', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'po_schedules'))) {
+    throw new ApiError(503, 'PO_TEMPLATES_NOT_CONFIGURED', 'PO schedules are not configured (migration 0015)');
+  }
+  const id = Number(c.req.param('id'));
+  await loadPoTemplate(c, id, ctx.store.id);
+  const dto = parseWith(poScheduleSchema, await parseJson(c));
+  const now = Date.now();
+  const existing = await c.env.DB.prepare('SELECT * FROM po_schedules WHERE template_id = ?1')
+    .bind(id)
+    .first<PoScheduleDbRow>();
+  if (existing) {
+    // 間隔を変えたら次回は「最終実行 (無ければ作成時) + 間隔」で組み直す
+    const base = existing.last_run_at ?? now;
+    await c.env.DB.prepare(
+      'UPDATE po_schedules SET interval_days = ?1, enabled = ?2, next_run_at = ?3 WHERE template_id = ?4',
+    )
+      .bind(dto.intervalDays, dto.enabled ? 1 : 0, base + dto.intervalDays * 86_400_000, id)
+      .run();
+  } else {
+    await c.env.DB.prepare(
+      'INSERT INTO po_schedules (template_id, interval_days, next_run_at, enabled, last_run_at) VALUES (?1, ?2, ?3, ?4, NULL)',
+    )
+      .bind(id, dto.intervalDays, now + dto.intervalDays * 86_400_000, dto.enabled ? 1 : 0)
+      .run();
+  }
+  const row = await loadPoTemplate(c, id, ctx.store.id);
+  return c.json(await poTemplateJson(c, row));
 });
 
 // ------------------------------------------------------- マイナス在庫承認
@@ -2921,6 +4015,8 @@ interface PurchaseOrderDbRow {
   created_by: number;
   created_at: number;
   updated_at: number;
+  /** 0015 で追加 (manual | template | schedule)。未適用環境では undefined */
+  source?: string;
 }
 
 interface PurchaseOrderLineDbRow {
@@ -2939,6 +4035,14 @@ const PO_SELECT = `SELECT po.id, po.supplier_id, sup.name AS supplier_name, po.s
                           po.expected_date, po.note, po.created_by, po.created_at, po.updated_at
                      FROM purchase_orders po
                      LEFT JOIN suppliers sup ON sup.id = po.supplier_id`;
+
+/** source 列 (0015) がある環境ではそれも引く PO_SELECT */
+async function poSelect(c: AppContext): Promise<string> {
+  if (await hasColumn(c, 'purchase_orders', 'source')) {
+    return PO_SELECT.replace('po.updated_at', 'po.updated_at, po.source');
+  }
+  return PO_SELECT;
+}
 
 function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow[]): Record<string, unknown> {
   const today = formatDateOnly(Date.now());
@@ -2960,6 +4064,7 @@ function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow
     createdBy: po.created_by,
     createdAt: po.created_at,
     updatedAt: po.updated_at,
+    source: po.source ?? 'manual',
     overdue,
     lines: lines.map((l) => ({
       id: l.id,
@@ -2975,7 +4080,7 @@ function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow
 }
 
 async function loadPurchaseOrder(c: AppContext, id: number, storeId: number): Promise<Record<string, unknown>> {
-  const po = await c.env.DB.prepare(`${PO_SELECT} WHERE po.id = ?1 AND po.store_id = ?2`)
+  const po = await c.env.DB.prepare(`${await poSelect(c)} WHERE po.id = ?1 AND po.store_id = ?2`)
     .bind(id, storeId)
     .first<PurchaseOrderDbRow>();
   if (!po) throw notFound('Purchase order not found');
@@ -2991,7 +4096,7 @@ app.get('/api/v1/purchase-orders', async (c) => {
   await requirePermission(c, Permission.PURCHASES_READ);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
-  const { results: orders } = await c.env.DB.prepare(`${PO_SELECT} WHERE po.store_id = ?1 ORDER BY po.id DESC LIMIT 100`)
+  const { results: orders } = await c.env.DB.prepare(`${await poSelect(c)} WHERE po.store_id = ?1 ORDER BY po.id DESC LIMIT 100`)
     .bind(ctx.store.id)
     .all<PurchaseOrderDbRow>();
   const out: Record<string, unknown>[] = [];
@@ -3159,83 +4264,20 @@ app.post('/api/v1/purchase-orders', async (c) => {
   const stored = await findStoredIdempotentResponse(c, key, requestHash, ctx.store.id);
   if (stored) return c.json(stored.body as Record<string, unknown>, stored.status as 201);
 
-  const supplier = await c.env.DB.prepare('SELECT id FROM suppliers WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
-    .bind(dto.supplierId, ctx.store.id)
-    .first<{ id: number }>();
-  if (!supplier) throw notFound('Supplier not found');
-
-  // 明細の数量を基本単位へ解決する。inputUnit='case' のときは
-  // inputQuantity × 商品の入数 (case_size) に換算し、入力値も明細に保持する
-  const withCase = await hasColumn(c, 'products', 'case_size');
-  const withInputCols = await hasColumn(c, 'purchase_order_lines', 'input_quantity');
-  interface ResolvedLine {
-    productId: number;
-    quantity: number;
-    inputQuantity: number;
-    inputUnit: 'base' | 'case';
-    unitCost: number | null;
-  }
-  const resolvedLines: ResolvedLine[] = [];
-  for (const line of dto.lines) {
-    const product = await c.env.DB.prepare(
-      `SELECT id${withCase ? ', case_size' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
-    )
-      .bind(line.productId, ctx.store.id)
-      .first<{ id: number; case_size?: number | null }>();
-    if (!product) throw notFound(`Product not found: ${line.productId}`);
-    if (line.inputUnit === 'case') {
-      if (line.inputQuantity === undefined) {
-        throw badRequest('inputQuantity is required when inputUnit is case');
-      }
-      const caseSize = product.case_size ?? null;
-      if (caseSize === null || caseSize < 1) {
-        throw badRequest(`Product ${line.productId} has no case size (case_size)`);
-      }
-      resolvedLines.push({
-        productId: line.productId,
-        quantity: line.inputQuantity * caseSize,
-        inputQuantity: line.inputQuantity,
-        inputUnit: 'case',
-        unitCost: line.unitCost ?? null,
-      });
-    } else {
-      const qty = line.inputQuantity ?? line.quantity;
-      if (qty === undefined) throw badRequest('quantity is required for each purchase order line');
-      resolvedLines.push({
-        productId: line.productId,
-        quantity: qty,
-        inputQuantity: qty,
-        inputUnit: 'base',
-        unitCost: line.unitCost ?? null,
-      });
-    }
-  }
-
+  // 明細の数量解決 (ケース → 基本単位) と下書き作成は lib/commercial.ts に集約し、
+  // テンプレート生成・定期生成と同一の規則で動かす (source='manual')
   const now = Date.now();
-  const poRes = await c.env.DB.prepare(
-    `INSERT INTO purchase_orders (supplier_id, status, expected_date, note, created_by, store_id, created_at, updated_at)
-     VALUES (?1, 'draft', ?2, ?3, ?4, ?5, ?6, ?6)`,
-  )
-    .bind(dto.supplierId, dto.expectedDate ?? null, dto.note ?? null, user(c).userId, ctx.store.id, now)
-    .run();
-  const poId = Number(poRes.meta.last_row_id);
-  const stmts: D1PreparedStatement[] = resolvedLines.map((line) =>
-    withInputCols
-      ? c.env.DB
-          .prepare(
-            `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost, input_quantity, input_unit)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)`,
-          )
-          .bind(poId, line.productId, line.quantity, line.unitCost, line.inputQuantity, line.inputUnit)
-      : c.env.DB
-          .prepare(
-            `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost)
-             VALUES (?1, ?2, ?3, 0, ?4)`,
-          )
-          .bind(poId, line.productId, line.quantity, line.unitCost),
-  );
+  const poId = await createDraftPurchaseOrder(c.env.DB, {
+    storeId: ctx.store.id,
+    supplierId: dto.supplierId,
+    expectedDate: dto.expectedDate ?? null,
+    note: dto.note ?? null,
+    actorId: user(c).userId,
+    source: 'manual',
+    lines: dto.lines,
+    nowMs: now,
+  });
   // 作成した発注書の完全な形は lines 挿入後に組み立てるため、冪等レコードと監査は後段で入れる
-  await c.env.DB.batch(stmts);
   const created = await loadPurchaseOrder(c, poId, ctx.store.id);
   await c.env.DB.batch([
     c.env.DB
@@ -3481,8 +4523,8 @@ app.get('/api/v1/analytics', async (c) => {
     const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
     const bucket = byMonth.get(key);
     if (!bucket) continue;
-    if (r.type === 'IN' || r.type === 'TRANSFER_IN') bucket.in += r.quantityChange;
-    else if (r.type === 'OUT' || r.type === 'TRANSFER_OUT') bucket.out += -r.quantityChange;
+    if (r.type === 'IN' || r.type === 'TRANSFER_IN' || r.type === 'RETURN') bucket.in += r.quantityChange;
+    else if (r.type === 'OUT' || r.type === 'TRANSFER_OUT' || r.type === 'DISPOSAL') bucket.out += -r.quantityChange;
   }
 
   // 在庫評価額とカバー率
@@ -3542,8 +4584,28 @@ app.get('/api/v1/analytics', async (c) => {
     .bind(now - 90 * DAY, ...scopeParams)
     .all<{ productId: number; sku: string; name: string; quantity: number }>();
 
+  // 廃棄集計 (0015): 直近 6 か月の廃棄数量と評価額 (数量 × 商品単価)
+  const disposalRow = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(-mv.quantity_change), 0) AS quantity,
+            COALESCE(SUM(-mv.quantity_change * COALESCE(p.unit_cost, 0)), 0) AS value
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN locations loc ON loc.id = s.location_id
+       JOIN lots l ON l.id = s.lot_id
+       JOIN products p ON p.id = l.product_id
+      WHERE mv.type = 'DISPOSAL' AND mv.created_at >= ?1 AND mv.store_id = ${storeId}${scopeCondition}`,
+  )
+    .bind(sixMonthsAgo, ...scopeParams)
+    .first<{ quantity: number; value: number }>()
+    .catch(() => null);
+
   return c.json({
     monthly: monthKeys.map((k) => byMonth.get(k)),
+    disposal: {
+      quantity: disposalRow?.quantity ?? 0,
+      value: disposalRow?.value ?? 0,
+      months: 6,
+    },
     valuation: {
       totalValue: valuationRow?.totalValue ?? 0,
       pricedProducts,
@@ -4246,6 +5308,18 @@ const worker: ExportedHandler<Env> = {
   fetch: (request, env, ctx) => app.fetch(request, env, ctx),
   scheduled: (_controller, env, ctx) => {
     ctx.waitUntil(runScheduledAnnouncementPushes(env.DB, env));
+    // 定期発注: 期限を過ぎた有効スケジュールを下書き PO 化する (0015)
+    ctx.waitUntil(runScheduledPoDrafts(env.DB, Date.now()));
+    // バックアップ: 最後の auto から 24 時間以上経っていれば 1 件作る (0016)
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await maybeAutoBackup(env.DB, Date.now());
+        } catch (e) {
+          console.error('maybeAutoBackup failed', e);
+        }
+      })(),
+    );
   },
 };
 export default worker;

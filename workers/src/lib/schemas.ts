@@ -23,6 +23,8 @@ export const createProductSchema = z.object({
   caseSize: z.number().int().min(1).nullable().optional(),
   /** リードタイム (日)。発注点の計算に使う (0014) */
   leadTimeDays: z.number().int().min(0).nullable().optional(),
+  /** セット品フラグ (0015)。セット品は自前の在庫行を持たない */
+  isBundle: z.boolean().optional(),
 });
 
 export const createWarehouseSchema = z.object({
@@ -34,6 +36,8 @@ export const createLocationSchema = z.object({
   warehouseId: idValue,
   code: z.string().min(1),
   name: z.string().min(1),
+  /** 親の保管場所 (階層)。null/未指定 = 倉庫直下 (0015) */
+  parentId: idValue.nullable().optional(),
 });
 
 /** YYYY-MM-DD */
@@ -87,6 +91,7 @@ export const updateProductSchema = z.object({
   unitCost: z.number().int().min(0).nullable().optional(),
   caseSize: z.number().int().min(1).nullable().optional(),
   leadTimeDays: z.number().int().min(0).nullable().optional(),
+  isBundle: z.boolean().optional(),
 });
 
 /** 仕入先マスタ */
@@ -152,6 +157,8 @@ export const updateWarehouseSchema = z.object({
 export const updateLocationSchema = z.object({
   code: z.string().min(1).optional(),
   name: z.string().min(1).optional(),
+  /** 親の保管場所 (階層)。null で倉庫直下へ戻す (0015) */
+  parentId: idValue.nullable().optional(),
 });
 
 /** ロットの編集は lot_code と expiry_date のみ (expiryDate: null で期限を外す) */
@@ -185,6 +192,115 @@ export const createApprovalSchema = z.object({
 
 export const decideApprovalSchema = z.object({
   decision: z.enum(['approved', 'rejected']),
+});
+
+/* ------------------------------------------------------------------ 0015 商用レベル第1弾 */
+
+/** 返品・廃棄の理由コード (この 2 種別でのみ必須) */
+export const reasonCodeSchema = z.enum(['damaged', 'expired', 'defective', 'other']);
+
+/** 返品 (社内から戻り = 在庫+)。入庫と同じ形に理由コードとメモを必須で足したもの */
+export const returnMovementSchema = z.object({
+  locationId: idValue,
+  productId: idValue,
+  lotCode: z.string().min(1),
+  expiryDate: dateString.optional(),
+  quantity: z.number().int().min(1),
+  reasonCode: reasonCodeSchema,
+  reason: z.string().min(1),
+});
+
+/** 廃棄 (在庫-)。通常の消費と同じ在庫検証で、マイナス在庫フローには乗せない */
+export const disposalSchema = z.object({
+  productId: idValue,
+  locationId: idValue.optional(),
+  quantity: z.number().int().min(1),
+  reasonCode: reasonCodeSchema,
+  reason: z.string().min(1),
+});
+
+/** 在庫の引当 (商品 + 任意の場所単位) */
+export const createReservationSchema = z.object({
+  productId: idValue,
+  locationId: idValue.nullable().optional(),
+  quantity: z.number().int().min(1),
+  reason: z.string().min(1),
+  /** 期限 (ミリ秒)。過ぎた引当は自動で無効扱い */
+  expiresAt: z.number().int().positive().nullable().optional(),
+});
+
+/** 引当の消費変換 (場所を指定するとその場所から消費する) */
+export const consumeReservationSchema = z.object({
+  locationId: idValue.optional(),
+});
+
+/** セット品の構成品の置き換え (空配列で構成を全て外す) */
+export const bundleComponentsSchema = z.object({
+  components: z
+    .array(
+      z.object({
+        productId: idValue,
+        quantity: z.number().int().min(1),
+      }),
+    )
+    .max(50),
+});
+
+/** セット品の消費 (構成品へ FEFO 展開する) */
+export const bundleConsumptionSchema = z.object({
+  productId: idValue,
+  locationId: idValue.optional(),
+  quantity: z.number().int().min(1),
+  department: z.string().min(1),
+  purpose: z.string().min(1),
+});
+
+/** ピッキングリストの作成 */
+export const createPickListSchema = z.object({
+  type: z.enum(['consume', 'transfer']),
+  toLocationId: idValue.nullable().optional(),
+  items: z
+    .array(
+      z.object({
+        productId: idValue,
+        fromLocationId: idValue,
+        plannedQty: z.number().int().min(1),
+      }),
+    )
+    .min(1)
+    .max(100),
+});
+
+/** ピッキング明細の数量修正 (検品の手入力・計画の調整) */
+export const updatePickItemSchema = z.object({
+  plannedQty: z.number().int().min(0).optional(),
+  pickedQty: z.number().int().min(0).optional(),
+});
+
+/** 発注テンプレート (明細は既存の発注書作成と同じ形) */
+export const createPoTemplateSchema = z.object({
+  name: z.string().min(1),
+  supplierId: idValue,
+  lines: createPurchaseOrderSchema.shape.lines,
+});
+
+/** 定期発注スケジュール (テンプレートに 1 つ) */
+export const poScheduleSchema = z.object({
+  intervalDays: z.number().int().min(1).max(365),
+  enabled: z.boolean(),
+});
+
+/** 商品の一括編集 (指定したフィールドだけを一括で書き換える) */
+export const bulkProductsSchema = z.object({
+  ids: z.array(idValue).min(1).max(200),
+  patch: z.object({
+    safetyStock: z.number().int().min(0).optional(),
+    unitCost: z.number().int().min(0).nullable().optional(),
+    caseSize: z.number().int().min(1).nullable().optional(),
+    leadTimeDays: z.number().int().min(0).nullable().optional(),
+    /** true = 有効化 (論理削除を解除)、false = 無効化 (論理削除) */
+    active: z.boolean().optional(),
+  }),
 });
 
 /** 'YYYY-MM-DD' -> UTC 0時のミリ秒。不正な日付は null */

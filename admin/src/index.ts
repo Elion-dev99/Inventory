@@ -49,6 +49,14 @@ import {
   type AnnouncementRow,
 } from '../../workers/src/lib/announcements';
 import { maybeSendAnnouncementPush } from '../../workers/src/lib/push';
+import {
+  createBackup,
+  hasBackupsTable,
+  listBackups,
+  readBackupJson,
+  restoreBackup,
+  type BackupRow,
+} from '../../workers/src/lib/backup';
 import { CONSOLE_HTML } from './console';
 
 /**
@@ -930,6 +938,230 @@ app.get('/api/platform/system', async (c) => {
     }
   }
   return c.json({ tables, activeSessions, maintenance });
+});
+
+// ------------------------------------------------------------ バックアップ
+// スナップショットの生成・復元ロジックは店舗アプリと共有の lib/backup.ts。
+// バックアップは業務データ一式の JSON を backups / backup_chunks に保持する。
+// 復元は業務テーブルだけを洗い替えし、users / user_roles / sessions には
+// 触れない (ロックアウト防止)。復元前に現在の状態を pre-restore として
+// 自動保存する。0016 未適用の環境では 503 BACKUP_NOT_CONFIGURED で劣化する。
+
+function backupJson(r: BackupRow): Record<string, unknown> {
+  return {
+    id: r.id,
+    kind: r.kind,
+    createdAt: r.created_at,
+    createdBy: r.created_by,
+    sizeBytes: r.size_bytes,
+    note: r.note,
+  };
+}
+
+async function requireBackupsTable(c: AppContext): Promise<void> {
+  if (!(await hasBackupsTable(c.env.DB))) {
+    throw new ApiError(503, 'BACKUP_NOT_CONFIGURED', 'Backups are not configured (migration 0016)');
+  }
+}
+
+/** バックアップ一覧 (新しい順) */
+app.get('/api/platform/backups', async (c) => {
+  requirePlatformAdmin(c);
+  await requireBackupsTable(c);
+  const rows = await listBackups(c.env.DB);
+  return c.json({ items: rows.map(backupJson) });
+});
+
+/** 手動バックアップの作成 */
+app.post('/api/platform/backups', async (c) => {
+  requirePlatformAdmin(c);
+  await requireBackupsTable(c);
+  const now = Date.now();
+  const id = await createBackup(c.env.DB, {
+    kind: 'manual',
+    createdBy: user(c).userId,
+    note: null,
+    nowMs: now,
+  });
+  const rows = await listBackups(c.env.DB);
+  const created = rows.find((r) => r.id === id);
+  await platformAudit(c, 'platform.backup.create', 'backup', String(id), {
+    sizeBytes: created?.size_bytes ?? null,
+  }, null);
+  return c.json(created ? backupJson(created) : { id }, 201);
+});
+
+/** バックアップのダウンロード (スナップショット JSON そのもの) */
+app.get('/api/platform/backups/:id/download', async (c) => {
+  requirePlatformAdmin(c);
+  await requireBackupsTable(c);
+  const id = Number(c.req.param('id'));
+  const json = await readBackupJson(c.env.DB, id);
+  if (json === null) throw notFound('Backup not found');
+  await platformAudit(c, 'platform.backup.download', 'backup', String(id), {}, null);
+  let createdAt = Date.now();
+  try {
+    const parsed = JSON.parse(json) as { createdAt?: number };
+    if (typeof parsed.createdAt === 'number') createdAt = parsed.createdAt;
+  } catch {
+    // ファイル名の日時だけに使うため、壊れていてもダウンロード自体は続ける
+  }
+  const stamp = new Date(createdAt).toISOString().replace(/[:.]/g, '-');
+  return c.body(json, 200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="inventory-backup-${id}-${stamp}.json"`,
+  });
+});
+
+/**
+ * バックアップからの復元。対象は業務テーブルのみで、復元前に現在の状態を
+ * pre-restore バックアップとして自動保存する。完了は監査に残す。
+ */
+app.post('/api/platform/backups/:id/restore', async (c) => {
+  requirePlatformAdmin(c);
+  await requireBackupsTable(c);
+  const id = Number(c.req.param('id'));
+  if ((await readBackupJson(c.env.DB, id)) === null) throw notFound('Backup not found');
+  let result: Awaited<ReturnType<typeof restoreBackup>>;
+  try {
+    result = await restoreBackup(c.env.DB, id, { actorId: user(c).userId, nowMs: Date.now() });
+  } catch (e) {
+    throw new ApiError(422, 'BACKUP_RESTORE_FAILED', e instanceof Error ? e.message : 'Restore failed');
+  }
+  await platformAudit(c, 'platform.backup.restore', 'backup', String(id), {
+    preRestoreBackupId: result.preRestoreBackupId,
+    restoredTables: result.restoredTables,
+  }, null);
+  return c.json({ restored: true, ...result });
+});
+
+// ------------------------------------------------------------ 利用量
+
+/** JST の当月初 (ミリ秒)。移動件数の「当月」集計に使う */
+function jstMonthStartMs(nowMs: number): number {
+  const JST = 9 * 60 * 60 * 1000;
+  const jst = new Date(nowMs + JST);
+  return Date.UTC(jst.getUTCFullYear(), jst.getUTCMonth(), 1) - JST;
+}
+
+/**
+ * 利用量: 店舗ごとの件数と DB 全体の実測値 (行数・ページ数ベースのサイズ・
+ * 有効セッション数・バックアップ容量)。取得できない指標は出さない。
+ */
+app.get('/api/platform/usage', async (c) => {
+  requirePlatformAdmin(c);
+  const db = c.env.DB;
+  const now = Date.now();
+  const monthStart = jstMonthStartMs(now);
+  const countFor = async (sql: string, ...params: number[]): Promise<number> => {
+    try {
+      const row = await db.prepare(sql).bind(...params).first<{ n: number }>();
+      return row?.n ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const { results: storeRows } = await db
+    .prepare('SELECT id, code, name FROM stores ORDER BY id ASC')
+    .all<{ id: number; code: string; name: string }>();
+  const stores: Record<string, unknown>[] = [];
+  for (const s of storeRows) {
+    stores.push({
+      id: s.id,
+      code: s.code,
+      name: s.name,
+      products: await countFor(
+        'SELECT COUNT(*) AS n FROM products WHERE store_id = ?1 AND deleted_at IS NULL',
+        s.id,
+      ),
+      stockRows: await countFor('SELECT COUNT(*) AS n FROM stocks WHERE store_id = ?1', s.id),
+      movementsThisMonth: await countFor(
+        'SELECT COUNT(*) AS n FROM stock_movements WHERE store_id = ?1 AND created_at >= ?2',
+        s.id,
+        monthStart,
+      ),
+      users: await countFor(
+        'SELECT COUNT(DISTINCT user_id) AS n FROM user_roles WHERE store_id = ?1',
+        s.id,
+      ),
+    });
+  }
+
+  // DB 全体の行数: sqlite_master の全テーブルを数える (内部テーブルは除く)
+  let totalRows = 0;
+  try {
+    const { results: tableNames } = await db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+      )
+      .all<{ name: string }>();
+    for (const t of tableNames) {
+      totalRows += await countFor(`SELECT COUNT(*) AS n FROM ${t.name}`);
+    }
+  } catch {
+    totalRows = 0;
+  }
+  // DB サイズ: ページ数 × ページサイズ (D1 では PRAGMA page_count が
+  // 許可されず dbstat も無いため通常は取れない。その場合は全テーブルの
+  // ペイロード長合計を推定値として返す)
+  let pageCount: number | null = null;
+  let pageSize: number | null = null;
+  try {
+    const pc = await db.prepare('PRAGMA page_count').first<Record<string, number>>();
+    if (pc) pageCount = Object.values(pc)[0] ?? null;
+    const ps = await db.prepare('PRAGMA page_size').first<Record<string, number>>();
+    if (ps) pageSize = Object.values(ps)[0] ?? null;
+  } catch {
+    pageCount = null;
+    pageSize = null;
+  }
+  const sizeBytes = pageCount !== null && pageSize !== null ? pageCount * pageSize : null;
+  let sizeEstimateBytes = 0;
+  if (sizeBytes === null) {
+    try {
+      const { results: tableNames } = await db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+        )
+        .all<{ name: string }>();
+      for (const t of tableNames) {
+        const { results: cols } = await db
+          .prepare(`PRAGMA table_info(${t.name})`)
+          .all<{ name: string }>();
+        if (cols.length === 0) continue;
+        const expr = cols
+          .map((col) => `COALESCE(LENGTH(CAST("${col.name}" AS BLOB)), 0)`)
+          .join(' + ');
+        const row = await db
+          .prepare(`SELECT COALESCE(SUM(${expr}), 0) AS bytes FROM ${t.name}`)
+          .first<{ bytes: number }>();
+        sizeEstimateBytes += row?.bytes ?? 0;
+      }
+    } catch {
+      sizeEstimateBytes = 0;
+    }
+  }
+
+  const activeSessions = await countFor(
+    'SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?1',
+    now,
+  );
+  let backupStats = { count: 0, totalBytes: 0 };
+  if (await hasBackupsTable(db)) {
+    const row = await db
+      .prepare('SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM backups')
+      .first<{ n: number; bytes: number }>();
+    backupStats = { count: row?.n ?? 0, totalBytes: row?.bytes ?? 0 };
+  }
+
+  return c.json({
+    generatedAt: now,
+    stores,
+    database: { totalRows, sizeBytes, sizeEstimateBytes, pageCount, pageSize },
+    activeSessions,
+    backups: backupStats,
+  });
 });
 
 const maintenanceBodySchema = z.object({

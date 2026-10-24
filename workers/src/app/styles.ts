@@ -601,6 +601,14 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .chip:active { transform: scale(0.96); }
 .chip.active { background: var(--accent); border-color: transparent; color: #fff; }
 
+/* ---- 保存検索チップ (在庫一覧) とフリー在庫の併記 ---- */
+.saved-wrap { display: inline-flex; align-items: center; gap: 0.15rem; }
+.saved-del {
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: 1rem; line-height: 1; padding: 0.3rem 0.35rem;
+}
+.free-note { font-size: 0.78rem; font-weight: 600; color: var(--accent); margin-top: 0.1rem; }
+
 /* ---- 在庫一覧: 行タップと数量の強調 ---- */
 .stocks-table tbody tr { cursor: pointer; }
 .stocks-table td { padding-top: 0.85rem; padding-bottom: 0.85rem; }
