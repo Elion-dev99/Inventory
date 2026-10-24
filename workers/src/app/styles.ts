@@ -329,6 +329,9 @@ tbody tr { transition: background 0.12s ease; }
 tbody tr:hover { background: var(--surface-2); }
 tr:last-child td { border-bottom: none; }
 
+.thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 8px; vertical-align: middle; margin-right: 0.5rem; background: var(--control); }
+.thumb-lg { width: 76px; height: 76px; object-fit: cover; border-radius: 10px; background: var(--control); }
+.photo-grid { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0; }
 .badge { display: inline-block; padding: 0.12rem 0.6rem; border-radius: 980px; font-size: 0.78rem; font-weight: 600; background: var(--control); color: var(--fg); }
 .badge-danger { background: var(--danger-bg); color: var(--danger); }
 .badge-warn { background: var(--warn-bg); color: var(--warn); }

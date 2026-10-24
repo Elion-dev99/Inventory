@@ -6,6 +6,7 @@ import {
   type ConsumeInput,
   type Envelope,
   type InboundInput,
+  type StartStocktakeInput,
   type TransferInput,
 } from './coordinator';
 import {
@@ -57,6 +58,7 @@ import {
   consumptionSchema,
   countedQuantitySchema,
   createApprovalSchema,
+  createStocktakeSchema,
   createLocationSchema,
   createLotSchema,
   createProductSchema,
@@ -102,6 +104,15 @@ import {
   maybeSendAnnouncementPush,
   runScheduledAnnouncementPushes,
 } from './lib/push';
+import {
+  imageResponse,
+  imagesBucket,
+  movementPhotoKey,
+  productImageKey,
+  readImageBody,
+  requireImagesBucket,
+} from './lib/photos';
+import { qrSvg } from './lib/qr';
 
 export { InventoryCoordinator };
 
@@ -159,6 +170,102 @@ app.get('/manifest.webmanifest', () => manifestResponse());
 app.get('/icons/:name', (c) => iconResponse(c.req.param('name')) ?? c.notFound());
 // Web Push 用 Service Worker (push で通知表示、クリックで /app を開く)
 app.get('/sw.js', () => serviceWorkerResponse());
+
+// ------------------------------------------------------------ ラベル印刷
+// QR ラベルをサーバー描画で返す印刷用ページ (要ログイン + master.read)。
+// 商品ラベルの QR 内容はスキャンで解決できる値 (バーコードがあればバーコード、
+// 無ければ SKU)、保管場所ラベルは場所コード。印刷時は白背景・黒文字で、
+// アプリの UI を出さない (@media print でツールバーを隠す)。
+
+function escHtml(s: unknown): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+app.get('/labels/print', async (c) => {
+  const authUser = await authenticate(c.req.raw, c.env);
+  c.set('user', authUser);
+  await requirePermission(c, Permission.MASTER_READ);
+  const ctx = await storeContext(c);
+  const type = c.req.query('type') === 'locations' ? 'locations' : 'products';
+  const ids = (c.req.query('ids') ?? '')
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0)
+    .slice(0, 200);
+
+  interface LabelItem {
+    qr: string;
+    title: string;
+    sub: string;
+  }
+  const items: LabelItem[] = [];
+  if (type === 'products') {
+    const sql =
+      'SELECT id, sku, name, barcode FROM products WHERE store_id = ?1 AND deleted_at IS NULL' +
+      (ids.length > 0 ? ` AND id IN (${ids.map(() => '?').join(',')})` : '') +
+      ' ORDER BY id ASC LIMIT 200';
+    const { results } = await c.env.DB.prepare(sql)
+      .bind(ctx.store.id, ...ids)
+      .all<{ id: number; sku: string; name: string; barcode: string | null }>();
+    for (const r of results) {
+      items.push({ qr: r.barcode && r.barcode.length > 0 ? r.barcode : r.sku, title: r.name, sub: r.sku });
+    }
+  } else {
+    const sql =
+      `SELECT loc.id, loc.code, loc.name, w.name AS warehouse_name
+         FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+        WHERE w.store_id = ?1 AND loc.deleted_at IS NULL` +
+      (ids.length > 0 ? ` AND loc.id IN (${ids.map(() => '?').join(',')})` : '') +
+      ' ORDER BY loc.id ASC LIMIT 200';
+    const { results } = await c.env.DB.prepare(sql)
+      .bind(ctx.store.id, ...ids)
+      .all<{ id: number; code: string; name: string; warehouse_name: string }>();
+    for (const r of results) {
+      items.push({ qr: r.code, title: r.name, sub: `${r.code} / ${r.warehouse_name}` });
+    }
+  }
+
+  const cards = items
+    .map(
+      (it) =>
+        `<div class="label"><div class="qr">${qrSvg(it.qr)}</div>` +
+        `<div class="label-name">${escHtml(it.title)}</div>` +
+        `<div class="label-sub">${escHtml(it.sub)}</div></div>`,
+    )
+    .join('\n');
+  const heading = type === 'products' ? '商品ラベル' : '保管場所ラベル';
+  return c.html(`<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${heading} | 在庫管理システム</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1rem; background: #fff; color: #000; }
+  .toolbar { margin-bottom: 1rem; }
+  .toolbar button { font: inherit; padding: 0.5rem 1rem; border: 1px solid #888; border-radius: 6px; background: #fff; cursor: pointer; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+  .label { border: 1px solid #999; border-radius: 6px; padding: 10px; text-align: center; break-inside: avoid; page-break-inside: avoid; }
+  .qr svg { width: 96px; height: 96px; }
+  .label-name { font-weight: 700; font-size: 0.95rem; margin-top: 6px; overflow-wrap: break-word; }
+  .label-sub { font-size: 0.8rem; color: #333; overflow-wrap: break-word; }
+  .empty { color: #555; }
+  @media print {
+    body { margin: 0; }
+    .toolbar { display: none; }
+    .grid { gap: 6px; }
+  }
+  @page { margin: 10mm; }
+</style></head>
+<body>
+<div class="toolbar"><button type="button" onclick="window.print()">印刷する</button>
+<span>${heading} (${items.length} 件)</span></div>
+${items.length > 0 ? `<div class="grid">\n${cards}\n</div>` : '<p class="empty">対象がありません。</p>'}
+</body>
+</html>`);
+});
 
 // ------------------------------------------------------------ ログイン (動作確認用)
 // Google Identity Services で ID トークンを取得し、業務 API を呼ぶ最小ページ。
@@ -952,6 +1059,20 @@ async function hasColumn(c: AppContext, table: string, column: string): Promise<
   }
 }
 
+/** テーブル自体が存在するか (0014 の movement_photos など) */
+async function hasTable(c: AppContext, table: string): Promise<boolean> {
+  try {
+    const row = await c.env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+    )
+      .bind(table)
+      .first<{ name: string }>();
+    return row !== null;
+  } catch {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------ ユーティリティ
 
 async function parseJson(c: AppContext): Promise<unknown> {
@@ -988,7 +1109,7 @@ interface CoordinatorStub {
   inbound: (input: InboundInput) => Promise<Envelope>;
   consume: (input: ConsumeInput) => Promise<Envelope>;
   transfer: (input: TransferInput) => Promise<Envelope>;
-  startStocktake: (input: { actorId: number; storeId: number }) => Promise<Envelope>;
+  startStocktake: (input: StartStocktakeInput) => Promise<Envelope>;
   finishStocktake: (input: { actorId: number; stocktakeId: number; storeId: number }) => Promise<Envelope>;
   decideStocktake: (input: { actorId: number; stocktakeId: number; approve: boolean; storeId: number }) => Promise<Envelope>;
   fetch: (request: Request) => Promise<Response>;
@@ -1229,13 +1350,17 @@ app.get('/api/v1/movements', async (c) => {
   }
   const skip = Number(c.req.query('skip') ?? 0);
   const take = Math.min(Number(c.req.query('take') ?? 50), 200);
+  // 検品写真の件数 (0014 の movement_photos がある環境のみ数える)
+  const photoCountSql = (await hasTable(c, 'movement_photos'))
+    ? '(SELECT COUNT(*) FROM movement_photos mp WHERE mp.movement_id = mv.id) AS photoCount'
+    : '0 AS photoCount';
   const sql =
     `SELECT mv.id, mv.document_id AS documentId, mv.stock_id AS stockId, mv.type,
             mv.quantity_change AS quantityChange, mv.quantity_before AS quantityBefore,
             mv.quantity_after AS quantityAfter, mv.actor_id AS actorId,
             mv.department, mv.purpose, mv.reason, mv.created_at AS createdAt,
             s.location_id AS locationId, loc.warehouse_id AS warehouseId,
-            l.product_id AS productId, l.lot_code AS lotCode, p.sku
+            l.product_id AS productId, l.lot_code AS lotCode, p.sku, ${photoCountSql}
        FROM stock_movements mv
        JOIN stocks s ON s.id = mv.stock_id
        JOIN locations loc ON loc.id = s.location_id
@@ -1246,6 +1371,105 @@ app.get('/api/v1/movements', async (c) => {
   params.push(take, skip);
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
   return c.json(results);
+});
+
+// ------------------------------------------------------- 検品写真 (R2)
+// 入出庫伝票 (stock_movements) への写真添付。実体は R2、台帳は movement_photos。
+// 写真は 1 リクエスト 1 枚で、複数枚は繰り返し呼ぶ。バインディング IMAGES や
+// テーブル (0014) が無い環境では 503 PHOTOS_NOT_CONFIGURED で劣化する。
+
+interface MovementPhotoRow {
+  id: number;
+  movement_id: number;
+  image_key: string;
+  created_by: number;
+  created_at: number;
+}
+
+async function loadMovementInStore(c: AppContext, movementId: number, storeId: number): Promise<void> {
+  const row = await c.env.DB.prepare('SELECT id FROM stock_movements WHERE id = ?1 AND store_id = ?2')
+    .bind(movementId, storeId)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Movement not found');
+}
+
+/** 検品写真を 1 枚追加する (movements.inbound)。発注の受入で生まれた伝票にもそのまま付けられる */
+app.post('/api/v1/movements/:id/photos', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_INBOUND);
+  const ctx = await storeContext(c);
+  const movementId = Number(c.req.param('id'));
+  if (!(await hasTable(c, 'movement_photos'))) {
+    throw new ApiError(503, 'PHOTOS_NOT_CONFIGURED', 'Movement photos are not configured (migration 0014 / R2 binding IMAGES)');
+  }
+  await loadMovementInStore(c, movementId, ctx.store.id);
+  const bucket = requireImagesBucket(c.env);
+  const { bytes, contentType } = await readImageBody(c.req.raw);
+  const now = Date.now();
+  const inserted = await c.env.DB.prepare(
+    `INSERT INTO movement_photos (store_id, movement_id, image_key, created_by, created_at)
+     VALUES (?1, ?2, '', ?3, ?4)`,
+  )
+    .bind(ctx.store.id, movementId, user(c).userId, now)
+    .run();
+  const photoId = Number(inserted.meta.last_row_id);
+  const key = movementPhotoKey(ctx.store.id, photoId);
+  try {
+    await bucket.put(key, bytes, { httpMetadata: { contentType } });
+  } catch {
+    await c.env.DB.prepare('DELETE FROM movement_photos WHERE id = ?1').bind(photoId).run();
+    throw new ApiError(502, 'PHOTO_STORE_FAILED', 'Failed to store the photo');
+  }
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE movement_photos SET image_key = ?1 WHERE id = ?2').bind(key, photoId),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'movement.photo.add', 'stock_movement', ?2, ?3, ?4, ?5)`,
+      )
+      .bind(user(c).userId, String(movementId), JSON.stringify({ photoId }), ctx.store.id, now),
+  ]);
+  return c.json({ id: photoId, movementId, imageKey: key, createdBy: user(c).userId, createdAt: now }, 201);
+});
+
+/** 伝票に付いた検品写真の一覧 (stocks.read) */
+app.get('/api/v1/movements/:id/photos', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  const movementId = Number(c.req.param('id'));
+  await loadMovementInStore(c, movementId, ctx.store.id);
+  if (!(await hasTable(c, 'movement_photos'))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, movement_id, image_key, created_by, created_at FROM movement_photos WHERE movement_id = ?1 AND store_id = ?2 ORDER BY id ASC',
+  )
+    .bind(movementId, ctx.store.id)
+    .all<MovementPhotoRow>();
+  return c.json(
+    results.map((r) => ({
+      id: r.id,
+      movementId: r.movement_id,
+      createdBy: r.created_by,
+      createdAt: r.created_at,
+    })),
+  );
+});
+
+/** 検品写真の実体配信 (stocks.read、現在店舗の写真のみ) */
+app.get('/api/v1/photos/:photoId', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  const photoId = Number(c.req.param('photoId'));
+  if (!(await hasTable(c, 'movement_photos'))) throw notFound('Photo not found');
+  const row = await c.env.DB.prepare(
+    'SELECT id, movement_id, image_key, created_by, created_at FROM movement_photos WHERE id = ?1 AND store_id = ?2',
+  )
+    .bind(photoId, ctx.store.id)
+    .first<MovementPhotoRow>();
+  if (!row) throw notFound('Photo not found');
+  const bucket = imagesBucket(c.env);
+  if (!bucket) throw new ApiError(503, 'PHOTOS_NOT_CONFIGURED', 'Image storage (R2 binding IMAGES) is not configured');
+  const res = imageResponse(await bucket.get(row.image_key));
+  if (!res) throw notFound('Photo not found');
+  return res;
 });
 
 // ---------------------------------------------------------------- マスタ
@@ -1261,6 +1485,10 @@ interface ProductRow {
   expiry_alert_days: number | null;
   /** 0007 で追加。未適用環境では undefined になるため null に寄せる */
   unit_cost?: number | null;
+  /** 0014 で追加 (画像キー・入数・リードタイム)。同上 */
+  image_key?: string | null;
+  case_size?: number | null;
+  lead_time_days?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -1276,6 +1504,9 @@ function productJson(r: ProductRow): Record<string, unknown> {
     requiresExpiry: r.requires_expiry === 1,
     expiryAlertDays: r.expiry_alert_days,
     unitCost: r.unit_cost ?? null,
+    imageKey: r.image_key ?? null,
+    caseSize: r.case_size ?? null,
+    leadTimeDays: r.lead_time_days ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -1299,21 +1530,27 @@ async function createProduct(c: AppContext): Promise<Response> {
   const ctx = await storeContext(c);
   const dto = parseWith(createProductSchema, await parseJson(c));
   const now = Date.now();
-  // unit_cost 列は 0007 で追加される。未適用環境では列なし INSERT に落とす
-  const withCost = await hasColumn(c, 'products', 'unit_cost');
-  const sql = withCost
-    ? `INSERT INTO products (store_id, sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, unit_cost, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)`
-    : `INSERT INTO products (store_id, sku, name, unit, barcode, safety_stock, requires_expiry, expiry_alert_days, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`;
+  // 任意列 (unit_cost は 0007、case_size / lead_time_days は 0014) は
+  // 列がある環境でのみ INSERT に含める (未適用環境への後方互換)
+  const cols: string[] = [
+    'store_id', 'sku', 'name', 'unit', 'barcode', 'safety_stock', 'requires_expiry', 'expiry_alert_days',
+  ];
   const binds: (string | number | null)[] = [
     ctx.store.id, dto.sku, dto.name, dto.unit, dto.barcode ?? null, dto.safetyStock ?? 0,
     dto.requiresExpiry ? 1 : 0, dto.expiryAlertDays ?? null,
   ];
-  if (withCost) binds.push(dto.unitCost ?? null);
-  binds.push(now);
+  if (await hasColumn(c, 'products', 'unit_cost')) { cols.push('unit_cost'); binds.push(dto.unitCost ?? null); }
+  if (await hasColumn(c, 'products', 'case_size')) { cols.push('case_size'); binds.push(dto.caseSize ?? null); }
+  if (await hasColumn(c, 'products', 'lead_time_days')) { cols.push('lead_time_days'); binds.push(dto.leadTimeDays ?? null); }
+  cols.push('created_at', 'updated_at');
+  binds.push(now, now);
+  const placeholders = cols.map((_, i) => `?${i + 1}`).join(', ');
   try {
-    const res = await c.env.DB.prepare(sql).bind(...binds).run();
+    const res = await c.env.DB.prepare(
+      `INSERT INTO products (${cols.join(', ')}) VALUES (${placeholders})`,
+    )
+      .bind(...binds)
+      .run();
     return c.json({ id: Number(res.meta.last_row_id), ...dto }, 201);
   } catch {
     throw new ApiError(409, 'DUPLICATE', 'Product with this sku already exists');
@@ -1498,6 +1735,14 @@ async function updateProduct(c: AppContext): Promise<Response> {
     sets.push('unit_cost = ?');
     params.push(dto.unitCost);
   }
+  if (dto.caseSize !== undefined && (await hasColumn(c, 'products', 'case_size'))) {
+    sets.push('case_size = ?');
+    params.push(dto.caseSize);
+  }
+  if (dto.leadTimeDays !== undefined && (await hasColumn(c, 'products', 'lead_time_days'))) {
+    sets.push('lead_time_days = ?');
+    params.push(dto.leadTimeDays);
+  }
   if (sets.length > 0) {
     const now = Date.now();
     await c.env.DB.prepare(
@@ -1523,6 +1768,67 @@ async function deleteProduct(c: AppContext): Promise<Response> {
     .bind(now, id, ctx.store.id)
     .run();
   if (res.meta.changes === 0) throw notFound('Product not found');
+  return c.json({ id, deleted: true });
+}
+
+// ------------------------------------------------------- 商品画像 (R2)
+// 保存先は R2 (lib/photos.ts)。バインディング IMAGES が無い環境では
+// 503 PHOTOS_NOT_CONFIGURED で劣化する。キーは products/{storeId}/{id}.jpg。
+
+async function loadProductForImage(c: AppContext, id: number, storeId: number): Promise<ProductRow> {
+  const row = await c.env.DB.prepare(
+    'SELECT * FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, storeId)
+    .first<ProductRow>();
+  if (!row) throw notFound('Product not found');
+  return row;
+}
+
+async function putProductImage(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  await loadProductForImage(c, id, ctx.store.id);
+  const bucket = requireImagesBucket(c.env);
+  const { bytes, contentType } = await readImageBody(c.req.raw);
+  const key = productImageKey(ctx.store.id, id);
+  await bucket.put(key, bytes, { httpMetadata: { contentType } });
+  if (await hasColumn(c, 'products', 'image_key')) {
+    await c.env.DB.prepare('UPDATE products SET image_key = ?1, updated_at = ?2 WHERE id = ?3')
+      .bind(key, Date.now(), id)
+      .run();
+  }
+  return c.json({ id, imageKey: key });
+}
+
+async function getProductImage(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_READ);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  await loadProductForImage(c, id, ctx.store.id);
+  const bucket = imagesBucket(c.env);
+  if (!bucket) throw new ApiError(503, 'PHOTOS_NOT_CONFIGURED', 'Image storage (R2 binding IMAGES) is not configured');
+  const res = imageResponse(await bucket.get(productImageKey(ctx.store.id, id)));
+  if (!res) throw notFound('Product image not found');
+  return res;
+}
+
+async function deleteProductImage(c: AppContext): Promise<Response> {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const row = await loadProductForImage(c, id, ctx.store.id);
+  const bucket = requireImagesBucket(c.env);
+  const key = productImageKey(ctx.store.id, id);
+  const head = await bucket.head(key);
+  if (!head && (row.image_key ?? null) === null) throw notFound('Product image not found');
+  await bucket.delete(key);
+  if (await hasColumn(c, 'products', 'image_key')) {
+    await c.env.DB.prepare('UPDATE products SET image_key = NULL, updated_at = ?1 WHERE id = ?2')
+      .bind(Date.now(), id)
+      .run();
+  }
   return c.json({ id, deleted: true });
 }
 
@@ -1706,6 +2012,8 @@ interface SupplierRow {
   email: string | null;
   phone: string | null;
   note: string | null;
+  /** 0014 で追加。未適用環境では undefined になるため null に寄せる */
+  lead_time_days?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -1718,6 +2026,7 @@ function supplierJson(r: SupplierRow): Record<string, unknown> {
     email: r.email,
     phone: r.phone,
     note: r.note,
+    leadTimeDays: r.lead_time_days ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -1741,12 +2050,20 @@ async function createSupplier(c: AppContext): Promise<Response> {
   const ctx = await storeContext(c);
   const dto = parseWith(createSupplierSchema, await parseJson(c));
   const now = Date.now();
-  const res = await c.env.DB.prepare(
-    `INSERT INTO suppliers (store_id, name, contact, email, phone, note, created_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)`,
-  )
-    .bind(ctx.store.id, dto.name, dto.contact ?? null, dto.email ?? null, dto.phone ?? null, dto.note ?? null, now)
-    .run();
+  const withLead = await hasColumn(c, 'suppliers', 'lead_time_days');
+  const res = withLead
+    ? await c.env.DB.prepare(
+        `INSERT INTO suppliers (store_id, name, contact, email, phone, note, lead_time_days, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)`,
+      )
+        .bind(ctx.store.id, dto.name, dto.contact ?? null, dto.email ?? null, dto.phone ?? null, dto.note ?? null, dto.leadTimeDays ?? null, now)
+        .run()
+    : await c.env.DB.prepare(
+        `INSERT INTO suppliers (store_id, name, contact, email, phone, note, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)`,
+      )
+        .bind(ctx.store.id, dto.name, dto.contact ?? null, dto.email ?? null, dto.phone ?? null, dto.note ?? null, now)
+        .run();
   return c.json({ id: Number(res.meta.last_row_id), ...dto }, 201);
 }
 
@@ -1767,6 +2084,10 @@ async function updateSupplier(c: AppContext): Promise<Response> {
   if (dto.email !== undefined) { sets.push('email = ?'); params.push(dto.email); }
   if (dto.phone !== undefined) { sets.push('phone = ?'); params.push(dto.phone); }
   if (dto.note !== undefined) { sets.push('note = ?'); params.push(dto.note); }
+  if (dto.leadTimeDays !== undefined && (await hasColumn(c, 'suppliers', 'lead_time_days'))) {
+    sets.push('lead_time_days = ?');
+    params.push(dto.leadTimeDays);
+  }
   if (sets.length > 0) {
     await c.env.DB.prepare(
       `UPDATE suppliers SET ${sets.join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
@@ -1911,6 +2232,9 @@ for (const base of ['/api/v1/master', '/api/v1'] as const) {
   app.post(`${base}/products/import`, importProducts);
   app.put(`${base}/products/:id`, updateProduct);
   app.delete(`${base}/products/:id`, deleteProduct);
+  app.put(`${base}/products/:id/image`, putProductImage);
+  app.get(`${base}/products/:id/image`, getProductImage);
+  app.delete(`${base}/products/:id/image`, deleteProductImage);
   app.get(`${base}/warehouses`, listWarehouses);
   app.post(`${base}/warehouses`, createWarehouse);
   app.put(`${base}/warehouses/:id`, updateWarehouse);
@@ -2268,19 +2592,80 @@ app.post('/api/v1/stocktakes', async (c) => {
   await requirePermission(c, Permission.STOCKTAKES_MANAGE);
   await requireFeature(c, 'stocktakes');
   const ctx = await storeContext(c);
-  const envelope = await coordinator(c).startStocktake({ actorId: user(c).userId, storeId: ctx.store.id });
+  // ボディは任意: 無ければ全件・非盲検 (従来どおり)。壊れた JSON も無しとして扱う
+  let raw: unknown = {};
+  try {
+    raw = await c.req.json();
+  } catch {
+    raw = {};
+  }
+  const dto = parseWith(createStocktakeSchema, raw ?? {});
+  const envelope = await coordinator(c).startStocktake({
+    actorId: user(c).userId,
+    storeId: ctx.store.id,
+    scopeType: dto.scopeType ?? 'full',
+    ...(dto.locationIds !== undefined ? { locationIds: dto.locationIds } : {}),
+    blind: dto.blind ?? false,
+  });
   return respond(c, envelope);
 });
 
+interface StocktakeHeadRow {
+  id: number;
+  status: string;
+  startedBy: number;
+  startedAt: number;
+  confirmedAt: number | null;
+  scopeType?: string;
+  scopeJson?: string | null;
+  blind?: number;
+}
+
+/** 棚卸しの見出し行を API 形式へ (scope/blind は 0014 適用環境のみ値が入る) */
+function stocktakeHeadJson(r: StocktakeHeadRow): Record<string, unknown> {
+  let locationIds: number[] | null = null;
+  if (typeof r.scopeJson === 'string') {
+    try {
+      const parsed = JSON.parse(r.scopeJson) as unknown;
+      if (Array.isArray(parsed)) locationIds = parsed.filter((v): v is number => typeof v === 'number');
+    } catch {
+      locationIds = null;
+    }
+  }
+  return {
+    id: r.id,
+    status: r.status,
+    startedBy: r.startedBy,
+    startedAt: r.startedAt,
+    confirmedAt: r.confirmedAt,
+    scopeType: r.scopeType ?? 'full',
+    locationIds,
+    blind: r.blind === 1,
+  };
+}
+
+const STOCKTAKE_HEAD_SQL = `SELECT id, status, started_by AS startedBy, started_at AS startedAt,
+       confirmed_at AS confirmedAt, scope_type AS scopeType, scope_json AS scopeJson, blind
+  FROM stocktakes`;
+const STOCKTAKE_HEAD_SQL_LEGACY = `SELECT id, status, started_by AS startedBy, started_at AS startedAt,
+       confirmed_at AS confirmedAt
+  FROM stocktakes`;
+
+async function stocktakeHeadSql(c: AppContext): Promise<string> {
+  return (await hasColumn(c, 'stocktakes', 'scope_type'))
+    ? STOCKTAKE_HEAD_SQL
+    : STOCKTAKE_HEAD_SQL_LEGACY;
+}
+
 app.get('/api/v1/stocktakes', async (c) => {
   const ctx = await storeContext(c);
+  const headSql = await stocktakeHeadSql(c);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, status, started_by AS startedBy, started_at AS startedAt, confirmed_at AS confirmedAt
-       FROM stocktakes WHERE store_id = ?1 ORDER BY id DESC LIMIT 50`,
+    `${headSql} WHERE store_id = ?1 ORDER BY id DESC LIMIT 50`,
   )
     .bind(ctx.store.id)
-    .all();
-  return c.json(results);
+    .all<StocktakeHeadRow>();
+  return c.json(results.map(stocktakeHeadJson));
 });
 
 app.post('/api/v1/stocktakes/:id/finish', async (c) => {
@@ -2336,23 +2721,42 @@ const STOCKTAKE_LINE_SQL = `SELECT sl.id, sl.stock_id AS stockId, sl.book_quanti
       JOIN lots l ON l.id = s.lot_id
       JOIN products p ON p.id = l.product_id`;
 
+/**
+ * 盲検の秘匿: 盲検 (blind=1) かつ実施中の間は、実数入力のためのレスポンスから
+ * 帳簿数 (bookQuantity) と差異 (difference) を落とす。差異が見えるのは
+ * 承認待ち以降 (差異承認の画面) だけ。
+ */
+function applyBlind(
+  lineJson: Record<string, unknown>,
+  stocktake: { blind?: number; status: string },
+): Record<string, unknown> {
+  if (stocktake.blind === 1 && stocktake.status === 'in_progress') {
+    const out = { ...lineJson };
+    delete out.bookQuantity;
+    delete out.difference;
+    return out;
+  }
+  return lineJson;
+}
+
 /** 棚卸しの詳細 (lines: 帳簿数・実数・差異つき)。一覧と同じく現在店舗の割当が条件 */
 app.get('/api/v1/stocktakes/:id', async (c) => {
   const ctx = await storeContext(c);
   const id = Number(c.req.param('id'));
-  const stocktake = await c.env.DB.prepare(
-    `SELECT id, status, started_by AS startedBy, started_at AS startedAt, confirmed_at AS confirmedAt
-       FROM stocktakes WHERE id = ?1 AND store_id = ?2`,
-  )
+  const headSql = await stocktakeHeadSql(c);
+  const stocktake = await c.env.DB.prepare(`${headSql} WHERE id = ?1 AND store_id = ?2`)
     .bind(id, ctx.store.id)
-    .first();
+    .first<StocktakeHeadRow>();
   if (!stocktake) throw notFound('Stocktake not found');
   const { results } = await c.env.DB.prepare(
     `${STOCKTAKE_LINE_SQL} WHERE sl.stocktake_id = ?1 ORDER BY sl.id ASC`,
   )
     .bind(id)
     .all<StocktakeLineView>();
-  return c.json({ ...stocktake, lines: results.map(stocktakeLineJson) });
+  return c.json({
+    ...stocktakeHeadJson(stocktake),
+    lines: results.map((r) => applyBlind(stocktakeLineJson(r), stocktake)),
+  });
 });
 
 /** 棚卸し lines への実数入力 (実施中のみ)。lines は stocks ではないため Worker が直接更新する */
@@ -2362,9 +2766,10 @@ app.put('/api/v1/stocktakes/:id/lines/:lineId', async (c) => {
   const stocktakeId = Number(c.req.param('id'));
   const lineId = Number(c.req.param('lineId'));
   const dto = parseWith(countedQuantitySchema, await parseJson(c));
-  const stocktake = await c.env.DB.prepare('SELECT id, status FROM stocktakes WHERE id = ?1 AND store_id = ?2')
+  const headSql = await stocktakeHeadSql(c);
+  const stocktake = await c.env.DB.prepare(`${headSql} WHERE id = ?1 AND store_id = ?2`)
     .bind(stocktakeId, ctx.store.id)
-    .first<{ id: number; status: string }>();
+    .first<StocktakeHeadRow>();
   if (!stocktake) throw notFound('Stocktake not found');
   if (stocktake.status !== 'in_progress') {
     throw new ApiError(409, 'STOCKTAKE_NOT_IN_PROGRESS', 'Counted quantities can only be entered while the stocktake is in progress');
@@ -2378,7 +2783,7 @@ app.put('/api/v1/stocktakes/:id/lines/:lineId', async (c) => {
   const line = await c.env.DB.prepare(`${STOCKTAKE_LINE_SQL} WHERE sl.id = ?1`)
     .bind(lineId)
     .first<StocktakeLineView>();
-  return c.json(stocktakeLineJson(line as StocktakeLineView));
+  return c.json(applyBlind(stocktakeLineJson(line as StocktakeLineView), stocktake));
 });
 
 /** 棚卸しの差異承認/差し戻し (pending_approval のときのみ Coordinator が処理する) */
@@ -2489,6 +2894,9 @@ interface PurchaseOrderLineDbRow {
   quantity: number;
   received_quantity: number;
   unit_cost: number | null;
+  /** 0014 で追加 (入力時の数量・単位)。未適用環境では undefined になるため null に寄せる */
+  input_quantity?: number | null;
+  input_unit?: string | null;
 }
 
 const PO_SELECT = `SELECT po.id, po.supplier_id, sup.name AS supplier_name, po.status,
@@ -2497,6 +2905,15 @@ const PO_SELECT = `SELECT po.id, po.supplier_id, sup.name AS supplier_name, po.s
                      LEFT JOIN suppliers sup ON sup.id = po.supplier_id`;
 
 function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow[]): Record<string, unknown> {
+  const today = formatDateOnly(Date.now());
+  const hasRemaining = lines.some((l) => l.quantity - l.received_quantity > 0);
+  // 納期超過: 未完了 (下書き・発注済み) で残があり、納期日を過ぎている
+  const overdue =
+    (po.status === 'draft' || po.status === 'ordered') &&
+    hasRemaining &&
+    po.expected_date !== null &&
+    today !== null &&
+    po.expected_date < today;
   return {
     id: po.id,
     supplierId: po.supplier_id,
@@ -2507,11 +2924,15 @@ function purchaseOrderJson(po: PurchaseOrderDbRow, lines: PurchaseOrderLineDbRow
     createdBy: po.created_by,
     createdAt: po.created_at,
     updatedAt: po.updated_at,
+    overdue,
     lines: lines.map((l) => ({
       id: l.id,
       productId: l.product_id,
       quantity: l.quantity,
       receivedQuantity: l.received_quantity,
+      remainingQuantity: l.quantity - l.received_quantity,
+      inputQuantity: l.input_quantity ?? null,
+      inputUnit: l.input_unit ?? null,
       unitCost: l.unit_cost,
     })),
   };
@@ -2550,8 +2971,15 @@ app.get('/api/v1/purchase-orders', async (c) => {
 });
 
 /**
- * 発注提案: 安全在庫を下回った商品について、不足分と提案数量を返す。
- * 提案数量は「安全在庫の 2 倍まで補充する」ルール (safety*2 - 現在庫)。
+ * 発注提案 (0014 で高度化):
+ * - 発注点 = 平均日次消費 (直近90日の消費量 / 90) × リードタイム + 安全在庫。
+ *   リードタイムは商品の指定 → 直近の発注先の既定 → 7日 の順で解決する。
+ *   平均消費が 0 のときは発注点 = 安全在庫 (従来と同じ判定になる)。
+ * - 判定は論理在庫 = 実在庫 + 発注残 (status='ordered' の未入荷数量) で行い、
+ *   発注残で発注点以上になる商品は提案しない。
+ * - 提案数量は発注点 + 安全在庫まで補充する量。入数 (case_size) がある商品は
+ *   ケース単位に切り上げる。
+ * - レスポンスには内訳 (実在庫・発注残・発注点・平均日次消費・リードタイム) を含む。
  */
 app.get('/api/v1/purchase-orders/suggestions', async (c) => {
   await requirePermission(c, Permission.PURCHASES_READ);
@@ -2559,33 +2987,128 @@ app.get('/api/v1/purchase-orders/suggestions', async (c) => {
   const ctx = await storeContext(c);
   const reachable = reachableWarehouseIds(ctx.assignments);
   if (reachable !== null && reachable.length === 0) return c.json([]);
-  const scopeJoin =
-    reachable === null
-      ? ''
-      : ` AND sloc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
-  const sql = `SELECT p.id AS productId, p.sku, p.name, p.safety_stock AS safetyStock,
-                      COALESCE((SELECT SUM(s.quantity)
-                                  FROM stocks s
-                                  JOIN lots sl ON sl.id = s.lot_id
-                                  JOIN locations sloc ON sloc.id = s.location_id
-                                 WHERE sl.product_id = p.id AND s.store_id = ?${scopeJoin}), 0) AS totalQuantity
-                 FROM products p
-                WHERE p.deleted_at IS NULL AND p.safety_stock > 0 AND p.store_id = ?
-                ORDER BY p.id ASC`;
-  const { results } = await c.env.DB.prepare(sql)
-    .bind(ctx.store.id, ...(reachable ?? []), ctx.store.id)
-    .all<{ productId: number; sku: string; name: string; safetyStock: number; totalQuantity: number }>();
-  const suggestions = results
-    .filter((r) => r.safetyStock - r.totalQuantity > 0)
-    .map((r) => ({
-      productId: r.productId,
-      sku: r.sku,
-      name: r.name,
-      safetyStock: r.safetyStock,
-      totalQuantity: r.totalQuantity,
-      shortage: r.safetyStock - r.totalQuantity,
-      suggestedQuantity: r.safetyStock * 2 - r.totalQuantity,
-    }));
+  const storeId = ctx.store.id;
+  const DAY = 86_400_000;
+  const since = Date.now() - 90 * DAY;
+  const scopeCondition =
+    reachable === null ? '' : ` AND sloc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
+  const scopeParams = reachable ?? [];
+
+  const withCase = await hasColumn(c, 'products', 'case_size');
+  const withLead = await hasColumn(c, 'products', 'lead_time_days');
+  const withSupplierLead = await hasColumn(c, 'suppliers', 'lead_time_days');
+
+  const { results: products } = await c.env.DB.prepare(
+    `SELECT p.id AS productId, p.sku, p.name, p.safety_stock AS safetyStock
+            ${withCase ? ', p.case_size AS caseSize' : ', NULL AS caseSize'}
+            ${withLead ? ', p.lead_time_days AS leadTimeDays' : ', NULL AS leadTimeDays'}
+       FROM products p
+      WHERE p.deleted_at IS NULL AND p.safety_stock > 0 AND p.store_id = ?1
+      ORDER BY p.id ASC`,
+  )
+    .bind(storeId)
+    .all<{
+      productId: number;
+      sku: string;
+      name: string;
+      safetyStock: number;
+      caseSize: number | null;
+      leadTimeDays: number | null;
+    }>();
+  if (products.length === 0) return c.json([]);
+
+  // 実在庫 (倉庫スコープ適用)
+  const { results: onHandRows } = await c.env.DB.prepare(
+    `SELECT sl.product_id AS productId, COALESCE(SUM(s.quantity), 0) AS qty
+       FROM stocks s
+       JOIN lots sl ON sl.id = s.lot_id
+       JOIN locations sloc ON sloc.id = s.location_id
+      WHERE s.store_id = ?${scopeCondition}
+      GROUP BY sl.product_id`,
+  )
+    .bind(storeId, ...scopeParams)
+    .all<{ productId: number; qty: number }>();
+  const onHand = new Map(onHandRows.map((r) => [r.productId, r.qty]));
+
+  // 直近90日の消費 (OUT) 合計
+  const { results: consumedRows } = await c.env.DB.prepare(
+    `SELECT sl.product_id AS productId, COALESCE(SUM(-mv.quantity_change), 0) AS qty
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN lots sl ON sl.id = s.lot_id
+       JOIN locations sloc ON sloc.id = s.location_id
+      WHERE mv.type = 'OUT' AND mv.created_at >= ? AND mv.store_id = ?${scopeCondition}
+      GROUP BY sl.product_id`,
+  )
+    .bind(since, storeId, ...scopeParams)
+    .all<{ productId: number; qty: number }>();
+  const consumed = new Map(consumedRows.map((r) => [r.productId, r.qty]));
+
+  // 発注残: 発注済み (ordered) で未入荷の数量
+  const { results: onOrderRows } = await c.env.DB.prepare(
+    `SELECT pol.product_id AS productId, COALESCE(SUM(pol.quantity - pol.received_quantity), 0) AS qty
+       FROM purchase_order_lines pol
+       JOIN purchase_orders po ON po.id = pol.po_id
+      WHERE po.store_id = ?1 AND po.status = 'ordered'
+      GROUP BY pol.product_id`,
+  )
+    .bind(storeId)
+    .all<{ productId: number; qty: number }>();
+  const onOrder = new Map(onOrderRows.map((r) => [r.productId, r.qty]));
+
+  // 商品にリードタイム指定が無い場合の fallback: 直近の発注先の既定リードタイム
+  const supplierLead = new Map<number, number>();
+  if (withSupplierLead) {
+    const { results: leadRows } = await c.env.DB.prepare(
+      `SELECT pol.product_id AS productId, sup.lead_time_days AS leadTimeDays
+         FROM purchase_order_lines pol
+         JOIN purchase_orders po ON po.id = pol.po_id
+         JOIN suppliers sup ON sup.id = po.supplier_id
+        WHERE po.store_id = ?1 AND sup.lead_time_days IS NOT NULL
+        ORDER BY po.created_at DESC, pol.id DESC`,
+    )
+      .bind(storeId)
+      .all<{ productId: number; leadTimeDays: number }>();
+    for (const r of leadRows) {
+      if (!supplierLead.has(r.productId)) supplierLead.set(r.productId, r.leadTimeDays);
+    }
+  }
+
+  const suggestions: Record<string, unknown>[] = [];
+  for (const p of products) {
+    const hand = onHand.get(p.productId) ?? 0;
+    const ordered = onOrder.get(p.productId) ?? 0;
+    const logical = hand + ordered;
+    const avgDailyRaw = (consumed.get(p.productId) ?? 0) / 90;
+    const leadTimeDays = p.leadTimeDays ?? supplierLead.get(p.productId) ?? 7;
+    const reorderPoint = Math.ceil(avgDailyRaw * leadTimeDays) + p.safetyStock;
+    if (logical >= reorderPoint) continue;
+    const shortage = reorderPoint - logical;
+    const rawSuggested = reorderPoint + p.safetyStock - logical;
+    let suggestedQuantity = rawSuggested;
+    let suggestedCases: number | null = null;
+    if (p.caseSize !== null && p.caseSize > 1) {
+      suggestedCases = Math.ceil(rawSuggested / p.caseSize);
+      suggestedQuantity = suggestedCases * p.caseSize;
+    }
+    suggestions.push({
+      productId: p.productId,
+      sku: p.sku,
+      name: p.name,
+      safetyStock: p.safetyStock,
+      totalQuantity: hand,
+      onHand: hand,
+      onOrder: ordered,
+      logicalStock: logical,
+      reorderPoint,
+      avgDailyConsumption: Math.round(avgDailyRaw * 100) / 100,
+      leadTimeDays,
+      shortage,
+      suggestedQuantity,
+      caseSize: p.caseSize,
+      suggestedCases,
+    });
+  }
   return c.json(suggestions);
 });
 
@@ -2604,11 +3127,52 @@ app.post('/api/v1/purchase-orders', async (c) => {
     .bind(dto.supplierId, ctx.store.id)
     .first<{ id: number }>();
   if (!supplier) throw notFound('Supplier not found');
+
+  // 明細の数量を基本単位へ解決する。inputUnit='case' のときは
+  // inputQuantity × 商品の入数 (case_size) に換算し、入力値も明細に保持する
+  const withCase = await hasColumn(c, 'products', 'case_size');
+  const withInputCols = await hasColumn(c, 'purchase_order_lines', 'input_quantity');
+  interface ResolvedLine {
+    productId: number;
+    quantity: number;
+    inputQuantity: number;
+    inputUnit: 'base' | 'case';
+    unitCost: number | null;
+  }
+  const resolvedLines: ResolvedLine[] = [];
   for (const line of dto.lines) {
-    const product = await c.env.DB.prepare('SELECT id FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL')
+    const product = await c.env.DB.prepare(
+      `SELECT id${withCase ? ', case_size' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+    )
       .bind(line.productId, ctx.store.id)
-      .first<{ id: number }>();
+      .first<{ id: number; case_size?: number | null }>();
     if (!product) throw notFound(`Product not found: ${line.productId}`);
+    if (line.inputUnit === 'case') {
+      if (line.inputQuantity === undefined) {
+        throw badRequest('inputQuantity is required when inputUnit is case');
+      }
+      const caseSize = product.case_size ?? null;
+      if (caseSize === null || caseSize < 1) {
+        throw badRequest(`Product ${line.productId} has no case size (case_size)`);
+      }
+      resolvedLines.push({
+        productId: line.productId,
+        quantity: line.inputQuantity * caseSize,
+        inputQuantity: line.inputQuantity,
+        inputUnit: 'case',
+        unitCost: line.unitCost ?? null,
+      });
+    } else {
+      const qty = line.inputQuantity ?? line.quantity;
+      if (qty === undefined) throw badRequest('quantity is required for each purchase order line');
+      resolvedLines.push({
+        productId: line.productId,
+        quantity: qty,
+        inputQuantity: qty,
+        inputUnit: 'base',
+        unitCost: line.unitCost ?? null,
+      });
+    }
   }
 
   const now = Date.now();
@@ -2619,13 +3183,20 @@ app.post('/api/v1/purchase-orders', async (c) => {
     .bind(dto.supplierId, dto.expectedDate ?? null, dto.note ?? null, user(c).userId, ctx.store.id, now)
     .run();
   const poId = Number(poRes.meta.last_row_id);
-  const stmts: D1PreparedStatement[] = dto.lines.map((line) =>
-    c.env.DB
-      .prepare(
-        `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost)
-         VALUES (?1, ?2, ?3, 0, ?4)`,
-      )
-      .bind(poId, line.productId, line.quantity, line.unitCost ?? null),
+  const stmts: D1PreparedStatement[] = resolvedLines.map((line) =>
+    withInputCols
+      ? c.env.DB
+          .prepare(
+            `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost, input_quantity, input_unit)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)`,
+          )
+          .bind(poId, line.productId, line.quantity, line.unitCost, line.inputQuantity, line.inputUnit)
+      : c.env.DB
+          .prepare(
+            `INSERT INTO purchase_order_lines (po_id, product_id, quantity, received_quantity, unit_cost)
+             VALUES (?1, ?2, ?3, 0, ?4)`,
+          )
+          .bind(poId, line.productId, line.quantity, line.unitCost),
   );
   // 作成した発注書の完全な形は lines 挿入後に組み立てるため、冪等レコードと監査は後段で入れる
   await c.env.DB.batch(stmts);
@@ -2677,7 +3248,7 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
     .bind(poId, ctx.store.id)
     .first<{ id: number; status: string }>();
   if (!po) throw notFound('Purchase order not found');
-  if (po.status === 'received' || po.status === 'cancelled') {
+  if (po.status === 'received' || po.status === 'cancelled' || po.status === 'closed') {
     throw new ApiError(409, 'PO_NOT_RECEIVABLE', `Purchase order is ${po.status} and cannot receive items`);
   }
 
@@ -2702,6 +3273,8 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
     }
   }
 
+  // 受入で生成された入庫伝票 (検品写真を付ける導線のためレスポンスに含める)
+  const receivedMovements: { lineId: number; movementId: number; documentId: string }[] = [];
   for (const line of dto.lines) {
     const target = lineById.get(line.lineId) as PurchaseOrderLineDbRow;
     let expiryDateMs: number | null = null;
@@ -2721,7 +3294,10 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
       }),
     );
     const prior = await findStoredIdempotentResponse(c, lineKey, lineHash, ctx.store.id);
-    if (!prior) {
+    let documentId: string | null = null;
+    if (prior) {
+      documentId = (prior.body as { documentId?: string }).documentId ?? null;
+    } else {
       const envelope = await coordinator(c).inbound({
         actorId: user(c).userId,
         endpoint: 'POST /api/v1/purchase-orders/:id/receive',
@@ -2735,12 +3311,21 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
         quantity: line.quantity,
       });
       if (envelope.status !== 201) return respond(c, envelope);
+      documentId = (envelope.body as { documentId?: string }).documentId ?? null;
       await c.env.DB.prepare(
         'UPDATE purchase_order_lines SET received_quantity = received_quantity + ?1 WHERE id = ?2',
       )
         .bind(line.quantity, line.lineId)
         .run();
       target.received_quantity += line.quantity;
+    }
+    if (documentId) {
+      const mv = await c.env.DB.prepare(
+        'SELECT id FROM stock_movements WHERE document_id = ?1 AND store_id = ?2',
+      )
+        .bind(documentId, ctx.store.id)
+        .first<{ id: number }>();
+      if (mv) receivedMovements.push({ lineId: line.lineId, movementId: mv.id, documentId });
     }
   }
 
@@ -2768,6 +3353,49 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
         ctx.store.id,
         now,
       ),
+  ]);
+  const poJson = await loadPurchaseOrder(c, poId, ctx.store.id);
+  return c.json({ ...poJson, receivedMovements });
+});
+
+/**
+ * 残クローズ: 未入荷の残数量を打ち切って発注を完了 (closed) にする。
+ * 分納で残が届かない場合の運用クローズ。監査ログに残数量を残す。
+ */
+app.post('/api/v1/purchase-orders/:id/close-residual', async (c) => {
+  await requirePermission(c, Permission.PURCHASES_WRITE);
+  await requireFeature(c, 'purchase_orders');
+  const ctx = await storeContext(c);
+  const poId = Number(c.req.param('id'));
+  const po = await c.env.DB.prepare('SELECT id, status FROM purchase_orders WHERE id = ?1 AND store_id = ?2')
+    .bind(poId, ctx.store.id)
+    .first<{ id: number; status: string }>();
+  if (!po) throw notFound('Purchase order not found');
+  if (po.status !== 'draft' && po.status !== 'ordered') {
+    throw new ApiError(409, 'PO_NOT_CLOSABLE', `Purchase order is ${po.status} and cannot be closed`);
+  }
+  const { results: lineRows } = await c.env.DB.prepare(
+    'SELECT * FROM purchase_order_lines WHERE po_id = ?1',
+  )
+    .bind(poId)
+    .all<PurchaseOrderLineDbRow>();
+  const remaining = lineRows
+    .map((l) => ({ lineId: l.id, productId: l.product_id, remaining: l.quantity - l.received_quantity }))
+    .filter((l) => l.remaining > 0);
+  if (remaining.length === 0) {
+    throw new ApiError(409, 'PO_NOT_CLOSABLE', 'Purchase order has no remaining quantity to close');
+  }
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare("UPDATE purchase_orders SET status = 'closed', updated_at = ?1 WHERE id = ?2")
+      .bind(now, poId),
+    c.env.DB
+      .prepare(
+        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
+         VALUES (?1, 'purchase_order.close_residual', 'purchase_order', ?2, ?3, ?4, ?5)`,
+      )
+      .bind(user(c).userId, String(poId), JSON.stringify({ remaining }), ctx.store.id, now),
   ]);
   return c.json(await loadPurchaseOrder(c, poId, ctx.store.id));
 });

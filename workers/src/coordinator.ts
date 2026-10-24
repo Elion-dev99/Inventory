@@ -81,6 +81,17 @@ interface StockRow {
   version: number;
 }
 
+export interface StartStocktakeInput {
+  actorId: number;
+  storeId: number;
+  /** 'full' (全件、既定) | 'locations' (部分棚卸し: locationIds の場所のみ) */
+  scopeType?: 'full' | 'locations';
+  /** scopeType='locations' の対象 location ID 群 */
+  locationIds?: number[];
+  /** 盲検: 実数入力の間、帳簿数を一切見せない */
+  blind?: boolean;
+}
+
 interface CandidateDbRow {
   stock_id: number;
   lot_id: number;
@@ -289,19 +300,71 @@ export class InventoryCoordinator extends DurableObject<Env> {
     }
   }
 
+  /** 列の有無をキャッシュする (migration 0014 未適用環境との後方互換用) */
+  private columnCache = new Map<string, boolean>();
+
+  private async hasColumn(table: string, column: string): Promise<boolean> {
+    const key = `${table}.${column}`;
+    const cached = this.columnCache.get(key);
+    if (cached !== undefined) return cached;
+    let found = false;
+    try {
+      const { results } = await this.env.DB.prepare(`PRAGMA table_info(${table})`).all<{
+        name: string;
+      }>();
+      found = results.some((r) => r.name === column);
+    } catch {
+      found = false;
+    }
+    this.columnCache.set(key, found);
+    return found;
+  }
+
   /**
-   * 棚卸し実施中は全面停止 (要件 Q3)。停止は店舗単位で、他店舗の棚卸しは
-   * この店舗の入出庫に影響しない。
+   * 実施中・承認待ちの棚卸しのロック範囲を返す。無ければ null。
+   * - full (および 0014 未適用環境): 店舗の全在庫が停止
+   * - locations (部分棚卸し): scope_json の location だけが停止
    * 差異承認待ち (pending_approval) の間も在庫は動かせないため同じく停止する。
    * 棚卸し自身の調整 (decideStocktake) はこのチェックを通らない専用パスで行う。
    */
-  private async assertNotLocked(storeId: number): Promise<void> {
-    const row = await this.env.DB.prepare(
-      "SELECT id FROM stocktakes WHERE store_id = ?1 AND status IN ('in_progress', 'pending_approval') LIMIT 1",
-    )
-      .bind(storeId)
-      .first<{ id: number }>();
-    if (row) throw stocktakeLocked();
+  private async activeStocktakeScope(
+    storeId: number,
+  ): Promise<{ scopeType: 'full' | 'locations'; locationIds: ReadonlySet<number> } | null> {
+    const scoped = await this.hasColumn('stocktakes', 'scope_type');
+    const row = scoped
+      ? await this.env.DB.prepare(
+          "SELECT scope_type, scope_json FROM stocktakes WHERE store_id = ?1 AND status IN ('in_progress', 'pending_approval') LIMIT 1",
+        )
+          .bind(storeId)
+          .first<{ scope_type: string; scope_json: string | null }>()
+      : await this.env.DB.prepare(
+          "SELECT 'full' AS scope_type, NULL AS scope_json FROM stocktakes WHERE store_id = ?1 AND status IN ('in_progress', 'pending_approval') LIMIT 1",
+        )
+          .bind(storeId)
+          .first<{ scope_type: string; scope_json: string | null }>();
+    if (!row) return null;
+    if (row.scope_type === 'locations') {
+      let ids: number[] = [];
+      try {
+        const parsed = JSON.parse(row.scope_json ?? '[]') as unknown;
+        if (Array.isArray(parsed)) ids = parsed.filter((v): v is number => typeof v === 'number');
+      } catch {
+        ids = [];
+      }
+      return { scopeType: 'locations', locationIds: new Set(ids) };
+    }
+    return { scopeType: 'full', locationIds: new Set() };
+  }
+
+  /**
+   * 指定 location 群への移動が棚卸しロックに触れるなら 423。
+   * full は店舗の全移動を止め、partial は対象 location を含む移動だけを止める。
+   */
+  private async assertLocationsUnlocked(storeId: number, locationIds: number[]): Promise<void> {
+    const active = await this.activeStocktakeScope(storeId);
+    if (!active) return;
+    if (active.scopeType === 'full') throw stocktakeLocked();
+    if (locationIds.some((id) => active.locationIds.has(id))) throw stocktakeLocked();
   }
 
   // ------------------------------------------------------------------ 入庫
@@ -319,7 +382,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async inboundInternal(input: InboundInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked(input.storeId);
+    await this.assertLocationsUnlocked(input.storeId, [input.locationId]);
 
     const db = this.env.DB;
     const now = Date.now();
@@ -475,7 +538,16 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async consumeInternal(input: ConsumeInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked(input.storeId);
+    // 全面棚卸しは消費も全停止。部分棚卸しは候補の絞り込みで対応する (下記)
+    const activeTake = await this.activeStocktakeScope(input.storeId);
+    if (activeTake?.scopeType === 'full') throw stocktakeLocked();
+    if (
+      activeTake?.scopeType === 'locations' &&
+      input.locationId !== undefined &&
+      activeTake.locationIds.has(input.locationId)
+    ) {
+      throw stocktakeLocked();
+    }
 
     const db = this.env.DB;
     const now = Date.now();
@@ -505,7 +577,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     }
     sql += ' ORDER BY s.id ASC';
     const { results } = await db.prepare(sql).bind(...params).all<CandidateDbRow>();
-    const candidates: CandidateRow[] = results.map((r) => ({
+    const allCandidates: CandidateRow[] = results.map((r) => ({
       stockId: r.stock_id,
       lotId: r.lot_id,
       expiryDate: r.expiry_date,
@@ -515,6 +587,22 @@ export class InventoryCoordinator extends DurableObject<Env> {
       locationId: r.location_id,
       warehouseId: r.warehouse_id,
     }));
+
+    // 部分棚卸し中は、対象 location の在庫を候補から外す (凍結)。
+    // 場所未指定の消費で「対象外だけでは不足し、対象分を使えば足りる」場合は
+    // 対象 location を含む移動として 423 を返す。
+    let candidates = allCandidates;
+    let needsLockedStock = false;
+    if (activeTake?.scopeType === 'locations' && input.locationId === undefined) {
+      candidates = allCandidates.filter((cd) => !activeTake.locationIds.has(cd.locationId));
+      const openShortfall = planConsumption(candidates, input.quantity, now, null).shortfall;
+      if (openShortfall > 0) {
+        needsLockedStock = planConsumption(allCandidates, input.quantity, now, null).shortfall === 0;
+      }
+    } else if (activeTake?.scopeType === 'locations' && input.locationId !== undefined) {
+      // locationId 指定時は上のチェックで対象外が確定している (候補はその場所のみ)
+      candidates = allCandidates;
+    }
 
     // マイナス在庫承認 (指定時のみ)。承認済み・未使用・対象が同じ商品であること
     let approval: NegativeApprovalInfo | null = null;
@@ -530,6 +618,12 @@ export class InventoryCoordinator extends DurableObject<Env> {
       if (row.approved_by === null || row.approved_by === row.requested_by) {
         throw new ApiError(422, 'SELF_APPROVAL_FORBIDDEN', 'Self-approval is not allowed');
       }
+      if (activeTake?.scopeType === 'locations') {
+        const lockedTarget = allCandidates.find((cd) => cd.stockId === row.stock_id);
+        if (lockedTarget && activeTake.locationIds.has(lockedTarget.locationId)) {
+          throw stocktakeLocked();
+        }
+      }
       const target = candidates.find((c) => c.stockId === row.stock_id);
       if (!target) {
         throw badRequest('Approval target stock is not part of this consumption');
@@ -539,6 +633,8 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
     const plan = planConsumption(candidates, input.quantity, now, approval);
     if (plan.shortfall > 0) {
+      // 部分棚卸しの対象在庫を使えば足りる場合は、在庫不足ではなくロックとして返す
+      if (needsLockedStock) throw stocktakeLocked();
       const available = input.quantity - plan.shortfall;
       throw insufficientStock(
         `Requested ${input.quantity}, available ${available} (expired lots excluded)`,
@@ -684,7 +780,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
   private async transferInternal(input: TransferInput): Promise<Envelope> {
     const stored = await this.findStoredResponse(input);
     if (stored) return stored;
-    await this.assertNotLocked(input.storeId);
+    await this.assertLocationsUnlocked(input.storeId, [input.fromLocationId, input.toLocationId]);
 
     const db = this.env.DB;
     const now = Date.now();
@@ -893,7 +989,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- 棚卸し
 
-  async startStocktake(input: { actorId: number; storeId: number }): Promise<Envelope> {
+  async startStocktake(input: StartStocktakeInput): Promise<Envelope> {
     return this.runExclusive(async () => {
       try {
         return await this.startStocktakeInternal(input);
@@ -903,10 +999,28 @@ export class InventoryCoordinator extends DurableObject<Env> {
     });
   }
 
-  private async startStocktakeInternal(input: { actorId: number; storeId: number }): Promise<Envelope> {
+  private async startStocktakeInternal(input: StartStocktakeInput): Promise<Envelope> {
     try {
       const db = this.env.DB;
       const now = Date.now();
+      const scopeType = input.scopeType ?? 'full';
+      const blind = input.blind === true;
+      const locationIds = [...new Set(input.locationIds ?? [])];
+      if (scopeType === 'locations') {
+        if (locationIds.length === 0) {
+          throw badRequest('locationIds is required for a partial (locations) stocktake');
+        }
+        // 対象 location はすべて対象店舗のものであること (他店舗の ID は存在しない扱い)
+        const { results: locRows } = await db
+          .prepare(
+            `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+              WHERE loc.deleted_at IS NULL AND w.store_id = ?1 AND loc.id IN (${locationIds.map(() => '?').join(',')})`,
+          )
+          .bind(input.storeId, ...locationIds)
+          .all<{ id: number }>();
+        if (locRows.length !== locationIds.length) throw badRequest('Location not found');
+      }
+
       // 実施中+承認待ちは店舗ごとに 1 件まで (DB の部分ユニークインデックスでも担保)
       const existing = await db
         .prepare(
@@ -916,25 +1030,54 @@ export class InventoryCoordinator extends DurableObject<Env> {
         .first<{ id: number }>();
       if (existing) throw stocktakeLocked('Another stocktake is already in progress or awaiting approval');
 
-      const inserted = await db
-        .prepare(
-          `INSERT INTO stocktakes (status, started_by, started_at, store_id, created_at, updated_at)
-           VALUES ('in_progress', ?1, ?2, ?3, ?2, ?2)`,
-        )
-        .bind(input.actorId, now, input.storeId)
-        .run();
+      const scoped = await this.hasColumn('stocktakes', 'scope_type');
+      const inserted = scoped
+        ? await db
+            .prepare(
+              `INSERT INTO stocktakes (status, started_by, started_at, store_id, scope_type, scope_json, blind, created_at, updated_at)
+               VALUES ('in_progress', ?1, ?2, ?3, ?4, ?5, ?6, ?2, ?2)`,
+            )
+            .bind(
+              input.actorId,
+              now,
+              input.storeId,
+              scopeType,
+              scopeType === 'locations' ? JSON.stringify(locationIds) : null,
+              blind ? 1 : 0,
+            )
+            .run()
+        : await db
+            .prepare(
+              `INSERT INTO stocktakes (status, started_by, started_at, store_id, created_at, updated_at)
+               VALUES ('in_progress', ?1, ?2, ?3, ?2, ?2)`,
+            )
+            .bind(input.actorId, now, input.storeId)
+            .run();
       const stocktakeId = Number(inserted.meta.last_row_id);
 
-      // その店舗の全 stocks の帳簿数をスナップショットする (Nest 版と同一)
-      const lineResult = await db
-        .prepare(
-          `INSERT INTO stocktake_lines (stocktake_id, stock_id, book_quantity)
-           SELECT ?1, id, quantity FROM stocks WHERE store_id = ?2`,
-        )
-        .bind(stocktakeId, input.storeId)
-        .run();
+      // 帳簿数のスナップショット: full は店舗の全 stocks、partial は対象 location の分のみ
+      const lineResult =
+        scopeType === 'locations'
+          ? await db
+              .prepare(
+                `INSERT INTO stocktake_lines (stocktake_id, stock_id, book_quantity)
+                 SELECT ?1, id, quantity FROM stocks
+                  WHERE store_id = ?2 AND location_id IN (${locationIds.map(() => '?').join(',')})`,
+              )
+              .bind(stocktakeId, input.storeId, ...locationIds)
+              .run()
+          : await db
+              .prepare(
+                `INSERT INTO stocktake_lines (stocktake_id, stock_id, book_quantity)
+                 SELECT ?1, id, quantity FROM stocks WHERE store_id = ?2`,
+              )
+              .bind(stocktakeId, input.storeId)
+              .run();
       await this.auditStmt(input.actorId, 'stocktake.start', 'stocktake', String(stocktakeId), {
         stocktakeId,
+        scopeType,
+        ...(scopeType === 'locations' ? { locationIds } : {}),
+        blind,
       }, input.storeId).run();
 
       const body = {
@@ -943,6 +1086,9 @@ export class InventoryCoordinator extends DurableObject<Env> {
         startedBy: input.actorId,
         startedAt: now,
         lineCount: lineResult.meta.changes,
+        scopeType,
+        ...(scopeType === 'locations' ? { locationIds } : {}),
+        blind,
       };
       this.broadcast({ type: 'stocktake.started', stocktakeId, storeId: input.storeId, at: now });
       return this.envelope(201, body);
@@ -1076,7 +1222,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
    * 棚卸しの差異承認/差し戻し (pending_approval のときのみ)。
    * 承認: 差異を調整伝票 (stock_movements type 'ADJUST', reason 'stocktake-adjustment')
    * として在庫へ反映し confirmed にする。棚卸しロック中でも棚卸し自身の調整は
-   * 通す必要があるため、このメソッドは assertNotLocked を経由しない専用パス。
+   * 通す必要があるため、このメソッドはロックチェックを経由しない専用パス。
    * 差し戻し: 実数は保持したまま in_progress に戻す。
    */
   async decideStocktake(input: {

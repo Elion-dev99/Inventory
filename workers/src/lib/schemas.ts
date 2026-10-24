@@ -19,6 +19,10 @@ export const createProductSchema = z.object({
   expiryAlertDays: z.number().int().min(0).optional(),
   /** 単価 (円)。在庫評価額の算出に使う */
   unitCost: z.number().int().min(0).optional(),
+  /** 入数: 1 ケースあたりの基本単位数量 (0014)。null = ケース単位なし */
+  caseSize: z.number().int().min(1).nullable().optional(),
+  /** リードタイム (日)。発注点の計算に使う (0014) */
+  leadTimeDays: z.number().int().min(0).nullable().optional(),
 });
 
 export const createWarehouseSchema = z.object({
@@ -81,6 +85,8 @@ export const updateProductSchema = z.object({
   requiresExpiry: z.boolean().optional(),
   expiryAlertDays: z.number().int().min(0).nullable().optional(),
   unitCost: z.number().int().min(0).nullable().optional(),
+  caseSize: z.number().int().min(1).nullable().optional(),
+  leadTimeDays: z.number().int().min(0).nullable().optional(),
 });
 
 /** 仕入先マスタ */
@@ -90,6 +96,8 @@ export const createSupplierSchema = z.object({
   email: z.string().optional(),
   phone: z.string().optional(),
   note: z.string().optional(),
+  /** 既定リードタイム (日)。商品個別の指定が無い発注点計算で使う (0014) */
+  leadTimeDays: z.number().int().min(0).nullable().optional(),
 });
 
 export const updateSupplierSchema = z.object({
@@ -98,6 +106,7 @@ export const updateSupplierSchema = z.object({
   email: z.string().nullable().optional(),
   phone: z.string().nullable().optional(),
   note: z.string().nullable().optional(),
+  leadTimeDays: z.number().int().min(0).nullable().optional(),
 });
 
 /** 発注書の作成 (作成時は下書き draft。発注確定は status を ordered へ進める運用) */
@@ -109,7 +118,11 @@ export const createPurchaseOrderSchema = z.object({
     .array(
       z.object({
         productId: idValue,
-        quantity: z.number().int().min(1),
+        /** 基本単位での発注数量。inputUnit が 'case' のときは省略可 (サーバーで換算する) */
+        quantity: z.number().int().min(1).optional(),
+        /** 入力時の数量と単位 (0014)。inputUnit: 'case' は inputQuantity × 商品の入数 */
+        inputQuantity: z.number().int().min(1).optional(),
+        inputUnit: z.enum(['base', 'case']).optional(),
         unitCost: z.number().int().min(0).optional(),
       }),
     )
@@ -150,6 +163,13 @@ export const updateLotSchema = z.object({
 /** 棚卸し lines への実数入力 */
 export const countedQuantitySchema = z.object({
   countedQuantity: z.number().int().min(0),
+});
+
+/** 棚卸しの開始 (0014: 部分棚卸しと盲検)。ボディなしは全件・非盲検として扱う */
+export const createStocktakeSchema = z.object({
+  scopeType: z.enum(['full', 'locations']).optional(),
+  locationIds: z.array(idValue).optional(),
+  blind: z.boolean().optional(),
 });
 
 /** 棚卸しの差異承認/差し戻し */

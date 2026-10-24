@@ -21,4 +21,10 @@ export interface Env {
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY_JWK?: string;
   VAPID_SUBJECT?: string;
+  /**
+   * 商品画像・検品写真の保存先 R2 バケット (任意)。
+   * 未設定の環境では写真系 API は 503 PHOTOS_NOT_CONFIGURED を返し、
+   * 画像以外の機能は通常どおり動く。
+   */
+  IMAGES?: R2Bucket;
 }

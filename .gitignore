@@ -5,3 +5,4 @@ dist/
 coverage/
 .prisma/
 .wrangler/
+.vapid-private.json

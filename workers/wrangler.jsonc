@@ -19,6 +19,14 @@
       "migrations_dir": "migrations"
     }
   ],
+  // 商品画像・検品写真の保存先。バケット inventory-images はデプロイ時に作成する。
+  // ローカル (wrangler dev / テスト) では Miniflare が同名のローカルバケットを提供する
+  "r2_buckets": [
+    {
+      "binding": "IMAGES",
+      "bucket_name": "inventory-images"
+    }
+  ],
   "durable_objects": {
     "bindings": [
       {
