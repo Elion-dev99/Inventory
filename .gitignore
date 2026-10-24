@@ -6,3 +6,4 @@ coverage/
 .prisma/
 .wrangler/
 .vapid-private.json
+.vapid-public.txt
