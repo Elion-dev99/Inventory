@@ -132,7 +132,19 @@ import {
   FEATURE_KEYS,
   getFeatures,
   isFeatureEnabled,
+  type FeatureMap,
 } from './lib/features';
+import {
+  exceedsLimit,
+  organizationUsage,
+  planAllowsFeature,
+  planAllowsModule,
+  planFeatureError,
+  planLimitError,
+  resolveStorePlan,
+  singleStoreUsage,
+  type ModuleKey,
+} from './lib/plans';
 import { parseCsv, toCsv } from './lib/csv';
 import {
   recordMaintenanceRejections,
@@ -1242,11 +1254,72 @@ function canPerformInStore(
 /**
  * 機能フラグのサーバー側強制。管理者がオフにした機能は、権限があっても
  * 403 FEATURE_DISABLED で止める (画面の出し分けだけに頼らない)。
+ * プラン制 (0018) との合流: 実効値は「店舗フラグ ON かつ プラン許可」。
+ * フラグがオンでもプランが許可しなければ PLAN_FEATURE_NOT_AVAILABLE。
+ * 組織に所属しない店舗 (レガシー) と全体管理者の自店舗 (DGOSK = owner)
+ * はプラン側では制限されない。
  */
 async function requireFeature(c: AppContext, key: string): Promise<void> {
   const ctx = await storeContext(c);
   if (!(await isFeatureEnabled(c.env.DB, key, ctx.store.id))) {
     throw new ApiError(403, 'FEATURE_DISABLED', `Feature is disabled: ${key}`);
+  }
+  const plan = await resolveStorePlan(c.env.DB, ctx.store.id);
+  if (!planAllowsFeature(plan.def, key)) {
+    throw planFeatureError(plan.def.key, key);
+  }
+}
+
+/**
+ * プランのモジュール (引当・ピッキング・セット品・返品廃棄・発注テンプレート・
+ * 一括編集) のサーバー側強制。プランに無いモジュールは
+ * 403 PLAN_FEATURE_NOT_AVAILABLE。
+ */
+async function requireModule(c: AppContext, moduleKey: ModuleKey): Promise<void> {
+  const ctx = await storeContext(c);
+  const plan = await resolveStorePlan(c.env.DB, ctx.store.id);
+  if (!planAllowsModule(plan.def, moduleKey)) {
+    throw planFeatureError(plan.def.key, moduleKey);
+  }
+}
+
+/** 店舗フラグにプラン許可を重ねた実効フラグ (/me・/features の表示用) */
+async function effectiveFeatures(c: AppContext, storeId: number): Promise<FeatureMap> {
+  const features = await getFeatures(c.env.DB, storeId);
+  const plan = await resolveStorePlan(c.env.DB, storeId);
+  for (const key of Object.keys(features)) {
+    if (features[key] && !planAllowsFeature(plan.def, key)) features[key] = false;
+  }
+  return features;
+}
+
+/** /me に載せるプラン要約。組織なし店舗は owner 相当 (organization は null) */
+async function planSummaryForStore(c: AppContext, storeId: number): Promise<Record<string, unknown>> {
+  const plan = await resolveStorePlan(c.env.DB, storeId);
+  const usage = plan.organization
+    ? await organizationUsage(c.env.DB, plan.organization.id)
+    : await singleStoreUsage(c.env.DB, storeId);
+  return {
+    key: plan.def.key,
+    name: plan.def.name,
+    price: plan.def.price,
+    organization: plan.organization ? { id: plan.organization.id, name: plan.organization.name } : null,
+    limits: plan.def.limits,
+    usage,
+  };
+}
+
+/**
+ * SKU 上限チェック (プラン)。組織に所属しない店舗は制限なし。
+ * adding は今回増える商品数 (CSV インポートは投入見込み数)。
+ */
+async function assertSkuLimit(c: AppContext, storeId: number, adding: number): Promise<void> {
+  if (adding <= 0) return;
+  const plan = await resolveStorePlan(c.env.DB, storeId);
+  if (!plan.organization || plan.def.limits.skus === null) return;
+  const usage = await organizationUsage(c.env.DB, plan.organization.id);
+  if (exceedsLimit(plan.def.limits.skus, usage.skus, adding)) {
+    throw planLimitError(plan.def.key, 'skus', plan.def.limits.skus, usage.skus);
   }
 }
 
@@ -1471,7 +1544,8 @@ app.get('/api/v1/me', async (c) => {
       : ctx
         ? [...permissionsOf(ctx.assignments, rp)].sort()
         : [],
-    features: ctx ? await getFeatures(c.env.DB, ctx.store.id) : defaultFeatures(),
+    features: ctx ? await effectiveFeatures(c, ctx.store.id) : defaultFeatures(),
+    plan: ctx ? await planSummaryForStore(c, ctx.store.id) : null,
     stores,
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
@@ -1622,10 +1696,10 @@ app.get('/api/v1/setup/template/locations.csv', async (c) => {
 
 // ------------------------------------------------------------ 機能フラグ
 
-/** 解決済みの機能フラグ (現在店舗)。/app の出し分けと管理画面の初期表示用 */
+/** 解決済みの機能フラグ (現在店舗、プラン許可を重ねた実効値)。/app の出し分け用 */
 app.get('/api/v1/features', async (c) => {
   const ctx = await storeContext(c);
-  return c.json({ features: await getFeatures(c.env.DB, ctx.store.id) });
+  return c.json({ features: await effectiveFeatures(c, ctx.store.id) });
 });
 
 app.get('/api/v1/admin/features', async (c) => {
@@ -2313,6 +2387,8 @@ async function createProduct(c: AppContext): Promise<Response> {
   await requirePermission(c, Permission.MASTER_WRITE);
   const ctx = await storeContext(c);
   const dto = parseWith(createProductSchema, await parseJson(c));
+  // プランの SKU 上限 (0018)。上限到達時は 403 PLAN_LIMIT_REACHED
+  await assertSkuLimit(c, ctx.store.id, 1);
   const now = Date.now();
   // 任意列 (unit_cost は 0007、case_size / lead_time_days は 0014) は
   // 列がある環境でのみ INSERT に含める (未適用環境への後方互換)
@@ -3016,6 +3092,24 @@ async function importProducts(c: AppContext): Promise<Response> {
     }>();
   const knownSkus = new Set(existingRows.map((r) => r.sku));
 
+  // プランの SKU 上限 (0018): 投入後の合計が上限を超える場合は投入前に止める
+  {
+    const seenNew = new Set<string>();
+    let adding = 0;
+    for (let i = headerIdx + 1; i < records.length; i++) {
+      const record = records[i] as string[];
+      if (record.every((cell) => cell.trim().length === 0)) continue;
+      const sku = (record[col.sku] ?? '').trim();
+      const name = (record[col.name] ?? '').trim();
+      const unit = (record[col.unit] ?? '').trim();
+      if (!sku || !name || !unit) continue;
+      if (knownSkus.has(sku) || seenNew.has(sku)) continue;
+      seenNew.add(sku);
+      adding += 1;
+    }
+    await assertSkuLimit(c, ctx.store.id, adding);
+  }
+
   const now = Date.now();
   let total = 0;
   let created = 0;
@@ -3374,6 +3468,7 @@ app.post('/api/v1/movements/transfer', async (c) => {
 
 /** 返品 (社内から戻り = 在庫+)。理由コードとメモが必須。台帳は type='RETURN' */
 app.post('/api/v1/movements/return', async (c) => {
+  await requireModule(c, 'returns_disposals');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   const raw = (await parseJson(c)) as Record<string, unknown>;
@@ -3407,6 +3502,7 @@ app.post('/api/v1/movements/return', async (c) => {
 
 /** 廃棄 (在庫-)。通常の消費と同じ在庫検証で、マイナス在庫フローには乗せない */
 app.post('/api/v1/movements/disposal', async (c) => {
+  await requireModule(c, 'returns_disposals');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   const raw = (await parseJson(c)) as Record<string, unknown>;
@@ -3439,6 +3535,7 @@ app.post('/api/v1/movements/disposal', async (c) => {
 
 /** セット品の消費 (構成品へ FEFO 展開し、同一 group_id で記録する) */
 app.post('/api/v1/movements/bundle-consumption', async (c) => {
+  await requireModule(c, 'bundles');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   const raw = (await parseJson(c)) as Record<string, unknown>;
@@ -3475,6 +3572,7 @@ app.post('/api/v1/movements/bundle-consumption', async (c) => {
 
 /** セット品の一覧 (組立可能数つき)。在庫表示と消費画面で使う */
 app.get('/api/v1/bundles', async (c) => {
+  await requireModule(c, 'bundles');
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'product_bundles')) || !(await hasColumn(c, 'products', 'is_bundle'))) {
@@ -3503,6 +3601,7 @@ app.get('/api/v1/bundles', async (c) => {
 
 /** セット品 1 件の構成品と組立可能数 (商品詳細) */
 app.get('/api/v1/products/:id/bundle', async (c) => {
+  await requireModule(c, 'bundles');
   await requirePermission(c, Permission.MASTER_READ);
   const ctx = await storeContext(c);
   const id = Number(c.req.param('id'));
@@ -3533,6 +3632,7 @@ app.get('/api/v1/products/:id/bundle', async (c) => {
  * 構成が 1 件以上あれば is_bundle を自動で有効にする。
  */
 app.put('/api/v1/products/:id/bundle', async (c) => {
+  await requireModule(c, 'bundles');
   await requirePermission(c, Permission.MASTER_WRITE);
   const ctx = await storeContext(c);
   const id = Number(c.req.param('id'));
@@ -3602,6 +3702,7 @@ app.put('/api/v1/products/:id/bundle', async (c) => {
  * 有効/無効 (論理削除) を複数商品へ一括 PUT する。監査は 1 件に集約。
  */
 app.put('/api/v1/admin/products/bulk', async (c) => {
+  await requireModule(c, 'bulk_edit');
   await requirePermission(c, Permission.MASTER_WRITE);
   const ctx = await storeContext(c);
   const dto = parseWith(bulkProductsSchema, await parseJson(c));
@@ -3656,6 +3757,7 @@ async function loadReservationInStore(
 
 /** 引当の作成 (movements.consume)。フリー在庫を超える引当は 422 */
 app.post('/api/v1/reservations', async (c) => {
+  await requireModule(c, 'reservations');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'reservations'))) {
@@ -3714,6 +3816,7 @@ app.post('/api/v1/reservations', async (c) => {
 
 /** 有効な引当の一覧 (期限切れは自動で除外する) */
 app.get('/api/v1/reservations', async (c) => {
+  await requireModule(c, 'reservations');
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'reservations'))) return c.json([]);
@@ -3724,6 +3827,7 @@ app.get('/api/v1/reservations', async (c) => {
 
 /** 引当の解放 */
 app.post('/api/v1/reservations/:id/release', async (c) => {
+  await requireModule(c, 'reservations');
   await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'reservations'))) throw notFound('Reservation not found');
@@ -3754,6 +3858,7 @@ app.post('/api/v1/reservations/:id/release', async (c) => {
 
 /** 引当を消費に変換する: 実消費を Coordinator 経由で実行し、引当を consumed にする */
 app.post('/api/v1/reservations/:id/consume', async (c) => {
+  await requireModule(c, 'reservations');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await hasTable(c, 'reservations'))) throw notFound('Reservation not found');
@@ -3877,6 +3982,7 @@ function requirePickTables(c: AppContext): Promise<boolean> {
 
 /** ピッキングリストの作成 (予定) */
 app.post('/api/v1/pick-lists', async (c) => {
+  await requireModule(c, 'picking');
   await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) {
@@ -3922,6 +4028,7 @@ app.post('/api/v1/pick-lists', async (c) => {
 
 /** ピッキングリストの一覧と詳細 */
 app.get('/api/v1/pick-lists', async (c) => {
+  await requireModule(c, 'picking');
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) return c.json([]);
@@ -3939,6 +4046,7 @@ app.get('/api/v1/pick-lists', async (c) => {
 });
 
 app.get('/api/v1/pick-lists/:id', async (c) => {
+  await requireModule(c, 'picking');
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) throw notFound('Pick list not found');
@@ -3954,6 +4062,7 @@ app.get('/api/v1/pick-lists/:id', async (c) => {
 
 /** 明細の数量修正 (検品の手入力・計画の調整)。open の間だけ変更できる */
 app.put('/api/v1/pick-lists/:id/items/:itemId', async (c) => {
+  await requireModule(c, 'picking');
   await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) throw notFound('Pick list not found');
@@ -3985,6 +4094,7 @@ app.put('/api/v1/pick-lists/:id/items/:itemId', async (c) => {
 
 /** 確定: 検品済み数量を Coordinator 経由で一括・原子的に実行する */
 app.post('/api/v1/pick-lists/:id/confirm', async (c) => {
+  await requireModule(c, 'picking');
   const rp = await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) throw notFound('Pick list not found');
@@ -4040,6 +4150,7 @@ app.post('/api/v1/pick-lists/:id/confirm', async (c) => {
 
 /** ピッキングリストの取消 */
 app.post('/api/v1/pick-lists/:id/cancel', async (c) => {
+  await requireModule(c, 'picking');
   await requirePermission(c, Permission.MOVEMENTS_CONSUME);
   const ctx = await storeContext(c);
   if (!(await requirePickTables(c))) throw notFound('Pick list not found');
@@ -4132,6 +4243,7 @@ async function loadPoTemplate(c: AppContext, id: number, storeId: number): Promi
 }
 
 app.get('/api/v1/purchase-order-templates', async (c) => {
+  await requireModule(c, 'po_templates');
   await requirePermission(c, Permission.PURCHASES_READ);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
@@ -4150,6 +4262,7 @@ app.get('/api/v1/purchase-order-templates', async (c) => {
 });
 
 app.post('/api/v1/purchase-order-templates', async (c) => {
+  await requireModule(c, 'po_templates');
   await requirePermission(c, Permission.PURCHASES_WRITE);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
@@ -4179,6 +4292,7 @@ app.post('/api/v1/purchase-order-templates', async (c) => {
 });
 
 app.delete('/api/v1/purchase-order-templates/:id', async (c) => {
+  await requireModule(c, 'po_templates');
   await requirePermission(c, Permission.PURCHASES_WRITE);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
@@ -4207,6 +4321,7 @@ app.delete('/api/v1/purchase-order-templates/:id', async (c) => {
 
 /** テンプレートから下書き PO を生成する (source='template') */
 app.post('/api/v1/purchase-order-templates/:id/generate', async (c) => {
+  await requireModule(c, 'po_templates');
   await requirePermission(c, Permission.PURCHASES_WRITE);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
@@ -4242,6 +4357,7 @@ app.post('/api/v1/purchase-order-templates/:id/generate', async (c) => {
 
 /** 定期発注スケジュールの設定 (テンプレートに 1 つ、間隔日数と有効/無効) */
 app.put('/api/v1/purchase-order-templates/:id/schedule', async (c) => {
+  await requireModule(c, 'po_templates');
   await requirePermission(c, Permission.PURCHASES_WRITE);
   await requireFeature(c, 'purchase_orders');
   const ctx = await storeContext(c);
@@ -5491,6 +5607,25 @@ app.put('/api/v1/admin/users/:userId/roles', async (c) => {
         .first<{ id: number }>();
       if (!wh) {
         throw new ApiError(422, 'WAREHOUSE_NOT_FOUND', `Warehouse not found: ${a.warehouseId}`);
+      }
+    }
+  }
+  // プランのユーザー上限 (0018): 組織の全店舗で distinct に数える。
+  // 既に組織に所属するユーザーのロール変更・追加は増員として数えない
+  if (assignments.length > 0) {
+    const plan = await resolveStorePlan(c.env.DB, ctx.store.id);
+    if (plan.organization && plan.def.limits.users !== null) {
+      const member = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM user_roles
+          WHERE user_id = ?1 AND store_id IN (SELECT id FROM stores WHERE organization_id = ?2)`,
+      )
+        .bind(userId, plan.organization.id)
+        .first<{ n: number }>();
+      if ((member?.n ?? 0) === 0) {
+        const usage = await organizationUsage(c.env.DB, plan.organization.id);
+        if (exceedsLimit(plan.def.limits.users, usage.users, 1)) {
+          throw planLimitError(plan.def.key, 'users', plan.def.limits.users, usage.users);
+        }
       }
     }
   }

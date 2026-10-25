@@ -328,6 +328,8 @@ function errMsg(e) {
   if (e && e.status === 423) return '棚卸し実施中のため、この操作は停止しています (423)。棚卸しが終了するまでお待ちください。';
   if (e && e.code === 'STORE_SUSPENDED') return 'この店舗は現在停止中です。';
   if (e && e.code === 'STORE_NOT_SELECTED') return '店舗が選択されていません。画面を再読み込みして、店舗を選んでください。';
+  if (e && e.code === 'PLAN_LIMIT_REACHED') return 'プランの上限に達しています';
+  if (e && e.code === 'PLAN_FEATURE_NOT_AVAILABLE') return '現在のプランでは使えません';
   if (e && e.code === 'STEP_UP_REQUIRED') return '再認証が必要です。';
   if (e && e.code === 'STEP_UP_CANCELLED') return '再認証がキャンセルされました。';
   return e && e.message ? e.message : String(e);
@@ -965,6 +967,23 @@ function loadMore() {
     h += '<a class="group-row" href="/admin/permissions"><span class="row-icon" style="background:#30b0c7">' + icon('shield', 17) + '</span><span class="row-label">権限管理</span><span class="chev">' + icon('chevR', 18) + '</span></a>';
   }
   h += '</div>';
+  if (state.me && state.me.plan) {
+    var pl = state.me.plan;
+    function planCount(used, limit) {
+      return Number(used || 0).toLocaleString('ja-JP') + ' / ' + (limit === null || limit === undefined ? '無制限' : Number(limit).toLocaleString('ja-JP'));
+    }
+    h += '<h3>プラン</h3><div class="group">';
+    h += '<div class="group-row static"><span class="row-label">プラン: ' + esc(pl.name) + '</span></div>';
+    if (pl.organization) {
+      h += '<div class="group-row static"><span class="row-label">組織: ' + esc(pl.organization.name) + '</span></div>';
+    }
+    if (pl.usage && pl.limits) {
+      h += '<div class="group-row static"><span class="row-label">商品数: ' + planCount(pl.usage.skus, pl.limits.skus) + '</span></div>';
+      h += '<div class="group-row static"><span class="row-label">ユーザー数: ' + planCount(pl.usage.users, pl.limits.users) + '</span></div>';
+      h += '<div class="group-row static"><span class="row-label">店舗数: ' + planCount(pl.usage.stores, pl.limits.stores) + '</span></div>';
+    }
+    h += '</div>';
+  }
   h += '<h3>アカウント</h3><div class="group">';
   if (state.me) {
     h += '<div class="group-row static"><span class="row-label">' + esc(state.me.email) + (state.me.displayName ? ' (' + esc(state.me.displayName) + ')' : '') + '</span></div>';
@@ -4618,9 +4637,14 @@ function getPasskeyAssertion(opts) {
 /* ログインページの「Face IDでログイン」 */
 function passkeyLogin() {
   var msg = el('passkeyLoginMsg');
-  function fail(text) { if (msg) { msg.textContent = text; msg.style.display = ''; } }
+  var hint = el('passkeyLoginHint');
+  function fail(text) {
+    if (msg) { msg.textContent = text; msg.style.display = ''; }
+    if (hint) hint.style.display = '';
+  }
   if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
   if (msg) msg.style.display = 'none';
+  if (hint) hint.style.display = 'none';
   apiOnce('/api/v1/auth/passkey/login/options', { method: 'POST', body: {} }).then(function (opts) {
     return getPasskeyAssertion(opts);
   }).then(function (cred) {
@@ -4630,7 +4654,7 @@ function passkeyLogin() {
     if (res) location.reload();
   }).catch(function (e) {
     if (e && e.name === 'NotAllowedError') { fail('キャンセルされました'); return; }
-    if (e && e.status === 503 && e.code === 'MAINTENANCE') { fail(e.message); return; }
+    if (e && e.status === 503 && e.code === 'MAINTENANCE') { if (msg) { msg.textContent = e.message; msg.style.display = ''; } return; }
     fail('ログインできませんでした');
   });
 }

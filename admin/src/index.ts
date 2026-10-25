@@ -81,6 +81,17 @@ import {
   restoreBackup,
   type BackupRow,
 } from '../../workers/src/lib/backup';
+import {
+  exceedsLimit,
+  getOrganization,
+  hasOrganizationsTable,
+  isPlanKey,
+  organizationUsage,
+  PLAN_CATALOG,
+  planDef,
+  planLimitError,
+  resolveStorePlan,
+} from '../../workers/src/lib/plans';
 import { CONSOLE_HTML } from './console';
 
 /**
@@ -456,6 +467,9 @@ interface StoreDbRow {
   status: string;
   created_at: number;
   updated_at: number;
+  organization_id?: number | null;
+  orgName?: string | null;
+  planKey?: string | null;
 }
 
 function storeJson(r: StoreDbRow): Record<string, unknown> {
@@ -466,13 +480,25 @@ function storeJson(r: StoreDbRow): Record<string, unknown> {
     status: r.status,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    organizationId: r.organization_id ?? null,
+    organization:
+      r.organization_id !== null && r.organization_id !== undefined
+        ? { id: r.organization_id, name: r.orgName ?? null, planKey: r.planKey ?? null }
+        : null,
   };
 }
 
 async function storeRow(c: AppContext, id: number): Promise<StoreDbRow> {
-  const row = await c.env.DB.prepare('SELECT * FROM stores WHERE id = ?1')
-    .bind(id)
-    .first<StoreDbRow>();
+  const row =
+    (await hasOrganizationsTable(c.env.DB))
+      ? await c.env.DB.prepare(
+          `SELECT s.*, o.name AS orgName, o.plan_key AS planKey
+             FROM stores s LEFT JOIN organizations o ON o.id = s.organization_id
+            WHERE s.id = ?1`,
+        )
+          .bind(id)
+          .first<StoreDbRow>()
+      : await c.env.DB.prepare('SELECT * FROM stores WHERE id = ?1').bind(id).first<StoreDbRow>();
   if (!row) throw notFound('Store not found');
   return row;
 }
@@ -499,32 +525,200 @@ async function platformAudit(
 
 app.get('/api/platform/stores', async (c) => {
   requirePlatformAdmin(c);
-  const { results } = await c.env.DB.prepare('SELECT * FROM stores ORDER BY id ASC').all<StoreDbRow>();
+  const sql = (await hasOrganizationsTable(c.env.DB))
+    ? `SELECT s.*, o.name AS orgName, o.plan_key AS planKey
+         FROM stores s LEFT JOIN organizations o ON o.id = s.organization_id
+        ORDER BY s.id ASC`
+    : 'SELECT * FROM stores ORDER BY id ASC';
+  const { results } = await c.env.DB.prepare(sql).all<StoreDbRow>();
   return c.json(results.map(storeJson));
 });
 
 const createStoreBodySchema = z.object({
   code: z.string().min(1).max(50),
   name: z.string().min(1).max(100),
+  organizationId: z.number().int().positive().optional(),
 });
 
+/**
+ * 店舗の作成。0018 適用後は組織への所属が必須で、組織のプランの店舗数
+ * 上限を超える作成は 403 PLAN_LIMIT_REACHED でブロックする (先にプランを
+ * 上げるのが正規手順)。0018 未適用の環境では従来どおり組織なしで作る。
+ */
 app.post('/api/platform/stores', async (c) => {
   requirePlatformAdmin(c);
   const dto = parseWith(createStoreBodySchema, await parseJson(c));
+  const hasOrgs = await hasOrganizationsTable(c.env.DB);
+  let organizationId: number | null = null;
+  if (hasOrgs) {
+    if (dto.organizationId === undefined) {
+      throw new ApiError(400, 'ORGANIZATION_REQUIRED', 'organizationId is required');
+    }
+    const org = await getOrganization(c.env.DB, dto.organizationId);
+    if (!org) throw new ApiError(422, 'ORGANIZATION_NOT_FOUND', `Organization not found: ${dto.organizationId}`);
+    const def = planDef(org.planKey);
+    if (def.limits.stores !== null) {
+      const usage = await organizationUsage(c.env.DB, org.id);
+      if (exceedsLimit(def.limits.stores, usage.stores, 1)) {
+        throw planLimitError(def.key, 'stores', def.limits.stores, usage.stores);
+      }
+    }
+    organizationId = org.id;
+  }
   const now = Date.now();
   let res: D1Result;
   try {
-    res = await c.env.DB.prepare(
-      `INSERT INTO stores (code, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)`,
-    )
-      .bind(dto.code, dto.name, now)
-      .run();
+    res = hasOrgs
+      ? await c.env.DB.prepare(
+          `INSERT INTO stores (code, name, status, organization_id, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?4, ?4)`,
+        )
+          .bind(dto.code, dto.name, organizationId, now)
+          .run()
+      : await c.env.DB.prepare(
+          `INSERT INTO stores (code, name, status, created_at, updated_at) VALUES (?1, ?2, 'active', ?3, ?3)`,
+        )
+          .bind(dto.code, dto.name, now)
+          .run();
   } catch {
     throw new ApiError(409, 'DUPLICATE', 'Store with this code already exists');
   }
   const id = Number(res.meta.last_row_id);
-  await platformAudit(c, 'platform.store.create', 'store', String(id), { code: dto.code, name: dto.name }, id);
+  await platformAudit(
+    c,
+    'platform.store.create',
+    'store',
+    String(id),
+    { code: dto.code, name: dto.name, organizationId },
+    id,
+  );
   return c.json(storeJson(await storeRow(c, id)), 201);
+});
+
+// ------------------------------------------------------------ 組織・プラン
+
+interface OrganizationDbRow {
+  id: number;
+  name: string;
+  plan_key: string;
+  created_at: number;
+  updated_at: number;
+}
+
+async function organizationJson(c: AppContext, r: OrganizationDbRow): Promise<Record<string, unknown>> {
+  const def = planDef(r.plan_key);
+  return {
+    id: r.id,
+    name: r.name,
+    planKey: r.plan_key,
+    plan: { key: def.key, name: def.name, price: def.price, limits: def.limits },
+    usage: await organizationUsage(c.env.DB, r.id),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+async function organizationRow(c: AppContext, id: number): Promise<OrganizationDbRow> {
+  const row = await c.env.DB.prepare('SELECT * FROM organizations WHERE id = ?1')
+    .bind(id)
+    .first<OrganizationDbRow>();
+  if (!row) throw notFound('Organization not found');
+  return row;
+}
+
+/** 組織一覧 (利用状況つき) とプランカタログ */
+app.get('/api/platform/organizations', async (c) => {
+  requirePlatformAdmin(c);
+  if (!(await hasOrganizationsTable(c.env.DB))) {
+    return c.json({ plans: PLAN_CATALOG, organizations: [] });
+  }
+  const { results } = await c.env.DB.prepare('SELECT * FROM organizations ORDER BY id ASC').all<OrganizationDbRow>();
+  const organizations: Record<string, unknown>[] = [];
+  for (const r of results) organizations.push(await organizationJson(c, r));
+  return c.json({
+    plans: PLAN_CATALOG.map((p) => ({
+      key: p.key,
+      name: p.name,
+      price: p.price,
+      limits: p.limits,
+      features: p.features,
+      modules: p.modules,
+    })),
+    organizations,
+  });
+});
+
+const createOrganizationBodySchema = z.object({
+  name: z.string().min(1).max(100),
+  planKey: z.string().min(1).max(50),
+});
+
+app.post('/api/platform/organizations', async (c) => {
+  requirePlatformAdmin(c);
+  if (!(await hasOrganizationsTable(c.env.DB))) {
+    throw new ApiError(503, 'ORGANIZATIONS_NOT_CONFIGURED', 'Organizations are not configured (migration 0018)');
+  }
+  const dto = parseWith(createOrganizationBodySchema, await parseJson(c));
+  if (!isPlanKey(dto.planKey)) {
+    throw new ApiError(422, 'UNKNOWN_PLAN', `Unknown plan: ${dto.planKey}`);
+  }
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'INSERT INTO organizations (name, plan_key, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)',
+  )
+    .bind(dto.name, dto.planKey, now)
+    .run();
+  const id = Number(res.meta.last_row_id);
+  await platformAudit(c, 'platform.organization.create', 'organization', String(id), { name: dto.name, planKey: dto.planKey }, null);
+  return c.json(await organizationJson(c, await organizationRow(c, id)), 201);
+});
+
+const renameOrganizationBodySchema = z.object({
+  name: z.string().min(1).max(100),
+});
+
+app.put('/api/platform/organizations/:id', async (c) => {
+  requirePlatformAdmin(c);
+  if (!(await hasOrganizationsTable(c.env.DB))) {
+    throw new ApiError(503, 'ORGANIZATIONS_NOT_CONFIGURED', 'Organizations are not configured (migration 0018)');
+  }
+  const id = Number(c.req.param('id'));
+  const row = await organizationRow(c, id);
+  const dto = parseWith(renameOrganizationBodySchema, await parseJson(c));
+  await c.env.DB.prepare('UPDATE organizations SET name = ?1, updated_at = ?2 WHERE id = ?3')
+    .bind(dto.name, Date.now(), id)
+    .run();
+  await platformAudit(c, 'platform.organization.update', 'organization', String(id), { from: row.name, to: dto.name }, null);
+  return c.json(await organizationJson(c, await organizationRow(c, id)));
+});
+
+const changePlanBodySchema = z.object({
+  planKey: z.string().min(1).max(50),
+});
+
+/** プラン変更。即時反映され、監査ログに変更前後を記録する */
+app.put('/api/platform/organizations/:id/plan', async (c) => {
+  requirePlatformAdmin(c);
+  if (!(await hasOrganizationsTable(c.env.DB))) {
+    throw new ApiError(503, 'ORGANIZATIONS_NOT_CONFIGURED', 'Organizations are not configured (migration 0018)');
+  }
+  const id = Number(c.req.param('id'));
+  const row = await organizationRow(c, id);
+  const dto = parseWith(changePlanBodySchema, await parseJson(c));
+  if (!isPlanKey(dto.planKey)) {
+    throw new ApiError(422, 'UNKNOWN_PLAN', `Unknown plan: ${dto.planKey}`);
+  }
+  await c.env.DB.prepare('UPDATE organizations SET plan_key = ?1, updated_at = ?2 WHERE id = ?3')
+    .bind(dto.planKey, Date.now(), id)
+    .run();
+  await platformAudit(
+    c,
+    'platform.organization.plan_changed',
+    'organization',
+    String(id),
+    { from: row.plan_key, to: dto.planKey },
+    null,
+  );
+  return c.json(await organizationJson(c, await organizationRow(c, id)));
 });
 
 const updateStoreBodySchema = z.object({
@@ -766,6 +960,34 @@ app.put('/api/platform/users/:userId/assignments', async (c) => {
         'LOCKOUT_PREVENTION',
         'At least one platform admin must remain (lockout prevention)',
       );
+    }
+  }
+
+  // プランのユーザー上限 (0018): 新しく組織に加わる場合だけ増員として数える。
+  // 既にその組織に所属するユーザーの割当変更は上限チェックの対象外
+  if (await hasOrganizationsTable(c.env.DB)) {
+    const { results: beforeRows } = await c.env.DB.prepare(
+      `SELECT DISTINCT s.organization_id AS orgId
+         FROM user_roles ur JOIN stores s ON s.id = ur.store_id
+        WHERE ur.user_id = ?1 AND s.organization_id IS NOT NULL`,
+    )
+      .bind(userId)
+      .all<{ orgId: number }>();
+    const beforeOrgs = new Set(beforeRows.map((r) => r.orgId));
+    const afterOrgs = new Map<number, string>();
+    for (const a of assignments) {
+      if (a.storeId === null) continue;
+      const plan = await resolveStorePlan(c.env.DB, a.storeId);
+      if (plan.organization) afterOrgs.set(plan.organization.id, plan.organization.planKey);
+    }
+    for (const [orgId, planKey] of afterOrgs) {
+      if (beforeOrgs.has(orgId)) continue;
+      const def = planDef(planKey);
+      if (def.limits.users === null) continue;
+      const usage = await organizationUsage(c.env.DB, orgId);
+      if (exceedsLimit(def.limits.users, usage.users, 1)) {
+        throw planLimitError(def.key, 'users', def.limits.users, usage.users);
+      }
     }
   }
 

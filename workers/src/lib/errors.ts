@@ -9,13 +9,15 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly code: string,
     message: string,
+    /** レスポンスボディへ追加で載せる構造化フィールド (プラン上限の内訳など) */
+    public readonly extra?: Record<string, unknown>,
   ) {
     super(message);
     this.name = 'ApiError';
   }
 
-  toBody(): { statusCode: number; error: string; message: string } {
-    return { statusCode: this.status, error: this.code, message: this.message };
+  toBody(): Record<string, unknown> {
+    return { statusCode: this.status, error: this.code, message: this.message, ...(this.extra ?? {}) };
   }
 }
 

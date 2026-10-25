@@ -36,6 +36,7 @@ export const APP_HTML = `<!doctype html>
   <p><button class="btn" id="passkeyLoginBtn" type="button">Face IDでログイン</button></p>
   <p><a class="btn secondary" href="/auth/login">Google でログイン</a></p>
   <p class="small danger" id="passkeyLoginMsg" style="display:none"></p>
+  <p class="small muted" id="passkeyLoginHint" style="display:none">このサイト用のパスキーが未登録の場合は、先に Google でログインして「セキュリティ」から登録してください。</p>
 </div>
 
 <div id="errorBox" class="center-box" style="display:none">

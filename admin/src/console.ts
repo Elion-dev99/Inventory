@@ -83,6 +83,7 @@ export const CONSOLE_HTML = `<!doctype html>
   <aside class="console-side" id="sideNav" style="display:none">
     <button class="side-btn active" data-sec="overview">概要</button>
     <button class="side-btn" data-sec="stores">店舗</button>
+    <button class="side-btn" data-sec="orgs">組織・プラン</button>
     <button class="side-btn" data-sec="users">ユーザー</button>
     <button class="side-btn" data-sec="audit">監査</button>
     <button class="side-btn" data-sec="announce">お知らせ</button>
@@ -96,6 +97,7 @@ export const CONSOLE_HTML = `<!doctype html>
   <p><a class="btn" href="/auth/login">Google でログインする</a>
   <button class="btn secondary" id="passkeyLoginBtn" style="display:none;">Face IDでログイン</button></p>
   <p class="small" id="passkeyLoginMsg" style="display:none; color: var(--danger);"></p>
+  <p class="small muted" id="passkeyLoginHint" style="display:none;">このサイト用のパスキーが未登録の場合は、先に Google でログインして「システム」のセキュリティから登録してください。</p>
   <p class="small muted">パスキーはホストごとに登録が必要です。店舗アプリで登録したパスキーはこのコンソールでは使えません。このコンソール用のパスキーは、Google でログインした後に「システム」画面で登録してください。</p>
 </div>
 <div id="guide" class="section-box" style="display:none;">
@@ -118,9 +120,22 @@ export const CONSOLE_HTML = `<!doctype html>
   <div class="group"><div class="group-row static">
     <input id="newStoreCode" type="text" placeholder="店舗コード (例: TOKYO1)" style="width: 12em;">
     <input id="newStoreName" type="text" placeholder="店舗名" style="width: 14em;">
+    <label>組織 <select id="newStoreOrg"></select></label>
     <button class="btn" id="createStore">作成</button>
   </div></div>
   <div id="storeDetail" class="detail-box"></div>
+</section>
+
+<section id="sec-orgs" class="console-sec" style="display:none;">
+  <h2>組織・プラン</h2>
+  <p class="small muted">プランは組織単位で付与します。プラン変更は即時反映され、監査ログに記録されます。</p>
+  <div id="orgs"><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
+  <h3>組織を作成</h3>
+  <div class="group"><div class="group-row static">
+    <input id="newOrgName" type="text" placeholder="組織名" style="width: 14em;">
+    <label>プラン <select id="newOrgPlan"></select></label>
+    <button class="btn" id="createOrg">作成</button>
+  </div></div>
 </section>
 
 <section id="sec-users" class="console-sec" style="display:none;">
@@ -380,9 +395,14 @@ function getPasskeyAssertion(opts) {
 /* ログインページの「Face IDでログイン」 */
 async function passkeyLogin() {
   const msg = el('passkeyLoginMsg');
-  function fail(text) { if (msg) { msg.textContent = text; msg.style.display = ''; } }
+  const hint = el('passkeyLoginHint');
+  function fail(text) {
+    if (msg) { msg.textContent = text; msg.style.display = ''; }
+    if (hint) hint.style.display = '';
+  }
   if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
   if (msg) msg.style.display = 'none';
+  if (hint) hint.style.display = 'none';
   try {
     const opts = await api('/api/platform/auth/passkey/login/options', { method: 'POST', body: '{}' });
     const cred = await getPasskeyAssertion(opts);
@@ -473,6 +493,8 @@ let myId = null;
 let storeList = [];
 let roleList = [];
 let userList = [];
+let orgList = [];
+let planCatalog = [];
 let currentSection = '';
 
 function storeName(id) {
@@ -491,6 +513,7 @@ function showSection(name) {
     btn.classList.toggle('active', btn.dataset.sec === name);
   });
   if (name === 'overview') loadOverview();
+  if (name === 'orgs') loadOrganizations();
   if (name === 'users') loadUsers();
   if (name === 'audit') loadAudit();
   if (name === 'announce') loadAnnouncements();
@@ -543,10 +566,14 @@ async function loadOverview() {
 async function renderStores() {
   const box = el('stores');
   if (storeList.length === 0) { box.textContent = '店舗がありません。'; return; }
-  let html = '<div class="table-wrap"><table><thead><tr><th>ID</th><th>コード</th><th>店舗名</th><th>状態</th><th>統計 (ユーザー/商品/在庫/30日移動)</th><th>操作</th></tr></thead><tbody>';
+  let html = '<div class="table-wrap"><table><thead><tr><th>ID</th><th>コード</th><th>店舗名</th><th>状態</th><th>組織 / プラン</th><th>統計 (ユーザー/商品/在庫/30日移動)</th><th>操作</th></tr></thead><tbody>';
   for (const s of storeList) {
+    const orgCell = s.organization
+      ? esc(s.organization.name || '') + ' / ' + esc(planNameOf(s.organization.planKey))
+      : '<span class="muted">組織なし</span>';
     html += '<tr><td>' + s.id + '</td><td><code>' + esc(s.code) + '</code></td><td>' + esc(s.name) + '</td>' +
       '<td>' + (s.status === 'suspended' ? '<span class="badge badge-danger">停止中</span>' : '<span class="badge">稼働中</span>') + '</td>' +
+      '<td>' + orgCell + '</td>' +
       '<td id="stats-' + s.id + '">-</td>' +
       '<td><button data-store-detail="' + s.id + '">詳細</button> ' + (s.status === 'suspended'
         ? '<button data-store-act="resume" data-id="' + s.id + '">再開</button>'
@@ -593,13 +620,123 @@ async function createStore() {
   const code = el('newStoreCode').value.trim();
   const name = el('newStoreName').value.trim();
   if (!code || !name) { setError('店舗コードと店舗名を入力してください。'); return; }
+  const orgSel = el('newStoreOrg');
+  const body = { code, name };
+  if (orgSel && orgSel.value) body.organizationId = Number(orgSel.value);
   setError(''); setStatus('作成中…');
   try {
-    await api('/api/platform/stores', { method: 'POST', body: JSON.stringify({ code, name }) });
+    await api('/api/platform/stores', { method: 'POST', body: JSON.stringify(body) });
     el('newStoreCode').value = '';
     el('newStoreName').value = '';
     await reloadStores();
     setStatus('店舗「' + name + '」を作成しました。');
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+  }
+}
+
+/* ---------------- 組織・プラン ---------------- */
+function planNameOf(key) {
+  const p = planCatalog.find((x) => x.key === key);
+  return p ? p.name : (key || '');
+}
+function limitText(used, limit) {
+  return (used || 0) + ' / ' + (limit === null || limit === undefined ? '無制限' : limit);
+}
+function fillOrgSelects() {
+  const planOpts = planCatalog.map((p) =>
+    '<option value="' + esc(p.key) + '">' + esc(p.name) + (p.price === null ? ' (個別見積)' : ' (¥' + Number(p.price || 0).toLocaleString('ja-JP') + '/月)') + '</option>'
+  ).join('');
+  const orgPlanSel = el('newOrgPlan');
+  if (orgPlanSel) orgPlanSel.innerHTML = planOpts;
+  const storeOrgSel = el('newStoreOrg');
+  if (storeOrgSel) {
+    storeOrgSel.innerHTML = orgList.map((o) =>
+      '<option value="' + o.id + '">' + esc(o.name) + ' (' + esc(planNameOf(o.planKey)) + ')</option>'
+    ).join('');
+  }
+}
+async function refreshOrgData() {
+  const data = await api('/api/platform/organizations');
+  orgList = data.organizations || [];
+  planCatalog = data.plans || [];
+  fillOrgSelects();
+}
+async function loadOrganizations() {
+  try {
+    await refreshOrgData();
+    renderOrganizations();
+  } catch (e) {
+    setError(errText(e));
+  }
+}
+function renderOrganizations() {
+  const box = el('orgs');
+  if (orgList.length === 0) { box.textContent = '組織がありません。'; return; }
+  let html = '<div class="table-wrap"><table><thead><tr><th>ID</th><th>組織名</th><th>プラン</th><th>利用状況 (店舗 / ユーザー / 商品)</th><th>操作</th></tr></thead><tbody>';
+  for (const o of orgList) {
+    const planOpts = planCatalog.map((p) =>
+      '<option value="' + esc(p.key) + '"' + (p.key === o.planKey ? ' selected' : '') + '>' + esc(p.name) + '</option>'
+    ).join('');
+    const lim = (o.plan && o.plan.limits) || {};
+    const u = o.usage || {};
+    html += '<tr><td>' + o.id + '</td>' +
+      '<td><input id="orgName-' + o.id + '" type="text" value="' + esc(o.name) + '" style="width: 12em;"></td>' +
+      '<td><select data-org-plan="' + o.id + '">' + planOpts + '</select></td>' +
+      '<td>' + limitText(u.stores, lim.stores) + ' ・ ' + limitText(u.users, lim.users) + ' ・ ' + limitText(u.skus, lim.skus) + '</td>' +
+      '<td><button data-org-rename="' + o.id + '">名前を保存</button></td></tr>';
+  }
+  box.innerHTML = html + '</tbody></table></div>';
+  box.querySelectorAll('select[data-org-plan]').forEach((sel) => {
+    sel.onchange = () => changeOrgPlan(Number(sel.dataset.orgPlan), sel.value);
+  });
+  box.querySelectorAll('button[data-org-rename]').forEach((btn) => {
+    btn.onclick = () => renameOrg(Number(btn.dataset.orgRename));
+  });
+}
+async function changeOrgPlan(id, planKey) {
+  setError(''); setStatus('プランを変更中…');
+  try {
+    await api('/api/platform/organizations/' + id + '/plan', { method: 'PUT', body: JSON.stringify({ planKey }) });
+    await refreshOrgData();
+    renderOrganizations();
+    storeList = await api('/api/platform/stores');
+    await renderStores();
+    setStatus('組織 #' + id + ' のプランを「' + planNameOf(planKey) + '」に変更しました。');
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+    await loadOrganizations();
+  }
+}
+async function renameOrg(id) {
+  const name = el('orgName-' + id).value.trim();
+  if (!name) { setError('組織名を入力してください。'); return; }
+  setError(''); setStatus('保存中…');
+  try {
+    await api('/api/platform/organizations/' + id, { method: 'PUT', body: JSON.stringify({ name }) });
+    await refreshOrgData();
+    renderOrganizations();
+    storeList = await api('/api/platform/stores');
+    await renderStores();
+    setStatus('組織 #' + id + ' の名前を変更しました。');
+  } catch (e) {
+    setStatus('');
+    setError(errText(e));
+  }
+}
+async function createOrganization() {
+  const name = el('newOrgName').value.trim();
+  const planKey = el('newOrgPlan').value;
+  if (!name || !planKey) { setError('組織名とプランを入力してください。'); return; }
+  setError(''); setStatus('作成中…');
+  try {
+    await api('/api/platform/organizations', { method: 'POST', body: JSON.stringify({ name, planKey }) });
+    el('newOrgName').value = '';
+    await refreshOrgData();
+    renderOrganizations();
+    setStatus('組織「' + name + '」を作成しました。');
   } catch (e) {
     setStatus('');
     setError(errText(e));
@@ -1624,6 +1761,9 @@ async function loadAll() {
     roleList = roleData.roles;
   } catch (e) { roleList = []; }
   try {
+    await refreshOrgData();
+  } catch (e) { /* 組織 API が無い環境では店舗作成の組織セレクトは空のまま */ }
+  try {
     userList = await api('/api/platform/users');
   } catch (e) { userList = []; }
   fillAuditFilters();
@@ -1635,6 +1775,7 @@ el('logoutBtn').onclick = async () => {
   location.reload();
 };
 el('createStore').onclick = createStore;
+el('createOrg').onclick = createOrganization;
 el('userSearchBtn').onclick = loadUsers;
 el('auditSearchBtn').onclick = loadAudit;
 el('mntStartBtn').onclick = startMaintenanceNow;
