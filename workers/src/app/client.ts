@@ -4428,7 +4428,7 @@ function fetchAudit() {
     for (var i = 0; i < r.items.length; i++) {
       var a = r.items[i];
       h += '<tr><td>' + fmtDateTime(a.createdAt) + '</td><td>' + a.id + '</td><td>' +
-        (a.actorLabel ? esc(a.actorLabel) : (a.actorId === null ? '-' : a.actorId)) + '</td><td>' + esc(a.action) + '</td><td>' +
+        (a.actorId === null || a.actorId === undefined ? '-' : a.actorId) + '</td><td>' + esc(a.action) + '</td><td>' +
         esc(a.targetType + ' #' + a.targetId) + '</td><td>' +
         esc(a.payload === null ? '' : JSON.stringify(a.payload)) + '</td></tr>';
     }

@@ -460,8 +460,10 @@ describe('お知らせの投稿管理 (権限・対象範囲・既読集計)', (
       body: { title: '全体宛 (店舗管理者)', body: '本文', storeId: null },
     });
     expect(byStoreAdmin.status).toBe(201);
-    // 全店舗宛の対象は有効な全ユーザー 5 人
-    expect(byStoreAdmin.body.targetUsers).toBe(5);
+    // 全店舗宛の対象は有効な全ユーザー 5 人だが、店舗側の応答では
+    // 全体管理者の存在を見せないため、その分を除いた 4 人になる
+    // (全体管理者本人の応答では従来通り 5 人)
+    expect(byStoreAdmin.body.targetUsers).toBe(4);
 
     const byPlatform = await api('/api/v1/admin/announcements', {
       cookie: cookiePlatform,

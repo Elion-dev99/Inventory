@@ -1141,16 +1141,17 @@ async function hasTable(c: AppContext, table: string): Promise<boolean> {
   }
 }
 
-// ------------------------------------------------- 全体管理者の匿名化
+// ------------------------------------------------- 全体管理者の不可視化
 // 全体管理者 (全体割当 = SYSTEM_ADMIN かつ store_id IS NULL を持つユーザー) は
-// 店舗側の管理対象ではなく、その名前・メールアドレス・ID を店舗ユーザーに
-// 見せない。対象は「全体割当を持ち、現在店舗の割当を持たない」ユーザー。
-// 現在店舗の割当も持つ人は、その店舗のメンバーとして通常表示する。
-// 閲覧者自身が全体管理者の場合は何も隠さない (本人の表示・操作は通常通り)。
-// 判定はすべてサーバー側で行う。
-
-/** 匿名化した操作者の表示名 */
-const PLATFORM_ACTOR_LABEL = 'システム管理者';
+// 店舗側の管理対象ではなく、その名前・メールアドレス・ID はもちろん、
+// 「存在」自体も店舗ユーザーに見せない。対象は「全体割当を持ち、現在店舗の
+// 割当を持たない」ユーザー。現在店舗の割当も持つ人は、その店舗のメンバー
+// として通常表示する。閲覧者自身が全体管理者の場合は何も隠さない
+// (本人の表示・操作は通常通り)。判定はすべてサーバー側で行う。
+// 監査ログは対象者の行ごと返さず、件数からも除外する (ラベルでの匿名化は
+// 存在を示してしまうため行わない)。業務レコード (在庫の移動履歴など) は
+// 店舗のデータとして残すが、操作者 ID 欄は null にして誰の操作か分からない
+// 形にする。
 
 /** 現在店舗の文脈で素性を隠す全体管理者のユーザー ID 集合 */
 async function hiddenPlatformUserIds(
@@ -3187,7 +3188,8 @@ app.post('/api/v1/reservations/:id/release', async (c) => {
       .bind(user(c).userId, String(id), JSON.stringify({ productId: row.product_id, quantity: row.quantity }), ctx.store.id, now),
   ]);
   const updated = await loadReservationInStore(c, id, ctx.store.id);
-  return c.json(reservationJson(updated));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(anonymizeUserFields(reservationJson(updated), hidden, ['createdBy']));
 });
 
 /** 引当を消費に変換する: 実消費を Coordinator 経由で実行し、引当を consumed にする */
@@ -3243,7 +3245,14 @@ app.post('/api/v1/reservations/:id/consume', async (c) => {
       ),
   ]);
   const updated = await loadReservationInStore(c, id, ctx.store.id);
-  return c.json({ reservation: reservationJson(updated), movement: envelope.body }, 201);
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    {
+      reservation: anonymizeUserFields(reservationJson(updated), hidden, ['createdBy']),
+      movement: envelope.body,
+    },
+    201,
+  );
 });
 
 // ------------------------------------------------------- ピッキングリスト (0015)
@@ -3407,7 +3416,10 @@ app.put('/api/v1/pick-lists/:id/items/:itemId', async (c) => {
   await c.env.DB.prepare('UPDATE pick_items SET planned_qty = ?1, picked_qty = ?2 WHERE id = ?3')
     .bind(plannedQty, pickedQty, itemId)
     .run();
-  return c.json(await loadPickList(c, listId, ctx.store.id));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    anonymizeUserFields(await loadPickList(c, listId, ctx.store.id), hidden, ['createdBy']),
+  );
 });
 
 /** 確定: 検品済み数量を Coordinator 経由で一括・原子的に実行する */
@@ -3487,7 +3499,10 @@ app.post('/api/v1/pick-lists/:id/cancel', async (c) => {
       )
       .bind(user(c).userId, String(listId), ctx.store.id, Date.now()),
   ]);
-  return c.json(await loadPickList(c, listId, ctx.store.id));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    anonymizeUserFields(await loadPickList(c, listId, ctx.store.id), hidden, ['createdBy']),
+  );
 });
 
 // ------------------------------------------------------- 発注テンプレート・定期発注 (0015)
@@ -4524,7 +4539,11 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
       ),
   ]);
   const poJson = await loadPurchaseOrder(c, poId, ctx.store.id);
-  return c.json({ ...poJson, receivedMovements });
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({
+    ...anonymizeUserFields(poJson, hidden, ['createdBy']),
+    receivedMovements,
+  });
 });
 
 /**
@@ -4566,7 +4585,10 @@ app.post('/api/v1/purchase-orders/:id/close-residual', async (c) => {
       )
       .bind(user(c).userId, String(poId), JSON.stringify({ remaining }), ctx.store.id, now),
   ]);
-  return c.json(await loadPurchaseOrder(c, poId, ctx.store.id));
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(
+    anonymizeUserFields(await loadPurchaseOrder(c, poId, ctx.store.id), hidden, ['createdBy']),
+  );
 });
 
 // ---------------------------------------------------------------- 分析レポート
@@ -4937,10 +4959,7 @@ interface AuditLogRow {
   created_at: number;
 }
 
-function auditLogJson(
-  r: AuditLogRow,
-  hidden: ReadonlySet<number> = new Set(),
-): Record<string, unknown> {
+function auditLogJson(r: AuditLogRow): Record<string, unknown> {
   let payload: unknown = null;
   if (r.payload !== null) {
     try {
@@ -4949,12 +4968,9 @@ function auditLogJson(
       payload = r.payload;
     }
   }
-  // 全体管理者の操作は行自体を残しつつ、操作者を「システム管理者」に匿名化する
-  const anonymized = r.actor_id !== null && hidden.has(r.actor_id);
   return {
     id: r.id,
-    actorId: anonymized ? null : r.actor_id,
-    actorLabel: anonymized ? PLATFORM_ACTOR_LABEL : null,
+    actorId: r.actor_id,
     action: r.action,
     targetType: r.target_type,
     targetId: r.target_id,
@@ -4974,6 +4990,14 @@ app.get('/api/v1/admin/audit-logs', async (c) => {
   // 閲覧は現在店舗の監査だけ (全体操作 = store_id NULL は店舗側には出さない)
   const conditions: string[] = ['store_id = ?'];
   const params: (number | string)[] = [ctx.store.id];
+  // 全体管理者の行は存在自体を見せないため、件数・一覧の両方から除外する。
+  // actor フィルタで対象者の ID を指定されても、この条件で結果は空になる。
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  if (hidden.size > 0) {
+    const ids = [...hidden];
+    conditions.push(`(actor_id IS NULL OR actor_id NOT IN (${ids.map(() => '?').join(',')}))`);
+    params.push(...ids);
+  }
   const actor = c.req.query('actor');
   if (actor !== undefined && actor !== '') {
     const actorId = Number(actor);
@@ -5015,9 +5039,8 @@ app.get('/api/v1/admin/audit-logs', async (c) => {
   )
     .bind(...params, limit, offset)
     .all<AuditLogRow>();
-  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   return c.json({
-    items: results.map((r) => auditLogJson(r, hidden)),
+    items: results.map((r) => auditLogJson(r)),
     total: totalRow?.n ?? 0,
     limit,
     offset,
@@ -5142,6 +5165,47 @@ async function loadAnnouncementRow(c: AppContext, id: number): Promise<Announcem
   return row;
 }
 
+/**
+ * 店舗側の管理応答用のお知らせ JSON。全体管理者は存在自体を見せないため、
+ * 投稿者 ID を伏せるだけでなく、既読数 (readCount) と対象ユーザー数
+ * (targetUsers) の母数からも全体管理者を除く。共有 lib の
+ * announcementAdminJson は全体管理コンソールでも使うため、ここで店舗側
+ * だけに効く調整を行う。
+ * - 店舗宛の対象数は現在店舗の割当ベースで、対象者は割当を持たないため不変。
+ * - 全店舗宛の対象数は有効な全ユーザー数のため、有効な対象者の分を引く。
+ */
+async function announcementAdminJsonForStore(
+  c: AppContext,
+  ctx: StoreContext,
+  row: AnnouncementRow,
+): Promise<Record<string, unknown>> {
+  const json = await announcementAdminJson(c.env.DB, row);
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  if (hidden.size === 0) return { ...json };
+  const out: Record<string, unknown> = {
+    ...json,
+    createdBy: anonymizeUserId(json.createdBy, hidden),
+  };
+  const ids = [...hidden];
+  const marks = ids.map(() => '?').join(',');
+  const reads = await c.env.DB
+    .prepare(
+      `SELECT COUNT(*) AS n FROM announcement_reads
+        WHERE announcement_id = ?1 AND user_id NOT IN (${marks})`,
+    )
+    .bind(row.id, ...ids)
+    .first<{ n: number }>();
+  out.readCount = reads?.n ?? 0;
+  if (row.store_id === null && typeof json.targetUsers === 'number') {
+    const hiddenActive = await c.env.DB
+      .prepare(`SELECT COUNT(*) AS n FROM users WHERE status = 'active' AND id IN (${marks})`)
+      .bind(...ids)
+      .first<{ n: number }>();
+    out.targetUsers = Math.max(0, json.targetUsers - (hiddenActive?.n ?? 0));
+  }
+  return out;
+}
+
 /** 全店舗宛 (store_id NULL) を扱えるか: 全体管理者、または現在店舗の SYSTEM_ADMIN */
 function canPostToAllStores(ctx: StoreContext): boolean {
   return (
@@ -5250,10 +5314,8 @@ app.get('/api/v1/admin/announcements', async (c) => {
     )
     .bind(ctx.store.id)
     .all<AnnouncementRow>();
-  const rawItems: ReturnType<typeof announcementJson>[] = [];
-  for (const row of results) rawItems.push(await announcementAdminJson(c.env.DB, row));
-  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
-  const items = rawItems.map((i) => ({ ...i, createdBy: anonymizeUserId(i.createdBy, hidden) }));
+  const items: Record<string, unknown>[] = [];
+  for (const row of results) items.push(await announcementAdminJsonForStore(c, ctx, row));
   return c.json({ items });
 });
 
@@ -5298,7 +5360,7 @@ app.post('/api/v1/admin/announcements', async (c) => {
   // 掲載中なら即時プッシュ (未設定環境ではスキップされる)
   await maybeSendAnnouncementPush(c.env.DB, c.env, row, now);
   const fresh = await loadAnnouncementRow(c, row.id);
-  return c.json(await announcementAdminJson(c.env.DB, fresh), 201);
+  return c.json(await announcementAdminJsonForStore(c, ctx, fresh), 201);
 });
 
 app.put('/api/v1/admin/announcements/:id', async (c) => {
@@ -5343,7 +5405,7 @@ app.put('/api/v1/admin/announcements/:id', async (c) => {
   const fresh = await loadAnnouncementRow(c, row.id);
   await announcementAudit(c, 'announcement.update', fresh, ctx.store.id);
   await maybeSendAnnouncementPush(c.env.DB, c.env, fresh, now);
-  return c.json(await announcementAdminJson(c.env.DB, await loadAnnouncementRow(c, row.id)));
+  return c.json(await announcementAdminJsonForStore(c, ctx, await loadAnnouncementRow(c, row.id)));
 });
 
 app.delete('/api/v1/admin/announcements/:id', async (c) => {

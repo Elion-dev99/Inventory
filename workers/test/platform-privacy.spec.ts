@@ -14,13 +14,17 @@ import platformSettingsSql from '../migrations/0010_platform_settings.sql?raw';
 import maintenanceWindowsSql from '../migrations/0011_maintenance_windows.sql?raw';
 import maintenanceExtrasSql from '../migrations/0012_maintenance_extras.sql?raw';
 import announcementsSql from '../migrations/0013_announcements.sql?raw';
+import practicalSql from '../migrations/0014_practical.sql?raw';
+import commercialSql from '../migrations/0015_commercial.sql?raw';
 
 /**
- * 全体管理者の匿名化 (店舗側で素性を隠す) の結合テスト。
+ * 全体管理者の不可視化 (店舗側で存在自体を見せない) の結合テスト。
  *
  * - 全体管理者 (全体割当のみ) は店舗側のユーザー一覧に出ず、ロール付与の対象にもならない
- * - 監査ログ・履歴・承認・お知らせでは全体管理者の操作者 ID が伏せられ、
- *   監査ログでは「システム管理者」と表示される
+ * - 監査ログでは全体管理者の行ごと返らず、件数 (total) からも除外される。
+ *   ラベル等で存在を示すこともしない
+ * - 履歴・承認・お知らせ・引当など業務レコードの操作者 ID は伏せられ、
+ *   お知らせの既読数・対象数の母数からも全体管理者は除かれる
  * - エクスポートに全体管理者の users 行・全体割当が含まれない
  * - 現在店舗の割当も持つ全体管理者は、その店舗では通常のメンバーとして表示される
  * - 全体管理者本人の閲覧 (/me・各管理 API) は従来通り
@@ -79,7 +83,6 @@ async function api(
 interface AuditItem {
   id: number;
   actorId: number | null;
-  actorLabel: string | null;
   action: string;
 }
 interface AuditPage {
@@ -129,6 +132,8 @@ beforeAll(async () => {
     ...statementsOf(maintenanceWindowsSql),
     ...statementsOf(maintenanceExtrasSql),
     ...statementsOf(announcementsSql),
+    ...statementsOf(practicalSql),
+    ...statementsOf(commercialSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -206,7 +211,7 @@ beforeAll(async () => {
   ]);
 });
 
-describe('全体管理者の匿名化 (店舗側)', () => {
+describe('全体管理者の不可視化 (店舗側)', () => {
   it('ユーザー一覧に全体管理者が出ず、店舗割当を持つ全体管理者は通常表示される', async () => {
     const res = await api('/api/v1/admin/users', storeAdminToken);
     expect(res.status).toBe(200);
@@ -244,30 +249,53 @@ describe('全体管理者の匿名化 (店舗側)', () => {
     expect(visible.status).toBe(200);
   });
 
-  it('監査ログでは全体管理者の操作が「システム管理者」に匿名化され、行自体は残る', async () => {
+  it('監査ログでは全体管理者の行が1件も返らず、件数からも除外される', async () => {
     const res = await api('/api/v1/admin/audit-logs', storeAdminToken);
     expect(res.status).toBe(200);
     const text = await res.text();
     const page = JSON.parse(text) as AuditPage;
+    // 存在を示すラベルや素性は応答のどこにも出ない
+    expect(text).not.toContain('システム管理者');
     expect(text).not.toContain(PLATFORM_EMAIL);
-    // 全体管理者の ID はどの行にも出ない
+    expect(text).not.toContain('actorLabel');
+    // 全体管理者の行は1件も無い (全体管理者だけが行った操作も丸ごと消える)
     expect(page.items.every((a) => a.actorId !== 1)).toBe(true);
-    // 全体管理者の操作行は残り、ラベルで匿名化される
-    const platformOps = page.items.filter((a) => a.actorLabel === 'システム管理者');
-    expect(platformOps.length).toBeGreaterThanOrEqual(2);
-    expect(platformOps.every((a) => a.actorId === null)).toBe(true);
-    expect(page.items.some((a) => a.action === 'role_permissions.update' && a.actorLabel === 'システム管理者')).toBe(true);
+    expect(page.items.some((a) => a.action === 'role_permissions.update')).toBe(false);
     // 通常ユーザーの操作は従来通り ID で見える
-    expect(page.items.some((a) => a.action === 'stock.inbound' && a.actorId === 3 && a.actorLabel === null)).toBe(true);
-    // 店舗割当を持つ全体管理者 (id=4) の操作は匿名化されない
+    expect(page.items.some((a) => a.action === 'stock.inbound' && a.actorId === 3)).toBe(true);
+    // 店舗割当を持つ全体管理者 (id=4) の操作は隠されない
     expect(page.items.some((a) => a.action === 'stock.inbound' && a.actorId === 4)).toBe(true);
+    // 件数 (total) の差分がちょうど全体管理者の行数と一致する (= total からも除外)
+    const selfRes = await api('/api/v1/admin/audit-logs', platformToken);
+    expect(selfRes.status).toBe(200);
+    const selfPage = (await selfRes.json()) as AuditPage;
+    const platformRows = selfPage.items.filter((a) => a.actorId === 1).length;
+    expect(platformRows).toBeGreaterThanOrEqual(2);
+    expect(selfPage.total - page.total).toBe(platformRows);
+    expect(selfPage.items.length - page.items.length).toBe(platformRows);
   });
 
-  it('監査ログは全体管理者本人には従来通り見える', async () => {
-    const res = await api('/api/v1/admin/audit-logs', platformToken);
+  it('監査ログの actor フィルタで全体管理者の ID を指定しても結果は空になる', async () => {
+    const res = await api('/api/v1/admin/audit-logs?actor=1', storeAdminToken);
     expect(res.status).toBe(200);
     const page = (await res.json()) as AuditPage;
-    expect(page.items.some((a) => a.action === 'role_permissions.update' && a.actorId === 1 && a.actorLabel === null)).toBe(true);
+    expect(page.items).toEqual([]);
+    expect(page.total).toBe(0);
+    // 通常ユーザーのフィルタは従来通り効く
+    const staffRes = await api('/api/v1/admin/audit-logs?actor=3', storeAdminToken);
+    const staffPage = (await staffRes.json()) as AuditPage;
+    expect(staffPage.total).toBeGreaterThanOrEqual(1);
+    expect(staffPage.items.every((a) => a.actorId === 3)).toBe(true);
+  });
+
+  it('監査ログは全体管理者本人には自分の行を含め従来通り見える', async () => {
+    const res = await api('/api/v1/admin/audit-logs', platformToken);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    const page = JSON.parse(text) as AuditPage;
+    expect(text).not.toContain('actorLabel');
+    expect(page.items.some((a) => a.action === 'role_permissions.update' && a.actorId === 1)).toBe(true);
+    expect(page.items.some((a) => a.action === 'stock.inbound' && a.actorId === 1)).toBe(true);
   });
 
   it('履歴 (movements) でも全体管理者の actorId が伏せられる', async () => {
@@ -287,18 +315,86 @@ describe('全体管理者の匿名化 (店舗側)', () => {
     expect(items.find((a) => a.reason === 'スタッフの申請')?.requestedBy).toBe(3);
   });
 
-  it('お知らせでは全体管理者の投稿者 ID が伏せられる (閲覧・管理の両方)', async () => {
+  it('お知らせでは全体管理者の投稿者 ID が伏せられ、既読数・対象数の母数からも除かれる', async () => {
+    // 既読の素材: 全体管理者 (1) とスタッフ (3) が両方のお知らせを読む
+    const now = Date.now();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT OR IGNORE INTO announcement_reads (announcement_id, user_id, read_at)
+         VALUES (1, 1, ?1), (1, 3, ?1), (2, 1, ?1), (2, 3, ?1)`,
+      ).bind(now),
+    ]);
+
     const res = await api('/api/v1/announcements', storeAdminToken);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { items: { title: string; createdBy: number | null }[] };
     expect(body.items.find((a) => a.title === '全店舗向けお知らせ')?.createdBy).toBeNull();
     expect(body.items.find((a) => a.title === '店舗向けお知らせ')?.createdBy).toBe(2);
 
+    type AdminItem = {
+      title: string;
+      createdBy: number | null;
+      readCount?: number;
+      targetUsers?: number;
+    };
     const admin = await api('/api/v1/admin/announcements', storeAdminToken);
     expect(admin.status).toBe(200);
-    const adminBody = (await admin.json()) as { items: { title: string; createdBy: number | null }[] };
-    expect(adminBody.items.find((a) => a.title === '全店舗向けお知らせ')?.createdBy).toBeNull();
-    expect(adminBody.items.find((a) => a.title === '店舗向けお知らせ')?.createdBy).toBe(2);
+    const adminBody = (await admin.json()) as { items: AdminItem[] };
+    const allStore = adminBody.items.find((a) => a.title === '全店舗向けお知らせ');
+    const storeOnly = adminBody.items.find((a) => a.title === '店舗向けお知らせ');
+    expect(allStore?.createdBy).toBeNull();
+    expect(storeOnly?.createdBy).toBe(2);
+    // 既読数は全体管理者の既読 (1件) を数えない → スタッフの1件だけ
+    expect(allStore?.readCount).toBe(1);
+    expect(storeOnly?.readCount).toBe(1);
+    // 対象数: 全店舗宛は有効な全ユーザー4人から全体管理者を引いた3人。
+    // 店舗宛は店舗の割当ベース (2,3,4 の3人) で変わらない
+    expect(allStore?.targetUsers).toBe(3);
+    expect(storeOnly?.targetUsers).toBe(3);
+
+    // 全体管理者本人には母数も従来通り (全店舗宛は4人・既読2件)
+    const selfAdmin = await api('/api/v1/admin/announcements', platformToken);
+    expect(selfAdmin.status).toBe(200);
+    const selfBody = (await selfAdmin.json()) as { items: AdminItem[] };
+    const selfAll = selfBody.items.find((a) => a.title === '全店舗向けお知らせ');
+    expect(selfAll?.createdBy).toBe(1);
+    expect(selfAll?.readCount).toBe(2);
+    expect(selfAll?.targetUsers).toBe(4);
+  });
+
+  it('お知らせの更新レスポンスでも全体管理者の投稿者 ID は伏せられる', async () => {
+    const res = await api('/api/v1/admin/announcements/1', storeAdminToken, {
+      method: 'PUT',
+      body: { title: '全店舗向けお知らせ', body: '本文（更新）' },
+    });
+    expect(res.status).toBe(200);
+    const updated = (await res.json()) as { createdBy: number | null };
+    expect(updated.createdBy).toBeNull();
+  });
+
+  it('引当の解放レスポンスでも全体管理者の作成者 ID は伏せられる', async () => {
+    const created = await api('/api/v1/reservations', platformToken, {
+      method: 'POST',
+      body: { productId: 1, locationId: 1, quantity: 2, reason: '全体管理者の引当' },
+    });
+    expect(created.status).toBe(201);
+    const reservation = (await created.json()) as { id: number; createdBy: number | null };
+    expect(reservation.createdBy).toBe(1);
+
+    // 店舗側の一覧では作成者が伏せられる
+    const list = await api('/api/v1/reservations', storeAdminToken);
+    expect(list.status).toBe(200);
+    const rows = (await list.json()) as { id: number; createdBy: number | null }[];
+    expect(rows.find((r) => r.id === reservation.id)?.createdBy).toBeNull();
+
+    // 店舗管理者が解放したときのレスポンスでも伏せられる
+    const released = await api(`/api/v1/reservations/${reservation.id}/release`, storeAdminToken, {
+      method: 'POST',
+      body: {},
+    });
+    expect(released.status).toBe(200);
+    const releasedBody = (await released.json()) as { createdBy: number | null };
+    expect(releasedBody.createdBy).toBeNull();
   });
 
   it('エクスポートに全体管理者の users 行と全体割当が含まれない', async () => {
