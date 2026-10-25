@@ -1,4 +1,5 @@
 import { badRequest, notFound } from './errors';
+import { insertAudit } from './audit-chain';
 import {
   assemblableCount,
   freeTotalsByProduct,
@@ -338,13 +339,15 @@ export async function runScheduledPoDrafts(db: D1Database, nowMs: number): Promi
         nowMs,
       });
       generated += 1;
-      await db
-        .prepare(
-          `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-           VALUES (?1, 'purchase_order.create_scheduled', 'po_template', ?2, ?3, ?4, ?5)`,
-        )
-        .bind(row.created_by, String(row.template_id), JSON.stringify({ scheduleId: row.schedule_id }), row.store_id, nowMs)
-        .run();
+      await insertAudit(db, {
+        actorId: row.created_by,
+        action: 'purchase_order.create_scheduled',
+        targetType: 'po_template',
+        targetId: String(row.template_id),
+        payload: { scheduleId: row.schedule_id },
+        storeId: row.store_id,
+        createdAt: nowMs,
+      });
     } catch (e) {
       console.error('runScheduledPoDrafts: template', row.template_id, 'failed', e);
     }

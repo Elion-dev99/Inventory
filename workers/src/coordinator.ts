@@ -10,6 +10,7 @@ import {
   stockConflict,
   stocktakeLocked,
 } from './lib/errors';
+import { buildAuditInsert } from './lib/audit-chain';
 
 /**
  * InventoryCoordinator — 在庫書き込みの単一窓口 (単一の Durable Object)。
@@ -291,6 +292,12 @@ export class InventoryCoordinator extends DurableObject<Env> {
     );
   }
 
+  /**
+   * 監査 1 件分の INSERT 文を作る (ハッシュチェーン付き、0017)。
+   * チェーンの prev 読取は非同期のため呼び出し側で await する。
+   * Coordinator の書き込みは runExclusive で直列化されるため、
+   * ここ経由の監査は競合なく単一チェーンに連なる。
+   */
   private auditStmt(
     actorId: number,
     action: string,
@@ -298,11 +305,16 @@ export class InventoryCoordinator extends DurableObject<Env> {
     targetId: string,
     payload: unknown,
     storeId: number | null,
-  ): D1PreparedStatement {
-    return this.env.DB.prepare(
-      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-    ).bind(actorId, action, targetType, targetId, JSON.stringify(payload), storeId, Date.now());
+  ): Promise<D1PreparedStatement> {
+    return buildAuditInsert(this.env.DB, {
+      actorId,
+      action,
+      targetType,
+      targetId,
+      payload,
+      storeId,
+      createdAt: Date.now(),
+    });
   }
 
   /**
@@ -605,7 +617,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
           .bind(...inBinds),
       );
       const body = { documentId, stockId: stock.id, quantity: after };
-      statements.push(this.auditStmt(input.actorId, auditAction, 'stock', String(stock.id), {
+      statements.push(await this.auditStmt(input.actorId, auditAction, 'stock', String(stock.id), {
         documentId,
         quantity: input.quantity,
       }, input.storeId));
@@ -659,7 +671,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     // 作成された stock の ID を引く (batch 実行前に body が要るため、実行後にもう一度引く)
     const bodyPlaceholder = { documentId, stockId: 0, quantity: input.quantity };
     statements.push(
-      this.auditStmt(input.actorId, auditAction, 'product', String(input.productId), {
+      await this.auditStmt(input.actorId, auditAction, 'product', String(input.productId), {
         documentId,
         quantity: input.quantity,
       }, input.storeId),
@@ -866,7 +878,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       ...(plan.usedApprovalId !== null ? { negativeApprovalId: plan.usedApprovalId } : {}),
     };
     statements.push(
-      this.auditStmt(input.actorId, input.auditAction ?? 'stock.consume', 'product', String(input.productId), {
+      await this.auditStmt(input.actorId, input.auditAction ?? 'stock.consume', 'product', String(input.productId), {
         documentId,
         quantity: input.quantity,
         ...(plan.usedApprovalId !== null ? { negativeApprovalId: plan.usedApprovalId } : {}),
@@ -1073,7 +1085,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     }
 
     statements.push(
-      this.auditStmt(input.actorId, 'stock.transfer', 'product', String(input.productId), {
+      await this.auditStmt(input.actorId, 'stock.transfer', 'product', String(input.productId), {
         documentId,
         fromLocationId: input.fromLocationId,
         toLocationId: input.toLocationId,
@@ -1273,7 +1285,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
     }
     const body = { documentId, groupId: documentId, allocations: bodyAllocations };
     statements.push(
-      this.auditStmt(input.actorId, 'stock.consume_bundle', 'product', String(input.bundleProductId), {
+      await this.auditStmt(input.actorId, 'stock.consume_bundle', 'product', String(input.bundleProductId), {
         documentId,
         quantity: input.quantity,
         components: plans.map((p) => ({ productId: p.productId, quantity: p.required })),
@@ -1561,7 +1573,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
       expected.set(idx, 1);
     }
     statements.push(
-      this.auditStmt(input.actorId, 'pick_list.confirm', 'pick_list', String(input.pickListId), {
+      await this.auditStmt(input.actorId, 'pick_list.confirm', 'pick_list', String(input.pickListId), {
         documentId,
         type: input.type,
         items: input.items.filter((i) => i.quantity > 0).length,
@@ -1670,12 +1682,12 @@ export class InventoryCoordinator extends DurableObject<Env> {
               )
               .bind(stocktakeId, input.storeId)
               .run();
-      await this.auditStmt(input.actorId, 'stocktake.start', 'stocktake', String(stocktakeId), {
+      await (await this.auditStmt(input.actorId, 'stocktake.start', 'stocktake', String(stocktakeId), {
         stocktakeId,
         scopeType,
         ...(scopeType === 'locations' ? { locationIds } : {}),
         blind,
-      }, input.storeId).run();
+      }, input.storeId)).run();
 
       const body = {
         id: stocktakeId,
@@ -1767,7 +1779,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
           ),
         );
         statements.push(
-          this.auditStmt(input.actorId, 'stocktake.finish', 'stocktake', String(input.stocktakeId), {
+          await this.auditStmt(input.actorId, 'stocktake.finish', 'stocktake', String(input.stocktakeId), {
             stocktakeId: input.stocktakeId,
             result: 'confirmed',
           }, input.storeId),
@@ -1798,7 +1810,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         ),
       );
       statements.push(
-        this.auditStmt(input.actorId, 'stocktake.finish', 'stocktake', String(input.stocktakeId), {
+        await this.auditStmt(input.actorId, 'stocktake.finish', 'stocktake', String(input.stocktakeId), {
           stocktakeId: input.stocktakeId,
           result: 'pending_approval',
           differences: diffs,
@@ -1877,7 +1889,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
           ),
         );
         statements.push(
-          this.auditStmt(input.actorId, 'stocktake.decide', 'stocktake', String(input.stocktakeId), {
+          await this.auditStmt(input.actorId, 'stocktake.decide', 'stocktake', String(input.stocktakeId), {
             stocktakeId: input.stocktakeId,
             approve: false,
           }, input.storeId),
@@ -1953,7 +1965,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
         ),
       );
       statements.push(
-        this.auditStmt(input.actorId, 'stocktake.decide', 'stocktake', String(input.stocktakeId), {
+        await this.auditStmt(input.actorId, 'stocktake.decide', 'stocktake', String(input.stocktakeId), {
           stocktakeId: input.stocktakeId,
           approve: true,
           documentId,

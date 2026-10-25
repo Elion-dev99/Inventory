@@ -43,6 +43,10 @@ const EXTRA_CSS = `
 /* 利用量の容量バー (単色のみ) */
 .usage-bar { height: 8px; background: var(--control); border-radius: 4px; overflow: hidden; margin: 0.4rem 0; }
 .usage-bar > div { height: 100%; background: var(--accent); }
+/* 再認証 (ステップアップ) のオーバーレイ。色は単色のみ */
+.stepup-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); z-index: 60; }
+.stepup-box { max-width: 24rem; margin: 14vh auto 0; background: var(--surface); border-radius: var(--r-md); box-shadow: var(--shadow); padding: 1.2rem 1.4rem; }
+.stepup-box h3 { margin-top: 0; }
 /* 中幅以下ではフォーム行を 1 カラムに積み、コントロールを全幅にする
    (.group-row は折り返しなしの flex のため、狭幅ではラベルが潰れ入力欄がはみ出す) */
 @media (max-width: 900px) {
@@ -89,7 +93,10 @@ export const CONSOLE_HTML = `<!doctype html>
 <p id="error" style="color: var(--danger); white-space: pre-wrap;"></p>
 <div id="loginGuide" class="section-box" style="display:none;">
   <p>ログインが必要です（セッションの有効期限は2時間です）。全体管理者だけがログインできます。</p>
-  <p><a class="btn" href="/auth/login">Google でログインする</a></p>
+  <p><a class="btn" href="/auth/login">Google でログインする</a>
+  <button class="btn secondary" id="passkeyLoginBtn" style="display:none;">Face IDでログイン</button></p>
+  <p class="small" id="passkeyLoginMsg" style="display:none; color: var(--danger);"></p>
+  <p class="small muted">パスキーはホストごとに登録が必要です。店舗アプリで登録したパスキーはこのコンソールでは使えません。このコンソール用のパスキーは、Google でログインした後に「システム」画面で登録してください。</p>
 </div>
 <div id="guide" class="section-box" style="display:none;">
   <p>この画面はシステム全体の管理者 (全体管理者) 専用です。店舗内の管理は店舗アプリの「権限管理」から行ってください。</p>
@@ -128,6 +135,11 @@ export const CONSOLE_HTML = `<!doctype html>
 
 <section id="sec-audit" class="console-sec" style="display:none;">
   <h2>監査ログ</h2>
+  <div class="group"><div class="group-row static">
+    <span class="row-label">整合性チェック <small class="muted">ハッシュチェーンで改ざんを検知します</small></span>
+    <button class="btn small secondary" id="auditIntegrityBtn">チェックする</button>
+    <span class="small" id="auditIntegrityResult"></span>
+  </div></div>
   <div class="group"><div class="group-row static">
     <label>店舗 <select id="auditStore"></select></label>
     <label>ユーザー <select id="auditUser"></select></label>
@@ -268,8 +280,29 @@ export const CONSOLE_HTML = `<!doctype html>
     <div class="group-row"><span class="row-label">全データエクスポート (全店舗)</span><a class="btn small" href="/api/platform/export.json">ダウンロード</a></div>
     <div class="group-row"><span class="row-label">全セッション失効 <small class="muted">自分のセッションは残ります</small></span><button class="btn small danger" id="revokeAllBtn">失効させる</button></div>
   </div>
+  <h3>セキュリティ</h3>
+  <h4>パスキー (このコンソール用)</h4>
+  <p class="small muted">パスキーはホストごとに登録が必要です。店舗アプリで登録したパスキーはこのコンソールでは使えません。</p>
+  <div class="group"><div class="group-row static">
+    <button class="btn small" id="passkeyRegisterBtn">このコンソール用にパスキーを登録</button>
+    <span class="small" id="passkeyMsg"></span>
+  </div></div>
+  <h4>自分のセッション</h4>
+  <p class="small muted">このコンソール (全体管理) のセッションだけを表示します。店舗アプリのセッションは店舗アプリのセキュリティ画面で管理してください。</p>
+  <div id="mySessions"><div class="skl skl-row"></div></div>
 </section>
   </main>
+</div>
+
+<div id="stepUpOverlay" class="stepup-overlay" style="display:none;">
+  <div class="stepup-box">
+    <h3>本人確認</h3>
+    <p class="small muted">この操作には再認証が必要です。</p>
+    <p><button class="btn" id="stepUpPasskeyBtn" style="display:none;">Face IDで認証</button>
+    <a class="btn secondary" href="/auth/login?stepup=1">Google で再ログイン</a></p>
+    <p class="small" id="stepUpMsg" style="display:none; color: var(--danger);"></p>
+    <p><button class="btn small secondary" id="stepUpCancelBtn">キャンセル</button></p>
+  </div>
 </div>
 
 <script>
@@ -283,15 +316,157 @@ function setStatus(msg) { el('status').textContent = msg; }
 function setError(msg) { el('error').textContent = msg; }
 function errText(e) { return String(e && e.message ? e.message : e); }
 async function api(path, opts) {
-  const headers = { 'Content-Type': 'application/json', ...((opts && opts.headers) || {}) };
-  const res = await fetch(path, { credentials: 'same-origin', ...(opts || {}), headers });
+  const src = opts || {};
+  const headers = { 'Content-Type': 'application/json', ...(src.headers || {}) };
+  const fetchOpts = { credentials: 'same-origin', method: src.method, body: src.body, headers };
+  const res = await fetch(path, fetchOpts);
   const text = await res.text();
   if (res.status === 401) {
     el('loginGuide').style.display = '';
     throw new Error('未ログインです。下のボタンからログインしてください。');
   }
+  if (res.status === 403 && !src.stepUpRetried) {
+    let code = '';
+    try { code = (JSON.parse(text) || {}).error || ''; } catch (e) { code = ''; }
+    if (code === 'STEP_UP_REQUIRED') {
+      // 重要操作の再認証: ダイアログで認証できたら元のリクエストを 1 回だけ再試行する
+      await requestStepUp();
+      return api(path, { ...src, stepUpRetried: true });
+    }
+  }
   if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text);
   return text ? JSON.parse(text) : null;
+}
+
+/* ---------------- パスキー / 再認証 (WebAuthn) ---------------- */
+function b64urlToBuf(text) {
+  const b64 = String(text).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob(padded);
+  const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function bufToB64url(buf) {
+  const u = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  s = btoa(s).split('+').join('-').split('/').join('_');
+  while (s.charAt(s.length - 1) === '=') s = s.slice(0, -1);
+  return s;
+}
+function passkeySupported() {
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.get && navigator.credentials.create);
+}
+function assertionBody(cred) {
+  const r = cred.response;
+  return {
+    credentialId: cred.id,
+    authenticatorData: bufToB64url(r.authenticatorData),
+    clientDataJSON: bufToB64url(r.clientDataJSON),
+    signature: bufToB64url(r.signature),
+  };
+}
+function getPasskeyAssertion(opts) {
+  return navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBuf(opts.challenge),
+      rpId: opts.rpId,
+      userVerification: opts.userVerification || 'required',
+      timeout: opts.timeout,
+    },
+  });
+}
+/* ログインページの「Face IDでログイン」 */
+async function passkeyLogin() {
+  const msg = el('passkeyLoginMsg');
+  function fail(text) { if (msg) { msg.textContent = text; msg.style.display = ''; } }
+  if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
+  if (msg) msg.style.display = 'none';
+  try {
+    const opts = await api('/api/platform/auth/passkey/login/options', { method: 'POST', body: '{}' });
+    const cred = await getPasskeyAssertion(opts);
+    if (!cred) { fail('キャンセルされました'); return; }
+    await api('/api/platform/auth/passkey/login/verify', { method: 'POST', body: JSON.stringify(assertionBody(cred)) });
+    location.reload();
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') { fail('キャンセルされました'); return; }
+    if (String(e && e.message ? e.message : e).indexOf('PLATFORM_ADMIN_REQUIRED') >= 0) {
+      fail('全体管理者の権限がありません');
+      return;
+    }
+    fail('ログインできませんでした');
+  }
+}
+/* システム画面の「このコンソール用にパスキーを登録」 */
+async function doPasskeyRegister() {
+  const msg = el('passkeyMsg');
+  function fail(t) { if (msg) msg.textContent = t; }
+  if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
+  if (msg) msg.textContent = '';
+  try {
+    const opts = await api('/api/platform/auth/passkey/register/options', { method: 'POST', body: '{}' });
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        challenge: b64urlToBuf(opts.challenge),
+        rp: opts.rp,
+        user: { id: b64urlToBuf(opts.user.id), name: opts.user.name, displayName: opts.user.displayName },
+        pubKeyCredParams: opts.pubKeyCredParams,
+        timeout: opts.timeout,
+        attestation: opts.attestation,
+        authenticatorSelection: opts.authenticatorSelection,
+        excludeCredentials: (opts.excludeCredentials || []).map((x) => ({ type: x.type, id: b64urlToBuf(x.id), transports: x.transports })),
+      },
+    });
+    if (!cred) { fail('キャンセルされました'); return; }
+    const r = cred.response;
+    await api('/api/platform/auth/passkey/register/verify', {
+      method: 'POST',
+      body: JSON.stringify({
+        credentialId: cred.id,
+        attestationObject: bufToB64url(r.attestationObject),
+        clientDataJSON: bufToB64url(r.clientDataJSON),
+        transports: r.getTransports ? r.getTransports() : [],
+      }),
+    });
+    fail('登録しました');
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') { fail('キャンセルされました'); return; }
+    fail('登録できませんでした');
+  }
+}
+/* ---- 再認証 (ステップアップ) ダイアログ ---- */
+let stepUpWaiters = [];
+function requestStepUp() {
+  return new Promise((resolve, reject) => {
+    stepUpWaiters.push({ resolve, reject });
+    el('stepUpMsg').style.display = 'none';
+    el('stepUpPasskeyBtn').style.display = passkeySupported() ? '' : 'none';
+    el('stepUpOverlay').style.display = '';
+  });
+}
+function settleStepUp(ok) {
+  const ws = stepUpWaiters;
+  stepUpWaiters = [];
+  el('stepUpOverlay').style.display = 'none';
+  for (const w of ws) {
+    if (ok) w.resolve();
+    else w.reject(new Error('再認証をキャンセルしました'));
+  }
+}
+async function doPasskeyStepUp() {
+  const msg = el('stepUpMsg');
+  function fail() { if (msg) { msg.textContent = '認証できませんでした'; msg.style.display = ''; } }
+  try {
+    const opts = await api('/api/platform/auth/passkey/step-up/options', { method: 'POST', body: '{}' });
+    const cred = await getPasskeyAssertion(opts);
+    if (!cred) { fail(); return; }
+    await api('/api/platform/auth/step-up/passkey', { method: 'POST', body: JSON.stringify(assertionBody(cred)) });
+    settleStepUp(true);
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') return;
+    fail();
+  }
 }
 
 let myId = null;
@@ -704,6 +879,79 @@ async function loadSystem() {
   loadMaintenance();
   loadUsage();
   loadBackups();
+  loadMySessions();
+}
+
+/* ---------------- 自分のセッション (platform スコープ) ---------------- */
+function uaShortLabel(ua) {
+  const s = String(ua || '');
+  let os = '端末';
+  if (s.indexOf('iPhone') >= 0) os = 'iPhone';
+  else if (s.indexOf('iPad') >= 0) os = 'iPad';
+  else if (s.indexOf('Android') >= 0) os = 'Android';
+  else if (s.indexOf('Macintosh') >= 0 || s.indexOf('Mac OS') >= 0) os = 'Mac';
+  else if (s.indexOf('Windows') >= 0) os = 'Windows';
+  else if (s.indexOf('Linux') >= 0) os = 'Linux';
+  let br = '';
+  if (s.indexOf('Edg') >= 0) br = 'Edge';
+  else if (s.indexOf('Chrome') >= 0 || s.indexOf('CriOS') >= 0) br = 'Chrome';
+  else if (s.indexOf('Firefox') >= 0 || s.indexOf('FxiOS') >= 0) br = 'Firefox';
+  else if (s.indexOf('Safari') >= 0) br = 'Safari';
+  return br ? os + ' ' + br : os;
+}
+async function loadMySessions() {
+  const box = el('mySessions');
+  if (!box) return;
+  try {
+    const list = await api('/api/platform/auth/sessions');
+    if (!Array.isArray(list) || list.length === 0) {
+      box.innerHTML = '<p class="small muted">有効なセッションがありません。</p>';
+      return;
+    }
+    let html = '<div class="table-wrap"><table><thead><tr><th>作成</th><th>最終利用</th><th>端末</th><th>IP</th><th></th></tr></thead><tbody>';
+    for (const s of list) {
+      html += '<tr><td>' + fmtDate(s.createdAt) + '</td><td>' + fmtDate(s.lastSeenAt) + '</td>' +
+        '<td>' + esc(uaShortLabel(s.userAgent)) + '</td><td>' + esc(s.ip || '') + '</td><td style="white-space:nowrap;">' +
+        (s.current
+          ? '<span class="small muted">現在のセッション</span>'
+          : '<button class="btn small danger" data-revoke-session="' + s.id + '">失効</button>') +
+        '</td></tr>';
+    }
+    box.innerHTML = html + '</tbody></table></div>';
+    box.querySelectorAll('button[data-revoke-session]').forEach((btn) => {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await api('/api/platform/auth/sessions/' + btn.dataset.revokeSession, { method: 'DELETE' });
+          loadMySessions();
+        } catch (e) {
+          setError(errText(e));
+          btn.disabled = false;
+        }
+      };
+    });
+  } catch (e) {
+    box.innerHTML = '<p class="small muted">セッション一覧を取得できませんでした: ' + esc(errText(e)) + '</p>';
+  }
+}
+
+/* ---------------- 監査の整合性チェック ---------------- */
+async function checkAuditIntegrity() {
+  const out = el('auditIntegrityResult');
+  out.textContent = '確認中…';
+  try {
+    const res = await api('/api/platform/audit-integrity');
+    if (res.ok) {
+      out.textContent = '整合性 OK (検証 ' + res.checked + ' 件)';
+      out.style.color = 'var(--ok)';
+    } else {
+      out.textContent = '不整合を検出しました (行 ID ' + res.brokenAtId + ' 以降が改ざんされている可能性があります)';
+      out.style.color = 'var(--danger)';
+    }
+  } catch (e) {
+    out.textContent = 'チェックできませんでした: ' + errText(e);
+    out.style.color = 'var(--danger)';
+  }
 }
 
 /* ---------------- 利用量 ---------------- */
@@ -1394,6 +1642,12 @@ el('mntAddBtn').onclick = addWindow;
 el('revokeAllBtn').onclick = revokeAllSessions;
 el('backupCreateBtn').onclick = createBackupNow;
 el('annCreateBtn').onclick = createAnnouncement;
+el('auditIntegrityBtn').onclick = checkAuditIntegrity;
+el('passkeyRegisterBtn').onclick = doPasskeyRegister;
+el('stepUpPasskeyBtn').onclick = doPasskeyStepUp;
+el('stepUpCancelBtn').onclick = () => settleStepUp(false);
+el('passkeyLoginBtn').onclick = passkeyLogin;
+if (passkeySupported()) el('passkeyLoginBtn').style.display = '';
 loadAll();
 </script>
 </body>

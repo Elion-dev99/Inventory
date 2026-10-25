@@ -194,6 +194,19 @@ function uuid() {
 }
 function api(path, opts) {
   opts = opts || {};
+  return apiOnce(path, opts).catch(function (err) {
+    /* 重要操作の再認証要求: シートで再認証できたら元のリクエストを 1 回だけ再試行する */
+    if (err && err.code === 'STEP_UP_REQUIRED' && !opts.stepUpRetried) {
+      return requestStepUp().then(function () {
+        opts.stepUpRetried = true;
+        return apiOnce(path, opts);
+      });
+    }
+    throw err;
+  });
+}
+function apiOnce(path, opts) {
+  opts = opts || {};
   var headers = { 'Content-Type': 'application/json' };
   if (opts.headers) { for (var k in opts.headers) headers[k] = opts.headers[k]; }
   var init = { method: opts.method || 'GET', headers: headers, credentials: 'same-origin' };
@@ -313,8 +326,10 @@ function errMsg(e) {
     return e.endsAt ? mbase + '（' + fmtEndText(e.endsAt) + '）' : mbase + '（終了未定）';
   }
   if (e && e.status === 423) return '棚卸し実施中のため、この操作は停止しています (423)。棚卸しが終了するまでお待ちください。';
-  if (e && e.code === 'STORE_SUSPENDED') return 'この店舗は現在停止中です。全体管理者に連絡してください。';
+  if (e && e.code === 'STORE_SUSPENDED') return 'この店舗は現在停止中です。';
   if (e && e.code === 'STORE_NOT_SELECTED') return '店舗が選択されていません。画面を再読み込みして、店舗を選んでください。';
+  if (e && e.code === 'STEP_UP_REQUIRED') return '再認証が必要です。';
+  if (e && e.code === 'STEP_UP_CANCELLED') return '再認証がキャンセルされました。';
   return e && e.message ? e.message : String(e);
 }
 function msgHtml(kind, text) {
@@ -517,6 +532,7 @@ var VIEWS = [
   { id: 'reservations', label: '引当', visible: function () { return can('movements.consume'); } },
   { id: 'picking', label: 'ピッキング', visible: function () { return can('movements.consume') || can('movements.transfer'); } },
   { id: 'setup', label: 'はじめに', visible: function () { return (can('admin.users') || can('master.write')) && can('master.read'); } },
+  { id: 'security', label: 'セキュリティ', visible: function () { return true; } },
 ];
 function viewDef(id) { for (var i = 0; i < VIEWS.length; i++) { if (VIEWS[i].id === id) return VIEWS[i]; } return null; }
 function viewVisible(id) { var v = viewDef(id); return v ? v.visible() : false; }
@@ -551,7 +567,7 @@ function icon(name, size) {
 
 /* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
 var RECORD_VIEWS = ['inbound', 'consume', 'transfer', 'returns', 'disposal'];
-var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup'];
+var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup', 'security'];
 function tabOf(view) {
   if (view === 'dashboard') return 'dashboard';
   if (view === 'stocks') return 'stocks';
@@ -625,7 +641,19 @@ function openSheet() {
     rows[j].onclick = function () { closeSheet(); showView(this.getAttribute('data-view')); };
   }
 }
-function closeSheet() { el('sheetOverlay').style.display = 'none'; }
+function closeSheet() {
+  el('sheetOverlay').style.display = 'none';
+  /* 再認証シートを閉じたら、待ち中のリクエストはキャンセルとして落とす */
+  if (typeof stepUpWaiters !== 'undefined' && stepUpWaiters.length) {
+    var ws = stepUpWaiters;
+    stepUpWaiters = [];
+    for (var i = 0; i < ws.length; i++) {
+      var ce = new Error('step up cancelled');
+      ce.code = 'STEP_UP_CANCELLED';
+      ws[i].reject(ce);
+    }
+  }
+}
 /* ---------------- お知らせ ---------------- */
 function announcePeriodText(a) {
   var s = fmtDateTime(a.startsAt);
@@ -923,6 +951,7 @@ var MORE_ITEMS = [
   { view: 'announcements', icon: 'mega', color: '#ff9500', label: 'お知らせ', maintKeys: [] },
   { view: 'announceAdmin', icon: 'mega', color: '#64d2ff', label: 'お知らせ管理', maintKeys: [] },
   { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ', maintKeys: [] },
+  { view: 'security', icon: 'shield', color: '#636366', label: 'セキュリティ', maintKeys: [] },
 ];
 function loadMore() {
   var h = '<h2>その他</h2>';
@@ -982,6 +1011,7 @@ function showView(id) {
     reservations: loadReservations,
     picking: loadPicking,
     setup: loadSetup,
+    security: loadSecurity,
     more: loadMore,
   };
   var fn = loaders[id];
@@ -4530,6 +4560,255 @@ function renderStoreSwitch(me) {
 }
 
 /* ---------------- boot ---------------- */
+/* ---------------- パスキー (WebAuthn / Face ID) と再認証 ---------------- */
+function b64urlToBuf(s) {
+  var b = String(s).split('-').join('+').split('_').join('/');
+  while (b.length % 4) b += '=';
+  var bin = atob(b);
+  var u = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function bufToB64url(buf) {
+  var u = new Uint8Array(buf);
+  var s = '';
+  for (var i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  s = btoa(s).split('+').join('-').split('/').join('_');
+  while (s.charAt(s.length - 1) === '=') s = s.slice(0, -1);
+  return s;
+}
+function passkeySupported() {
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.get && navigator.credentials.create);
+}
+function uaShortLabel(ua) {
+  var s = String(ua || '');
+  var os = '端末';
+  if (s.indexOf('iPhone') >= 0) os = 'iPhone';
+  else if (s.indexOf('iPad') >= 0) os = 'iPad';
+  else if (s.indexOf('Android') >= 0) os = 'Android';
+  else if (s.indexOf('Macintosh') >= 0 || s.indexOf('Mac OS') >= 0) os = 'Mac';
+  else if (s.indexOf('Windows') >= 0) os = 'Windows';
+  else if (s.indexOf('Linux') >= 0) os = 'Linux';
+  var br = '';
+  if (s.indexOf('Edg') >= 0) br = 'Edge';
+  else if (s.indexOf('Chrome') >= 0 || s.indexOf('CriOS') >= 0) br = 'Chrome';
+  else if (s.indexOf('Firefox') >= 0 || s.indexOf('FxiOS') >= 0) br = 'Firefox';
+  else if (s.indexOf('Safari') >= 0) br = 'Safari';
+  return br ? os + ' ' + br : os;
+}
+function assertionBody(cred) {
+  var r = cred.response;
+  return {
+    credentialId: cred.id,
+    authenticatorData: bufToB64url(r.authenticatorData),
+    clientDataJSON: bufToB64url(r.clientDataJSON),
+    signature: bufToB64url(r.signature),
+  };
+}
+function getPasskeyAssertion(opts) {
+  return navigator.credentials.get({
+    publicKey: {
+      challenge: b64urlToBuf(opts.challenge),
+      rpId: opts.rpId,
+      userVerification: opts.userVerification || 'required',
+      timeout: opts.timeout,
+    },
+  });
+}
+/* ログインページの「Face IDでログイン」 */
+function passkeyLogin() {
+  var msg = el('passkeyLoginMsg');
+  function fail(text) { if (msg) { msg.textContent = text; msg.style.display = ''; } }
+  if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
+  if (msg) msg.style.display = 'none';
+  apiOnce('/api/v1/auth/passkey/login/options', { method: 'POST', body: {} }).then(function (opts) {
+    return getPasskeyAssertion(opts);
+  }).then(function (cred) {
+    if (!cred) { fail('キャンセルされました'); return null; }
+    return apiOnce('/api/v1/auth/passkey/login/verify', { method: 'POST', body: assertionBody(cred) });
+  }).then(function (res) {
+    if (res) location.reload();
+  }).catch(function (e) {
+    if (e && e.name === 'NotAllowedError') { fail('キャンセルされました'); return; }
+    if (e && e.status === 503 && e.code === 'MAINTENANCE') { fail(e.message); return; }
+    fail('ログインできませんでした');
+  });
+}
+/* パスキー登録 (セキュリティ画面) */
+function doPasskeyRegister() {
+  var msg = el('passkeyMsg');
+  function fail(t) { if (msg) msg.innerHTML = msgHtml('error', t); }
+  if (!passkeySupported()) { fail('この端末ではパスキーを使えません'); return; }
+  if (msg) msg.innerHTML = '';
+  api('/api/v1/auth/passkey/register/options', { method: 'POST', body: {} }).then(function (opts) {
+    return navigator.credentials.create({
+      publicKey: {
+        challenge: b64urlToBuf(opts.challenge),
+        rp: opts.rp,
+        user: { id: b64urlToBuf(opts.user.id), name: opts.user.name, displayName: opts.user.displayName },
+        pubKeyCredParams: opts.pubKeyCredParams,
+        timeout: opts.timeout,
+        attestation: opts.attestation,
+        authenticatorSelection: opts.authenticatorSelection,
+        excludeCredentials: (opts.excludeCredentials || []).map(function (x) {
+          return { type: x.type, id: b64urlToBuf(x.id), transports: x.transports };
+        }),
+      },
+    });
+  }).then(function (cred) {
+    if (!cred) { fail('キャンセルされました'); return null; }
+    var r = cred.response;
+    return api('/api/v1/auth/passkey/register/verify', {
+      method: 'POST',
+      body: {
+        credentialId: cred.id,
+        attestationObject: bufToB64url(r.attestationObject),
+        clientDataJSON: bufToB64url(r.clientDataJSON),
+        transports: r.getTransports ? r.getTransports() : [],
+      },
+    });
+  }).then(function (res) {
+    if (res) loadSecurity();
+  }).catch(function (e) {
+    if (e && e.name === 'NotAllowedError') { fail('キャンセルされました'); return; }
+    fail('登録できませんでした');
+  });
+}
+/* ---- 再認証 (ステップアップ) ---- */
+var stepUpWaiters = [];
+function requestStepUp() {
+  return new Promise(function (resolve, reject) {
+    stepUpWaiters.push({ resolve: resolve, reject: reject });
+    renderStepUpSheet();
+  });
+}
+function settleStepUp(ok) {
+  var ws = stepUpWaiters;
+  stepUpWaiters = [];
+  closeSheet();
+  for (var i = 0; i < ws.length; i++) {
+    if (ok) ws[i].resolve();
+    else {
+      var ce = new Error('step up cancelled');
+      ce.code = 'STEP_UP_CANCELLED';
+      ws[i].reject(ce);
+    }
+  }
+}
+function renderStepUpSheet() {
+  var h = '<div class="sheet-title">本人確認</div>';
+  h += '<p class="muted" style="padding:0 4px">この操作には再認証が必要です。</p>';
+  if (passkeySupported()) {
+    h += '<button class="sheet-row" id="stepUpPasskeyBtn"><span class="row-icon" style="background:#636366">' + icon('shield', 18) + '</span><span class="row-label">Face IDで認証</span></button>';
+  }
+  h += '<a class="sheet-row" href="/auth/login?stepup=1"><span class="row-icon" style="background:#0071e3">' + icon('shield', 18) + '</span><span class="row-label">Google で再ログイン</span></a>';
+  h += '<p class="small danger" id="stepUpMsg" style="display:none"></p>';
+  el('sheetBox').innerHTML = h;
+  el('sheetOverlay').style.display = '';
+  var b = el('stepUpPasskeyBtn');
+  if (b) b.onclick = doPasskeyStepUp;
+}
+function doPasskeyStepUp() {
+  var msg = el('stepUpMsg');
+  function fail() { if (msg) { msg.textContent = '認証できませんでした'; msg.style.display = ''; } }
+  apiOnce('/api/v1/auth/passkey/step-up/options', { method: 'POST', body: {} }).then(function (opts) {
+    return getPasskeyAssertion(opts);
+  }).then(function (cred) {
+    if (!cred) { fail(); return null; }
+    return apiOnce('/api/v1/auth/step-up/passkey', { method: 'POST', body: assertionBody(cred) });
+  }).then(function (res) {
+    if (res) settleStepUp(true);
+  }).catch(function (e) {
+    if (e && e.name === 'NotAllowedError') return;
+    fail();
+  });
+}
+/* ---- セキュリティ画面 (その他タブ) ---- */
+function loadSecurity() {
+  viewLoading('セキュリティ');
+  Promise.all([
+    api('/api/v1/auth/passkey/credentials').catch(function () { return null; }),
+    api('/api/v1/auth/sessions').catch(function () { return null; }),
+    api('/api/v1/auth/login-events').catch(function () { return null; }),
+  ]).then(function (r) {
+    renderSecurity(r[0], r[1], r[2]);
+  });
+}
+function renderSecurity(creds, sessions, events) {
+  var h = '<h2>セキュリティ</h2>';
+  /* パスキー */
+  h += '<h3>パスキー</h3>';
+  h += '<p class="small muted">' + (passkeySupported() ? 'この端末で使えます' : 'この端末では使えません') + '</p>';
+  h += '<div id="passkeyMsg"></div>';
+  h += '<div class="group">';
+  var list = creds || [];
+  if (!creds) {
+    h += '<div class="group-row static"><span class="row-label muted">読み込めませんでした</span></div>';
+  } else if (list.length === 0) {
+    h += '<div class="group-row static"><span class="row-label muted">登録済みのパスキーはありません</span></div>';
+  } else {
+    for (var i = 0; i < list.length; i++) {
+      var pk = list[i];
+      h += '<div class="group-row static"><span class="row-label">' + esc(pk.label || 'パスキー') +
+        '<br><span class="small muted">登録: ' + fmtDateTime(pk.createdAt) + ' / 最終利用: ' + (pk.lastUsedAt ? fmtDateTime(pk.lastUsedAt) : '未使用') + '</span></span>' +
+        '<button class="btn small danger" data-del-passkey="' + pk.id + '">削除</button></div>';
+    }
+  }
+  h += '</div>';
+  h += '<p><button class="btn" id="passkeyRegisterBtn"' + (passkeySupported() ? '' : ' disabled') + '>パスキーを登録</button></p>';
+  /* セッション */
+  h += '<h3>セッション</h3><div class="group">';
+  var ss = sessions || [];
+  if (!sessions) {
+    h += '<div class="group-row static"><span class="row-label muted">読み込めませんでした</span></div>';
+  } else if (ss.length === 0) {
+    h += '<div class="group-row static"><span class="row-label muted">セッションはありません</span></div>';
+  } else {
+    for (var j = 0; j < ss.length; j++) {
+      var s = ss[j];
+      h += '<div class="group-row static"><span class="row-label">' + esc(uaShortLabel(s.userAgent)) +
+        (s.current ? ' <span class="badge">現在のセッション</span>' : '') +
+        '<br><span class="small muted">作成: ' + fmtDateTime(s.createdAt) + ' / 最終利用: ' + fmtDateTime(s.lastSeenAt || s.createdAt) + (s.ip ? ' / IP: ' + esc(s.ip) : '') + '</span></span>' +
+        (s.current ? '' : '<button class="btn small secondary" data-revoke-session="' + s.id + '">失効</button>') + '</div>';
+    }
+  }
+  h += '</div>';
+  /* ログイン履歴 */
+  h += '<h3>ログイン履歴</h3><div class="group">';
+  var evs = events || [];
+  if (!events) {
+    h += '<div class="group-row static"><span class="row-label muted">読み込めませんでした</span></div>';
+  } else if (evs.length === 0) {
+    h += '<div class="group-row static"><span class="row-label muted">履歴はありません</span></div>';
+  } else {
+    for (var k = 0; k < evs.length; k++) {
+      var ev = evs[k];
+      h += '<div class="group-row static"><span class="row-label">' + (ev.method === 'passkey' ? 'パスキー' : 'Google') + ' / ' + esc(ev.deviceLabel || uaShortLabel(ev.userAgent)) +
+        '<br><span class="small muted">' + fmtDateTime(ev.createdAt) + (ev.ip ? ' / IP: ' + esc(ev.ip) : '') + '</span></span></div>';
+    }
+  }
+  h += '</div>';
+  el('view').innerHTML = h;
+  var reg = el('passkeyRegisterBtn');
+  if (reg) reg.onclick = doPasskeyRegister;
+  var dels = el('view').querySelectorAll('button[data-del-passkey]');
+  for (var d = 0; d < dels.length; d++) {
+    dels[d].onclick = function () {
+      var id = this.getAttribute('data-del-passkey');
+      api('/api/v1/auth/passkey/credentials/' + id, { method: 'DELETE' }).then(function () { loadSecurity(); })
+        .catch(function (e) { el('passkeyMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+  }
+  var revs = el('view').querySelectorAll('button[data-revoke-session]');
+  for (var v = 0; v < revs.length; v++) {
+    revs[v].onclick = function () {
+      var id = this.getAttribute('data-revoke-session');
+      api('/api/v1/auth/sessions/' + id, { method: 'DELETE' }).then(function () { loadSecurity(); })
+        .catch(function (e) { el('passkeyMsg').innerHTML = msgHtml('error', errMsg(e)); });
+    };
+  }
+}
+
 function boot() {
   el('sheetOverlay').addEventListener('click', function (e) { if (e.target === this) closeSheet(); });
   el('sheetCancel').onclick = closeSheet;
@@ -4588,6 +4867,12 @@ function boot() {
       el('loadingBox').style.display = '';
       boot();
     };
+  }
+  var pkLoginBtn = el('passkeyLoginBtn');
+  if (pkLoginBtn) {
+    /* パスキー非対応の端末ではボタンを出さない (Google ログインのみ) */
+    if (!passkeySupported()) pkLoginBtn.style.display = 'none';
+    pkLoginBtn.onclick = passkeyLogin;
   }
 }
 document.addEventListener('DOMContentLoaded', boot);

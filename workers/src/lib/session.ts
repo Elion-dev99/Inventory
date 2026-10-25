@@ -45,6 +45,65 @@ export interface CreateSessionOptions {
   scope?: SessionScope;
   /** 有効期限 (ミリ秒)。既定はスコープごとの標準値 */
   ttlMs?: number;
+  /** 発行時の User-Agent (0017。セッション管理画面での端末表示用) */
+  userAgent?: string | null;
+  /** 発行時のクライアント IP (0017) */
+  ip?: string | null;
+}
+
+interface SessionInsert {
+  tokenHash: string;
+  userId: number;
+  expiresAt: number;
+  createdAt: number;
+  /** null = 列自体を指定しない (店舗アプリ用。既定値 'app' が入る) */
+  scope: SessionScope | null;
+  userAgent: string | null;
+  ip: string | null;
+}
+
+/**
+ * セッション行を挿入する。0017 の列 (user_agent / ip / last_seen_at /
+ * step_up_at) を含む完全形を試し、未適用環境では従来形にフォールバック
+ * する。ログイン行為自体を「直近の強い認証」として扱うため、
+ * step_up_at は発行時刻で打つ (重要操作の再認証はログイン直後なら不要)。
+ */
+async function insertSessionRow(db: D1Database, row: SessionInsert): Promise<void> {
+  try {
+    if (row.scope !== null) {
+      await db
+        .prepare(
+          `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, scope, user_agent, ip, last_seen_at, step_up_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)`,
+        )
+        .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt, row.scope, row.userAgent, row.ip, row.createdAt)
+        .run();
+    } else {
+      await db
+        .prepare(
+          `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, user_agent, ip, last_seen_at, step_up_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)`,
+        )
+        .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt, row.userAgent, row.ip, row.createdAt)
+        .run();
+    }
+    return;
+  } catch {
+    // 0017 未適用の環境では従来形で挿入する
+  }
+  if (row.scope !== null) {
+    await db
+      .prepare(
+        'INSERT INTO sessions (token_hash, user_id, expires_at, created_at, scope) VALUES (?1, ?2, ?3, ?4, ?5)',
+      )
+      .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt, row.scope)
+      .run();
+  } else {
+    await db
+      .prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)')
+      .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt)
+      .run();
+  }
 }
 
 /** セッションを発行してトークン本体を返す (DB にはハッシュのみ) */
@@ -62,18 +121,26 @@ export async function createSession(
   const tokenHash = await hashSessionToken(token);
   if (scope === 'platform') {
     // scope 列 (migration 0009) が必須。店舗の自動選択も行わない。
-    await db
-      .prepare(
-        'INSERT INTO sessions (token_hash, user_id, expires_at, created_at, scope) VALUES (?1, ?2, ?3, ?4, ?5)',
-      )
-      .bind(tokenHash, userId, now + ttlMs, now, scope)
-      .run();
+    await insertSessionRow(db, {
+      tokenHash,
+      userId,
+      expiresAt: now + ttlMs,
+      createdAt: now,
+      scope,
+      userAgent: options.userAgent ?? null,
+      ip: options.ip ?? null,
+    });
     return token;
   }
-  await db
-    .prepare('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)')
-    .bind(tokenHash, userId, now + ttlMs, now)
-    .run();
+  await insertSessionRow(db, {
+    tokenHash,
+    userId,
+    expiresAt: now + ttlMs,
+    createdAt: now,
+    scope: null,
+    userAgent: options.userAgent ?? null,
+    ip: options.ip ?? null,
+  });
   // 入れる店舗が 1 つだけなら、その店舗を選択済みにして発行する
   // (複数店舗に所属する場合は未選択のままにし、/app が選択画面を出す)
   try {
@@ -224,6 +291,21 @@ export async function resolveSessionUser(
   if (row.scope !== expectedScope) return null;
   if (row.status !== 'active') return null;
 
+  // 最終利用日時の更新 (0017)。D1 の書き込み枠を食わないよう、
+  // 前回更新から 1 時間以上空いたときだけ書く。列が無い環境では黙って諦める。
+  try {
+    const now = Date.now();
+    await db
+      .prepare(
+        `UPDATE sessions SET last_seen_at = ?1
+          WHERE token_hash = ?2 AND (last_seen_at IS NULL OR last_seen_at < ?3)`,
+      )
+      .bind(now, tokenHash, now - LAST_SEEN_UPDATE_INTERVAL_MS)
+      .run();
+  } catch {
+    // last_seen_at 未適用の環境
+  }
+
   const { results } = await db
     .prepare('SELECT role_code, warehouse_id, store_id FROM user_roles WHERE user_id = ?1')
     .bind(row.id)
@@ -243,6 +325,70 @@ export async function resolveSessionUser(
     sessionScope: row.scope === 'platform' ? 'platform' : 'app',
     viaSession: true,
   };
+}
+
+/** last_seen_at の更新間隔 (これより新しい間は書き込まない) */
+export const LAST_SEEN_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+
+/** 重要操作の再認証 (ステップアップ) を有効とみなす時間 */
+export const STEP_UP_WINDOW_MS = 10 * 60 * 1000;
+
+export interface CurrentSessionRow {
+  id: number;
+  userId: number;
+  createdAt: number;
+  stepUpAt: number | null;
+}
+
+/**
+ * 現在のリクエストの Cookie に対応するセッション行 (id と step_up_at)。
+ * セッション管理・ステップアップ判定用。0017 の列が無い環境では
+ * stepUpAt は null として返す (行自体は従来列だけで引く)。
+ */
+export async function currentSessionRow(
+  db: D1Database,
+  request: Request,
+  cookieName: string = SESSION_COOKIE_NAME,
+): Promise<CurrentSessionRow | null> {
+  const token = readSessionToken(request, cookieName);
+  if (!token) return null;
+  const tokenHash = await hashSessionToken(token);
+  try {
+    const row = await db
+      .prepare(
+        'SELECT id, user_id, created_at, step_up_at FROM sessions WHERE token_hash = ?1',
+      )
+      .bind(tokenHash)
+      .first<{ id: number; user_id: number; created_at: number; step_up_at: number | null }>();
+    if (!row) return null;
+    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: row.step_up_at };
+  } catch {
+    const row = await db
+      .prepare('SELECT id, user_id, created_at FROM sessions WHERE token_hash = ?1')
+      .bind(tokenHash)
+      .first<{ id: number; user_id: number; created_at: number }>();
+    if (!row) return null;
+    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: null };
+  }
+}
+
+/** 現在のセッションに step_up_at を打つ。対象が無ければ false */
+export async function markSessionStepUp(
+  db: D1Database,
+  request: Request,
+  cookieName: string = SESSION_COOKIE_NAME,
+): Promise<boolean> {
+  const token = readSessionToken(request, cookieName);
+  if (!token) return false;
+  try {
+    const res = await db
+      .prepare('UPDATE sessions SET step_up_at = ?1 WHERE token_hash = ?2')
+      .bind(Date.now(), await hashSessionToken(token))
+      .run();
+    return res.meta.changes > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** ログアウト: Cookie に対応するセッション行を削除する */

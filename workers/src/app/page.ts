@@ -32,8 +32,10 @@ export const APP_HTML = `<!doctype html>
 <div id="loginBox" class="center-box" style="display:none">
   <img class="app-icon-lg" src="/icons/icon-512.png" alt="">
   <h2>ログインが必要です</h2>
-  <p class="muted">在庫管理システムを利用するには Google アカウントでログインしてください。</p>
-  <p><a class="btn" href="/auth/login">Google でログイン</a></p>
+  <p class="muted">在庫管理システムを利用するにはログインしてください。</p>
+  <p><button class="btn" id="passkeyLoginBtn" type="button">Face IDでログイン</button></p>
+  <p><a class="btn secondary" href="/auth/login">Google でログイン</a></p>
+  <p class="small danger" id="passkeyLoginMsg" style="display:none"></p>
 </div>
 
 <div id="errorBox" class="center-box" style="display:none">

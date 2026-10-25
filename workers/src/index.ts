@@ -47,10 +47,33 @@ import {
 import {
   clearSessionCookieHeader,
   createSession,
+  currentSessionRow,
   destroySession,
+  hashSessionToken,
+  markSessionStepUp,
+  readSessionToken,
+  resolveSessionUser,
   sessionCookieHeader,
   setSessionStore,
+  STEP_UP_WINDOW_MS,
 } from './lib/session';
+import { buildAuditInsert, insertAudit, verifyAuditChain } from './lib/audit-chain';
+import {
+  base64UrlDecode,
+  base64UrlEncode,
+  checkClientData,
+  consumeChallenge,
+  coseEc2ToJwk,
+  issueChallenge,
+  parseAttestationObject,
+  parseAuthenticatorData,
+  parseClientData,
+  sha256Bytes,
+  bytesEqual,
+  verifyAssertionSignature,
+  verifyAttestationSignature,
+} from './lib/webauthn';
+import { clientIp, recordLoginEvent } from './lib/login-events';
 import { APP_HTML } from './app/page';
 import { APP_CSS } from './app/styles';
 import { PWA_HEAD, manifestResponse, iconResponse, serviceWorkerResponse } from './pwa';
@@ -168,6 +191,73 @@ type Variables = {
 type AppContext = Context<{ Bindings: Env; Variables: Variables }>;
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+// -------------------------------------------------- セキュリティ基盤 (0017)
+// 全レスポンスへセキュリティヘッダを付け、/api/v1 の状態変更リクエストには
+// Origin チェックを行う (CSRF の多層防御。一次防御は Cookie の SameSite=Lax)。
+// CSP の緩和点:
+// - script-src の 'unsafe-inline': /app 等の単一 HTML がインラインスクリプト
+//   で構成されるため (nonce 化は将来課題)。
+// - script-src / frame-src の accounts.google.com: /login の Google
+//   Identity Services ボタン (外部スクリプト + iframe) 用。
+// - 'wasm-unsafe-eval': スキャンエンジン (zxing-wasm) のコンパイル用。
+const CSP_VALUE = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://accounts.google.com",
+  "worker-src 'self' blob:",
+  "img-src 'self' data: blob:",
+  "connect-src 'self' wss:",
+  "style-src 'self' 'unsafe-inline'",
+  'frame-src https://accounts.google.com',
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+].join('; ');
+
+/**
+ * CSP を付けないパス。Service Worker とスキャンエンジンは、自身の応答
+ * ヘッダがそのまま実行コンテキストのポリシーになるため、アプリ文書向け
+ * CSP を被せると起動できなくなる (nosniff 等の他ヘッダは付ける)。
+ */
+function skipsCsp(path: string): boolean {
+  return path === '/sw.js' || path.startsWith('/assets/scan/');
+}
+
+app.use('*', async (c, next) => {
+  if (
+    c.req.path.startsWith('/api/v1/') &&
+    (c.req.method === 'POST' ||
+      c.req.method === 'PUT' ||
+      c.req.method === 'DELETE' ||
+      c.req.method === 'PATCH')
+  ) {
+    const origin = c.req.header('origin');
+    if (origin !== undefined) {
+      let originHost: string | null = null;
+      try {
+        originHost = new URL(origin).host;
+      } catch {
+        originHost = null;
+      }
+      if (originHost === null || originHost !== new URL(c.req.url).host) {
+        return c.json(
+          { statusCode: 403, error: 'ORIGIN_MISMATCH', message: 'Origin does not match host' },
+          403,
+        );
+      }
+    }
+  }
+  await next();
+  try {
+    const headers = c.res.headers;
+    if (!skipsCsp(c.req.path)) headers.set('Content-Security-Policy', CSP_VALUE);
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Referrer-Policy', 'no-referrer');
+    headers.set('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
+  } catch {
+    // WebSocket (101) などヘッダを変更できないレスポンスでは黙って諦める
+  }
+});
 
 // ------------------------------------------------------------ ヘルスチェック
 app.get('/api/v1/health', (c) => c.json({ status: 'ok' }));
@@ -739,6 +829,9 @@ app.get('/auth/login', async (c) => {
   if (loginBlock) return c.html(loginMaintenancePage(loginBlock.message, loginBlock.endsAt), 503);
   const clientId = c.env.OIDC_CLIENT_ID ?? '';
   if (!clientId) return c.text('OIDC is not configured', 503);
+  // ステップアップ再認証 (?stepup=1): 既存セッションの step_up_at を打ち直す
+  // ための再ログイン。Google 側にも再認証を強制する (prompt=login)。
+  const stepup = new URL(c.req.url).searchParams.get('stepup') === '1';
   const nonce = crypto.randomUUID();
   const params = new URLSearchParams({
     client_id: clientId,
@@ -747,15 +840,17 @@ app.get('/auth/login', async (c) => {
     scope: 'openid email profile',
     nonce,
     state: nonce,
-    prompt: 'select_account',
+    prompt: stepup ? 'login' : 'select_account',
   });
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
-      'Set-Cookie': `oauth_nonce=${nonce}; Path=/; Max-Age=600; SameSite=Lax`,
-    },
+  const headers = new Headers({
+    Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
   });
+  headers.append('Set-Cookie', `oauth_nonce=${nonce}; Path=/; Max-Age=600; SameSite=Lax`);
+  if (stepup) {
+    // nonce と紐付けて、コールバックで「この往復がステップアップ用か」を判定する
+    headers.append('Set-Cookie', `oauth_stepup=${nonce}; Path=/; Max-Age=600; SameSite=Lax`);
+  }
+  return new Response(null, { status: 302, headers });
 });
 
 // OAuth リダイレクト受け口 (サーバー側で完結)。
@@ -809,15 +904,41 @@ ${body}
   }
 
   let authUser: AuthUser;
+  let cookieNonce = '';
   try {
     const payload = await verifyToken(c.env, tokenJson.id_token);
-    const cookieNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_nonce=([^;]*)/)?.[1] ?? '';
+    cookieNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_nonce=([^;]*)/)?.[1] ?? '';
     if (cookieNonce && payload.nonce !== cookieNonce) {
       return page('ログインに失敗しました', '<p>nonce が一致しません。もう一度ログインしてください。</p>', 400);
     }
     authUser = await syncUserFromPayload(c.env, payload);
   } catch {
     return page('ログインに失敗しました', '<p>ID トークンの検証に失敗しました。</p>', 400);
+  }
+
+  // ログイン履歴と新しい端末の通知 (0017)。失敗してもログインは止めない。
+  await recordLoginEvent(c.env.DB, c.env, {
+    userId: authUser.userId,
+    method: 'google',
+    ip: clientIp(c.req.raw),
+    userAgent: c.req.header('user-agent') ?? null,
+  });
+
+  // ステップアップ再認証の往復: 既存セッションが同じユーザーなら新規発行せず、
+  // そのセッションの step_up_at を打ち直して /app へ戻す。
+  const stepupNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_stepup=([^;]*)/)?.[1] ?? '';
+  if (stepupNonce && cookieNonce && stepupNonce === cookieNonce) {
+    try {
+      const sessionUser = await resolveSessionUser(c.env.DB, c.req.raw);
+      if (sessionUser && sessionUser.userId === authUser.userId) {
+        await markSessionStepUp(c.env.DB, c.req.raw);
+        const headers = new Headers({ Location: '/app' });
+        headers.append('Set-Cookie', 'oauth_stepup=; Path=/; Max-Age=0; SameSite=Lax');
+        return new Response(null, { status: 302, headers });
+      }
+    } catch {
+      // セッションが引けない場合は通常のログインとして続行する
+    }
   }
 
   // 新規ログイン停止中はセッションを発行しない (全体管理者は対象外)。
@@ -846,7 +967,11 @@ ${body}
       : '<p>アカウントは作成されましたが、権限はまだ付いていません。この画面が出たことをチャットで教えてください。管理者ロールを付与します。</p>';
   // ブラウザ向けにログインセッションを発行する (Cookie は HttpOnly)。
   // 以後の API / WebSocket はこのセッションで認証できる。
-  const sessionToken = await createSession(c.env.DB, authUser.userId);
+  // 発行時の UA / IP はセッション管理画面での端末表示用に記録する (0017)。
+  const sessionToken = await createSession(c.env.DB, authUser.userId, {
+    userAgent: c.req.header('user-agent') ?? null,
+    ip: clientIp(c.req.raw),
+  });
   const res = page(
     'ログインしました',
     `<p>メールアドレス: ${authUser.email}</p><p>ユーザー ID: ${authUser.userId}</p><p>現在のロール: ${roles}</p>${note}<p><a href="/app">アプリを開く</a></p>`,
@@ -955,6 +1080,14 @@ ${endText}
 
 app.use('/api/v1/*', async (c, next) => {
   if (c.req.path === '/api/v1/health') return next();
+  // パスキーのログイン開始・検証は未認証で受ける (認証そのものが目的)。
+  // 新規ログイン停止 (features の 'login') はハンドラ側で判定する。
+  if (
+    c.req.path === '/api/v1/auth/passkey/login/options' ||
+    c.req.path === '/api/v1/auth/passkey/login/verify'
+  ) {
+    return next();
+  }
   const authUser = await authenticate(c.req.raw, c.env);
   c.set('user', authUser);
   // メンテナンス (全体管理の maintenance_windows + 従来の即時設定を合算)。
@@ -1115,6 +1248,23 @@ async function requireFeature(c: AppContext, key: string): Promise<void> {
   if (!(await isFeatureEnabled(c.env.DB, key, ctx.store.id))) {
     throw new ApiError(403, 'FEATURE_DISABLED', `Feature is disabled: ${key}`);
   }
+}
+
+/**
+ * 重要操作の再認証 (ステップアップ、0017)。Cookie セッション経由の場合、
+ * セッションの step_up_at が 10 分以内でなければ 403 STEP_UP_REQUIRED。
+ * ログイン自体が step_up_at を打つため、ログイン直後はそのまま通る。
+ * Bearer (IdP の短期トークン) は直近に IdP で認証済みとして扱い対象外。
+ * step_up_at 列が無い環境 (0017 未適用) では強制しない。
+ */
+async function requireStepUp(c: AppContext): Promise<void> {
+  const me = user(c);
+  if (!me.viaSession) return;
+  if (!(await hasColumn(c, 'sessions', 'step_up_at'))) return;
+  const session = await currentSessionRow(c.env.DB, c.req.raw);
+  if (!session) return;
+  if (session.stepUpAt !== null && Date.now() - session.stepUpAt <= STEP_UP_WINDOW_MS) return;
+  throw new ApiError(403, 'STEP_UP_REQUIRED', 'Step-up authentication is required');
 }
 
 /** テーブルに列が存在するか (マイグレーション未適用環境との後方互換用) */
@@ -1505,12 +1655,15 @@ async function upsertFeatureFlag(
          ON CONFLICT(store_id, key) DO UPDATE SET enabled = excluded.enabled, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
       )
       .bind(storeId, key, enabled ? 1 : 0, user(c).userId, now),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'feature_flag.update', 'feature_flag', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, key, JSON.stringify({ enabled, storeId, via }), storeId, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'feature_flag.update',
+      targetType: 'feature_flag',
+      targetId: key,
+      payload: { enabled, storeId, via },
+      storeId,
+      createdAt: now,
+    }),
   ]);
 }
 
@@ -1534,6 +1687,402 @@ app.post('/api/v1/auth/logout', async (c) => {
     // sessions テーブル未適用の環境では破棄するものが無い
   }
   return c.json({ loggedOut: true }, 200, { 'Set-Cookie': clearSessionCookieHeader() });
+});
+
+// ------------------------------------------------- パスキー / セッション (0017)
+// WebAuthn (Face ID 等) ログイン、自分のセッション管理、ログイン履歴、
+// ステップアップ再認証。検証ロジックは lib/webauthn.ts、ログイン記録は
+// lib/login-events.ts。失敗は詳細を漏らさない汎用エラーに倒す。
+
+const PASSKEY_FAILED = () =>
+  new ApiError(400, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
+
+function rpIdOf(c: AppContext): string {
+  return new URL(c.req.url).hostname;
+}
+
+function originOf(c: AppContext): string {
+  return new URL(c.req.url).origin;
+}
+
+async function requirePasskeyTables(c: AppContext): Promise<void> {
+  if (!(await hasTable(c, 'passkey_credentials')) || !(await hasTable(c, 'webauthn_challenges'))) {
+    throw new ApiError(503, 'PASSKEY_NOT_CONFIGURED', 'Passkey is not configured (migration 0017)');
+  }
+}
+
+const passkeyRegisterVerifySchema = z.object({
+  credentialId: z.string().min(1),
+  clientDataJSON: z.string().min(1),
+  attestationObject: z.string().min(1),
+  transports: z.array(z.string()).optional(),
+  label: z.string().max(100).optional(),
+});
+
+const passkeyAssertionSchema = z.object({
+  credentialId: z.string().min(1),
+  clientDataJSON: z.string().min(1),
+  authenticatorData: z.string().min(1),
+  signature: z.string().min(1),
+});
+
+interface PasskeyCredentialRow {
+  id: number;
+  user_id: number;
+  credential_id: string;
+  public_key_jwk: string;
+  sign_count: number;
+  transports: string | null;
+  label: string | null;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+/**
+ * assertion を検証する共通処理 (ログインとステップアップで共用)。
+ * 成功したら該当クレデンシャル行を返し、sign_count / last_used_at を更新する。
+ * 失敗はすべて汎用エラー (詳細を漏らさない)。
+ */
+async function verifyPasskeyAssertion(
+  c: AppContext,
+  dto: z.infer<typeof passkeyAssertionSchema>,
+  purpose: 'login' | 'step_up',
+  expectedUserId: number | null,
+): Promise<PasskeyCredentialRow> {
+  const db = c.env.DB;
+  let clientDataBytes: Uint8Array;
+  let authenticatorDataBytes: Uint8Array;
+  let signatureBytes: Uint8Array;
+  try {
+    clientDataBytes = base64UrlDecode(dto.clientDataJSON);
+    authenticatorDataBytes = base64UrlDecode(dto.authenticatorData);
+    signatureBytes = base64UrlDecode(dto.signature);
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  let challenge: string;
+  try {
+    challenge = parseClientData(clientDataBytes).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const challengeRow = await consumeChallenge(db, challenge, purpose);
+  if (!challengeRow) throw PASSKEY_FAILED();
+  if (expectedUserId !== null && challengeRow.user_id !== expectedUserId) throw PASSKEY_FAILED();
+
+  const credential = await db
+    .prepare('SELECT * FROM passkey_credentials WHERE credential_id = ?1')
+    .bind(dto.credentialId)
+    .first<PasskeyCredentialRow>();
+  if (!credential) throw PASSKEY_FAILED();
+  if (expectedUserId !== null && credential.user_id !== expectedUserId) throw PASSKEY_FAILED();
+
+  try {
+    const clientData = parseClientData(clientDataBytes);
+    checkClientData(clientData, { type: 'webauthn.get', challenge, origin: originOf(c) });
+    const authData = parseAuthenticatorData(authenticatorDataBytes);
+    const expectedRpHash = await sha256Bytes(rpIdOf(c));
+    if (!bytesEqual(authData.rpIdHash, expectedRpHash)) throw new Error('rpIdHash mismatch');
+    if (!authData.userPresent || !authData.userVerified) throw new Error('UP/UV required');
+    // signCount が戻っている assertion は複製の疑いがあるため拒否する。
+    // カウンタを持たない authenticator (双方 0) は許容する。
+    if (
+      (authData.signCount !== 0 || credential.sign_count !== 0) &&
+      authData.signCount <= credential.sign_count
+    ) {
+      throw new Error('signCount regression');
+    }
+    const clientHash = await sha256Bytes(clientDataBytes);
+    const signedData = new Uint8Array(authenticatorDataBytes.length + clientHash.length);
+    signedData.set(authenticatorDataBytes, 0);
+    signedData.set(clientHash, authenticatorDataBytes.length);
+    const jwk = JSON.parse(credential.public_key_jwk) as JsonWebKey;
+    const ok = await verifyAssertionSignature(jwk, signatureBytes, signedData);
+    if (!ok) throw new Error('signature mismatch');
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+
+  // sign_count は assertion 側の値を保存する (検証済みの値を再パースして使う)
+  const verifiedCount = parseAuthenticatorData(authenticatorDataBytes).signCount;
+  await db
+    .prepare('UPDATE passkey_credentials SET sign_count = ?1, last_used_at = ?2 WHERE id = ?3')
+    .bind(verifiedCount, Date.now(), credential.id)
+    .run();
+  return credential;
+}
+
+/** パスキー登録の開始 (ログイン済みユーザー本人) */
+app.post('/api/v1/auth/passkey/register/options', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const challenge = await issueChallenge(c.env.DB, { userId: me.userId, purpose: 'register' });
+  const { results } = await c.env.DB.prepare(
+    'SELECT credential_id FROM passkey_credentials WHERE user_id = ?1 ORDER BY id ASC',
+  )
+    .bind(me.userId)
+    .all<{ credential_id: string }>();
+  return c.json({
+    challenge,
+    rp: { name: '在庫管理システム', id: rpIdOf(c) },
+    user: {
+      id: base64UrlEncode(new TextEncoder().encode(String(me.userId))),
+      name: me.email,
+      displayName: me.displayName || me.email,
+    },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+    timeout: 60000,
+    attestation: 'none',
+    // 端末内蔵 (Face ID) と外部キーの両方を許可し、discoverable にする
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+    excludeCredentials: results.map((r) => ({ type: 'public-key', id: r.credential_id })),
+  });
+});
+
+/** パスキー登録の検証・保存 */
+app.post('/api/v1/auth/passkey/register/verify', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const dto = parseWith(passkeyRegisterVerifySchema, await parseJson(c));
+  let clientDataBytes: Uint8Array;
+  let attestationBytes: Uint8Array;
+  try {
+    clientDataBytes = base64UrlDecode(dto.clientDataJSON);
+    attestationBytes = base64UrlDecode(dto.attestationObject);
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  let challenge: string;
+  try {
+    challenge = parseClientData(clientDataBytes).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const challengeRow = await consumeChallenge(c.env.DB, challenge, 'register');
+  if (!challengeRow || challengeRow.user_id !== me.userId) throw PASSKEY_FAILED();
+
+  let credentialId: string;
+  try {
+    const clientData = parseClientData(clientDataBytes);
+    checkClientData(clientData, { type: 'webauthn.create', challenge, origin: originOf(c) });
+    const { authData, format } = parseAttestationObject(attestationBytes);
+    const expectedRpHash = await sha256Bytes(rpIdOf(c));
+    if (!bytesEqual(authData.rpIdHash, expectedRpHash)) throw new Error('rpIdHash mismatch');
+    if (!authData.userPresent || !authData.userVerified) throw new Error('UP/UV required');
+    if (!authData.attestedCredentialData) throw new Error('no attested credential data');
+    const jwk = coseEc2ToJwk(authData.attestedCredentialData.cosePublicKey);
+    if (!(await verifyAttestationSignature(attestationBytes, clientDataBytes, jwk))) {
+      throw new Error('attestation signature invalid');
+    }
+    credentialId = base64UrlEncode(authData.attestedCredentialData.credentialId);
+    if (dto.credentialId !== credentialId) throw new Error('credential id mismatch');
+    const now = Date.now();
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO passkey_credentials (user_id, credential_id, public_key_jwk, sign_count, transports, label, created_at, last_used_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)`,
+    )
+      .bind(
+        me.userId,
+        credentialId,
+        JSON.stringify(jwk),
+        authData.signCount,
+        dto.transports ? JSON.stringify(dto.transports) : null,
+        dto.label ?? null,
+        now,
+      )
+      .run();
+    return c.json({ id: Number(inserted.meta.last_row_id), credentialId, createdAt: now }, 201);
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw PASSKEY_FAILED();
+  }
+});
+
+/** パスキーログインの開始 (未認証。ユーザー名なし・discoverable) */
+app.post('/api/v1/auth/passkey/login/options', async (c) => {
+  await requirePasskeyTables(c);
+  const loginBlock = await loginMaintenanceBlock(c);
+  if (loginBlock) {
+    return c.json(
+      { statusCode: 503, error: 'MAINTENANCE', message: loginBlock.message, endsAt: loginBlock.endsAt },
+      503,
+    );
+  }
+  const challenge = await issueChallenge(c.env.DB, { userId: null, purpose: 'login' });
+  return c.json({
+    challenge,
+    rpId: rpIdOf(c),
+    timeout: 60000,
+    userVerification: 'required',
+  });
+});
+
+/** パスキーログインの検証。成功すれば通常のセッションを発行する */
+app.post('/api/v1/auth/passkey/login/verify', async (c) => {
+  await requirePasskeyTables(c);
+  const dto = parseWith(passkeyAssertionSchema, await parseJson(c));
+  const credential = await verifyPasskeyAssertion(c, dto, 'login', null);
+  const target = await c.env.DB.prepare('SELECT id, status FROM users WHERE id = ?1')
+    .bind(credential.user_id)
+    .first<{ id: number; status: string }>();
+  if (!target || target.status !== 'active') throw PASSKEY_FAILED();
+  await recordLoginEvent(c.env.DB, c.env, {
+    userId: target.id,
+    method: 'passkey',
+    ip: clientIp(c.req.raw),
+    userAgent: c.req.header('user-agent') ?? null,
+  });
+  const token = await createSession(c.env.DB, target.id, {
+    userAgent: c.req.header('user-agent') ?? null,
+    ip: clientIp(c.req.raw),
+  });
+  return c.json({ ok: true }, 200, { 'Set-Cookie': sessionCookieHeader(token) });
+});
+
+/** 自分のパスキー一覧 */
+app.get('/api/v1/auth/passkey/credentials', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, credential_id, label, created_at, last_used_at
+       FROM passkey_credentials WHERE user_id = ?1 ORDER BY id ASC`,
+  )
+    .bind(me.userId)
+    .all<{ id: number; credential_id: string; label: string | null; created_at: number; last_used_at: number | null }>();
+  return c.json(
+    results.map((r) => ({
+      id: r.id,
+      credentialId: r.credential_id,
+      label: r.label,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at,
+    })),
+  );
+});
+
+/** 自分のパスキーを削除する */
+app.delete('/api/v1/auth/passkey/credentials/:id', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) throw notFound('Passkey not found');
+  const res = await c.env.DB.prepare(
+    'DELETE FROM passkey_credentials WHERE id = ?1 AND user_id = ?2',
+  )
+    .bind(id, me.userId)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Passkey not found');
+  return c.json({ id, deleted: true });
+});
+
+/** ステップアップ用のチャレンジ発行 (現在のセッションに紐付ける) */
+app.post('/api/v1/auth/passkey/step-up/options', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const session = await currentSessionRow(c.env.DB, c.req.raw);
+  const challenge = await issueChallenge(c.env.DB, {
+    userId: me.userId,
+    purpose: 'step_up',
+    sessionId: session?.id ?? null,
+  });
+  return c.json({
+    challenge,
+    rpId: rpIdOf(c),
+    timeout: 60000,
+    userVerification: 'required',
+  });
+});
+
+/** ステップアップ再認証 (パスキー)。現在のセッションに step_up_at を打つ */
+app.post('/api/v1/auth/step-up/passkey', async (c) => {
+  await requirePasskeyTables(c);
+  const me = user(c);
+  if (!me.viaSession) return c.json({ ok: true, stepUp: 'not_required' });
+  const dto = parseWith(passkeyAssertionSchema, await parseJson(c));
+  // チャレンジが現在のセッション用に発行されたものかも検証する
+  let challengeText: string;
+  try {
+    challengeText = parseClientData(base64UrlDecode(dto.clientDataJSON)).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const session = await currentSessionRow(c.env.DB, c.req.raw);
+  if (!session) throw PASSKEY_FAILED();
+  const challengeRow = await c.env.DB.prepare(
+    'SELECT session_id FROM webauthn_challenges WHERE challenge = ?1 AND purpose = ?2',
+  )
+    .bind(challengeText, 'step_up')
+    .first<{ session_id: number | null }>();
+  if (!challengeRow || challengeRow.session_id !== session.id) throw PASSKEY_FAILED();
+  await verifyPasskeyAssertion(c, dto, 'step_up', me.userId);
+  await markSessionStepUp(c.env.DB, c.req.raw);
+  return c.json({ ok: true });
+});
+
+/** 自分の有効セッション一覧 (現在のセッションには印を付ける) */
+app.get('/api/v1/auth/sessions', async (c) => {
+  const me = user(c);
+  const token = readSessionToken(c.req.raw);
+  const currentHash = token ? await hashSessionToken(token) : null;
+  const hasMeta = await hasColumn(c, 'sessions', 'user_agent');
+  const metaCols = hasMeta ? ', user_agent, ip, last_seen_at' : '';
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, token_hash, created_at, expires_at${metaCols}
+       FROM sessions
+      WHERE user_id = ?1 AND (scope IS NULL OR scope = 'app') AND expires_at > ?2
+      ORDER BY created_at DESC`,
+  )
+    .bind(me.userId, Date.now())
+    .all<Record<string, unknown>>();
+  return c.json(
+    results.map((r) => ({
+      id: Number(r.id),
+      createdAt: Number(r.created_at),
+      lastSeenAt: r.last_seen_at != null ? Number(r.last_seen_at) : null,
+      userAgent: (r.user_agent as string | null) ?? null,
+      ip: (r.ip as string | null) ?? null,
+      current: currentHash !== null && r.token_hash === currentHash,
+    })),
+  );
+});
+
+/** 自分の他のセッションを失効させる (現在のセッション自身は対象外) */
+app.delete('/api/v1/auth/sessions/:id', async (c) => {
+  const me = user(c);
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) throw notFound('Session not found');
+  const row = await c.env.DB.prepare('SELECT id, token_hash FROM sessions WHERE id = ?1 AND user_id = ?2')
+    .bind(id, me.userId)
+    .first<{ id: number; token_hash: string }>();
+  if (!row) throw notFound('Session not found');
+  const token = readSessionToken(c.req.raw);
+  const currentHash = token ? await hashSessionToken(token) : null;
+  if (currentHash !== null && row.token_hash === currentHash) {
+    throw new ApiError(400, 'CURRENT_SESSION', 'Current session cannot be revoked here. Use logout.');
+  }
+  await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?1').bind(id).run();
+  return c.json({ id, revoked: true });
+});
+
+/** 自分のログイン履歴 (直近 20 件) */
+app.get('/api/v1/auth/login-events', async (c) => {
+  const me = user(c);
+  if (!(await hasTable(c, 'login_events'))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    `SELECT method, ip, user_agent, device_label, created_at
+       FROM login_events WHERE user_id = ?1 ORDER BY id DESC LIMIT 20`,
+  )
+    .bind(me.userId)
+    .all<{ method: string; ip: string | null; user_agent: string | null; device_label: string; created_at: number }>();
+  return c.json(
+    results.map((r) => ({
+      method: r.method,
+      ip: r.ip,
+      userAgent: r.user_agent,
+      deviceLabel: r.device_label,
+      createdAt: r.created_at,
+    })),
+  );
 });
 
 /** 入出庫履歴 (stock_movements の参照)。現在店舗・スコープ外倉庫の履歴は出さない */
@@ -1639,12 +2188,15 @@ app.post('/api/v1/movements/:id/photos', async (c) => {
   }
   await c.env.DB.batch([
     c.env.DB.prepare('UPDATE movement_photos SET image_key = ?1 WHERE id = ?2').bind(key, photoId),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'movement.photo.add', 'stock_movement', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, String(movementId), JSON.stringify({ photoId }), ctx.store.id, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'movement.photo.add',
+      targetType: 'stock_movement',
+      targetId: String(movementId),
+      payload: { photoId },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   return c.json({ id: photoId, movementId, imageKey: key, createdBy: user(c).userId, createdAt: now }, 201);
 });
@@ -3030,12 +3582,15 @@ app.put('/api/v1/products/:id/bundle', async (c) => {
     );
   }
   stmts.push(
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'product.bundle.update', 'product', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, String(id), JSON.stringify({ components: dto.components }), ctx.store.id, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'product.bundle.update',
+      targetType: 'product',
+      targetId: String(id),
+      payload: { components: dto.components },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   );
   await c.env.DB.batch(stmts);
   const avail = await bundleAvailability(c.env.DB, ctx.store.id, id);
@@ -3073,13 +3628,15 @@ app.put('/api/v1/admin/products/bulk', async (c) => {
   )
     .bind(...params, now, ctx.store.id, ...ids)
     .run();
-  await c.env.DB
-    .prepare(
-      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-       VALUES (?1, 'product.bulk_update', 'product', ?2, ?3, ?4, ?5)`,
-    )
-    .bind(user(c).userId, ids.join(','), JSON.stringify({ ids, patch, updated: res.meta.changes }), ctx.store.id, now)
-    .run();
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'product.bulk_update',
+    targetType: 'product',
+    targetId: ids.join(','),
+    payload: { ids, patch, updated: res.meta.changes },
+    storeId: ctx.store.id,
+    createdAt: now,
+  });
   return c.json({ updated: res.meta.changes, ids });
 });
 
@@ -3180,12 +3737,15 @@ app.post('/api/v1/reservations/:id/release', async (c) => {
     c.env.DB
       .prepare("UPDATE reservations SET status = 'released', updated_at = ?1 WHERE id = ?2")
       .bind(now, id),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'reservation.release', 'reservation', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, String(id), JSON.stringify({ productId: row.product_id, quantity: row.quantity }), ctx.store.id, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'reservation.release',
+      targetType: 'reservation',
+      targetId: String(id),
+      payload: { productId: row.product_id, quantity: row.quantity },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   const updated = await loadReservationInStore(c, id, ctx.store.id);
   const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
@@ -3231,18 +3791,19 @@ app.post('/api/v1/reservations/:id/consume', async (c) => {
     c.env.DB
       .prepare("UPDATE reservations SET status = 'consumed', updated_at = ?1 WHERE id = ?2 AND status = 'active'")
       .bind(now, id),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'reservation.consume', 'reservation', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(
-        user(c).userId,
-        String(id),
-        JSON.stringify({ productId: row.product_id, quantity: row.quantity, documentId: (envelope.body as { documentId?: string }).documentId ?? null }),
-        ctx.store.id,
-        now,
-      ),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'reservation.consume',
+      targetType: 'reservation',
+      targetId: String(id),
+      payload: {
+        productId: row.product_id,
+        quantity: row.quantity,
+        documentId: (envelope.body as { documentId?: string }).documentId ?? null,
+      },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   const updated = await loadReservationInStore(c, id, ctx.store.id);
   const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
@@ -3492,12 +4053,15 @@ app.post('/api/v1/pick-lists/:id/cancel', async (c) => {
   }
   await c.env.DB.batch([
     c.env.DB.prepare("UPDATE pick_lists SET status = 'cancelled' WHERE id = ?1").bind(listId),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'pick_list.cancel', 'pick_list', ?2, '{}', ?3, ?4)`,
-      )
-      .bind(user(c).userId, String(listId), ctx.store.id, Date.now()),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'pick_list.cancel',
+      targetType: 'pick_list',
+      targetId: String(listId),
+      payload: {},
+      storeId: ctx.store.id,
+      createdAt: Date.now(),
+    }),
   ]);
   const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   return c.json(
@@ -3627,12 +4191,15 @@ app.delete('/api/v1/purchase-order-templates/:id', async (c) => {
   }
   stmts.push(c.env.DB.prepare('DELETE FROM po_templates WHERE id = ?1').bind(id));
   stmts.push(
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'po_template.delete', 'po_template', ?2, '{}', ?3, ?4)`,
-      )
-      .bind(user(c).userId, String(id), ctx.store.id, Date.now()),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'po_template.delete',
+      targetType: 'po_template',
+      targetId: String(id),
+      payload: {},
+      storeId: ctx.store.id,
+      createdAt: Date.now(),
+    }),
   );
   await c.env.DB.batch(stmts);
   return c.json({ id, deleted: true });
@@ -3661,13 +4228,15 @@ app.post('/api/v1/purchase-order-templates/:id/generate', async (c) => {
     lines,
     nowMs: now,
   });
-  await c.env.DB
-    .prepare(
-      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-       VALUES (?1, 'purchase_order.create_from_template', 'po_template', ?2, ?3, ?4, ?5)`,
-    )
-    .bind(user(c).userId, String(id), JSON.stringify({ purchaseOrderId: poId }), ctx.store.id, now)
-    .run();
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'purchase_order.create_from_template',
+    targetType: 'po_template',
+    targetId: String(id),
+    payload: { purchaseOrderId: poId },
+    storeId: ctx.store.id,
+    createdAt: now,
+  });
   return c.json(await loadPurchaseOrder(c, poId, ctx.store.id), 201);
 });
 
@@ -3783,12 +4352,15 @@ app.post('/api/v1/negative-approvals/:id/decide', async (c) => {
           WHERE id = ?4 AND status = 'pending'`,
       )
       .bind(dto.decision, user(c).userId, now, id),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, ?2, 'negative_stock_approval', ?3, ?4, ?5, ?6)`,
-      )
-      .bind(user(c).userId, `negative_approval.${dto.decision}`, String(id), JSON.stringify({ decision: dto.decision }), ctx.store.id, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: `negative_approval.${dto.decision}`,
+      targetType: 'negative_stock_approval',
+      targetId: String(id),
+      payload: { decision: dto.decision },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   return c.json({ id, status: dto.decision, approvedBy: user(c).userId, decidedAt: now });
 });
@@ -4392,18 +4964,15 @@ app.post('/api/v1/purchase-orders', async (c) => {
          VALUES (?1, ?2, 'POST /api/v1/purchase-orders', ?3, 201, ?4, ?5, ?6)`,
       )
       .bind(key, user(c).userId, requestHash, JSON.stringify(created), ctx.store.id, now),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'purchase_order.create', 'purchase_order', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(
-        user(c).userId,
-        String(poId),
-        JSON.stringify({ supplierId: dto.supplierId, lines: dto.lines.length }),
-        ctx.store.id,
-        now,
-      ),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'purchase_order.create',
+      targetType: 'purchase_order',
+      targetId: String(poId),
+      payload: { supplierId: dto.supplierId, lines: dto.lines.length },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   return c.json(created, 201);
 });
@@ -4525,18 +5094,15 @@ app.post('/api/v1/purchase-orders/:id/receive', async (c) => {
     c.env.DB
       .prepare('UPDATE purchase_orders SET status = ?1, updated_at = ?2 WHERE id = ?3')
       .bind(nextStatus, now, poId),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'purchase_order.receive', 'purchase_order', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(
-        user(c).userId,
-        String(poId),
-        JSON.stringify({ locationId: dto.locationId, lines: dto.lines, status: nextStatus }),
-        ctx.store.id,
-        now,
-      ),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'purchase_order.receive',
+      targetType: 'purchase_order',
+      targetId: String(poId),
+      payload: { locationId: dto.locationId, lines: dto.lines, status: nextStatus },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   const poJson = await loadPurchaseOrder(c, poId, ctx.store.id);
   const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
@@ -4578,12 +5144,15 @@ app.post('/api/v1/purchase-orders/:id/close-residual', async (c) => {
     c.env.DB
       .prepare("UPDATE purchase_orders SET status = 'closed', updated_at = ?1 WHERE id = ?2")
       .bind(now, poId),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'purchase_order.close_residual', 'purchase_order', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, String(poId), JSON.stringify({ remaining }), ctx.store.id, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'purchase_order.close_residual',
+      targetType: 'purchase_order',
+      targetId: String(poId),
+      payload: { remaining },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ]);
   const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
   return c.json(
@@ -4796,6 +5365,8 @@ app.get('/api/v1/admin/permissions', async (c) => {
 app.put('/api/v1/admin/role-permissions/:roleCode', async (c) => {
   // マトリクスは店舗横断の概念のため、全体権限チェック (店舗未選択でも可)
   await requireGlobalPermission(c, Permission.ADMIN_PERMISSIONS);
+  // 重要操作: 再認証 (ステップアップ) が新しいセッションだけ許可する
+  await requireStepUp(c);
   const roleCode = c.req.param('roleCode');
   const roles = await listRoles(c);
   if (!roles.some((r) => r.code === roleCode)) throw notFound('Role not found');
@@ -4827,12 +5398,15 @@ app.put('/api/v1/admin/role-permissions/:roleCode', async (c) => {
         .prepare('INSERT INTO role_permissions (role_code, permission_key) VALUES (?1, ?2)')
         .bind(roleCode, k),
     ),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'role_permissions.update', 'role', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, roleCode, JSON.stringify({ permissions: keys }), auditStoreId, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'role_permissions.update',
+      targetType: 'role',
+      targetId: roleCode,
+      payload: { permissions: keys },
+      storeId: auditStoreId,
+      createdAt: now,
+    }),
   ];
   await c.env.DB.batch(stmts);
   return c.json({ roleCode, permissions: keys });
@@ -4930,18 +5504,15 @@ app.put('/api/v1/admin/users/:userId/roles', async (c) => {
         .prepare('INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (?1, ?2, ?3, ?4)')
         .bind(userId, a.roleCode, a.warehouseId, ctx.store.id),
     ),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'user_roles.update', 'user', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(
-        user(c).userId,
-        String(userId),
-        JSON.stringify({ assignments, storeId: ctx.store.id }),
-        ctx.store.id,
-        now,
-      ),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'user_roles.update',
+      targetType: 'user',
+      targetId: String(userId),
+      payload: { assignments, storeId: ctx.store.id },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
   ];
   await c.env.DB.batch(stmts);
   return c.json({ userId, assignments });
@@ -5048,6 +5619,18 @@ app.get('/api/v1/admin/audit-logs', async (c) => {
 });
 
 /**
+ * 監査ログのハッシュチェーン検証 (admin.users、0017)。
+ * 行の書き換え・削除があると { ok: false, brokenAtId } で検出する。
+ * チェーン開始前 (row_hash が NULL) の行は検証対象外。
+ */
+app.get('/api/v1/admin/audit-integrity', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  await storeContext(c);
+  const result = await verifyAuditChain(c.env.DB);
+  return c.json(result);
+});
+
+/**
  * データエクスポート (admin.users)。業務データの主要テーブルを丸ごと JSON で返す。
  * sessions (認証情報)、idempotency_keys と write_guards (配送・整合性担保の内部状態)
  * は含めない (README「バックアップとデータエクスポート」参照)。
@@ -5092,6 +5675,8 @@ const EXPORT_STORE_SCOPES: Record<string, string> = {
 
 app.get('/api/v1/admin/export.json', async (c) => {
   await requirePermission(c, Permission.ADMIN_USERS);
+  // 重要操作: 全データの持ち出しには再認証 (ステップアップ) を要求する
+  await requireStepUp(c);
   const ctx = await storeContext(c);
   // 全体管理者 (現在店舗の割当を持たない) の users 行と、その全体割当の行は
   // 店舗側のエクスポートに含めない (名前・メール・外部 ID を出さない)
@@ -5226,25 +5811,20 @@ async function announcementAudit(
   row: AnnouncementRow,
   auditStoreId: number,
 ): Promise<void> {
-  await c.env.DB
-    .prepare(
-      `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-       VALUES (?1, ?2, 'announcement', ?3, ?4, ?5, ?6)`,
-    )
-    .bind(
-      user(c).userId,
-      action,
-      String(row.id), // target_id は TEXT。数値のままだと D1 が "7.0" 形式で保存する
-      JSON.stringify({
-        title: row.title,
-        storeId: row.store_id,
-        priority: row.priority,
-        push: row.push === 1,
-      }),
-      auditStoreId,
-      Date.now(),
-    )
-    .run();
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action,
+    targetType: 'announcement',
+    targetId: String(row.id), // target_id は TEXT。数値のままだと D1 が "7.0" 形式で保存する
+    payload: {
+      title: row.title,
+      storeId: row.store_id,
+      priority: row.priority,
+      push: row.push === 1,
+    },
+    storeId: auditStoreId,
+    createdAt: Date.now(),
+  });
 }
 
 app.get('/api/v1/announcements', async (c) => {

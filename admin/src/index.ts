@@ -16,12 +16,15 @@ import { getStore } from '../../workers/src/lib/stores';
 import {
   clearSessionCookieHeader,
   createSession,
+  currentSessionRow,
   destroySession,
   hashSessionToken,
+  markSessionStepUp,
   PLATFORM_SESSION_COOKIE_NAME,
   readSessionToken,
   resolveSessionUser,
   sessionCookieHeader,
+  STEP_UP_WINDOW_MS,
 } from '../../workers/src/lib/session';
 import {
   FEATURE_CATALOG,
@@ -49,6 +52,27 @@ import {
   type AnnouncementRow,
 } from '../../workers/src/lib/announcements';
 import { maybeSendAnnouncementPush } from '../../workers/src/lib/push';
+import {
+  buildAuditInsert,
+  insertAudit,
+  verifyAuditChain,
+} from '../../workers/src/lib/audit-chain';
+import {
+  base64UrlDecode,
+  base64UrlEncode,
+  bytesEqual,
+  checkClientData,
+  consumeChallenge,
+  coseEc2ToJwk,
+  issueChallenge,
+  parseAttestationObject,
+  parseAuthenticatorData,
+  parseClientData,
+  sha256Bytes,
+  verifyAssertionSignature,
+  verifyAttestationSignature,
+} from '../../workers/src/lib/webauthn';
+import { clientIp, recordLoginEvent } from '../../workers/src/lib/login-events';
 import {
   createBackup,
   hasBackupsTable,
@@ -83,8 +107,98 @@ type AppContext = Context<{ Bindings: AdminEnv; Variables: Variables }>;
 
 const app = new Hono<{ Bindings: AdminEnv; Variables: Variables }>();
 
+// -------------------------------------------------- セキュリティ基盤 (0017)
+// 全レスポンスへセキュリティヘッダを付け、/api/ の状態変更リクエストには
+// Origin チェックを行う (店舗側と同等。一次防御は Cookie の SameSite=Lax)。
+// CSP の緩和点は script-src / style-src の 'unsafe-inline' のみで、
+// コンソールの単一 HTML がインラインスクリプトで構成されるため。
+const CONSOLE_CSP_VALUE = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+].join('; ');
+
+app.use('*', async (c, next) => {
+  if (
+    c.req.path.startsWith('/api/') &&
+    (c.req.method === 'POST' ||
+      c.req.method === 'PUT' ||
+      c.req.method === 'DELETE' ||
+      c.req.method === 'PATCH')
+  ) {
+    const origin = c.req.header('origin');
+    if (origin !== undefined) {
+      let originHost: string | null = null;
+      try {
+        originHost = new URL(origin).host;
+      } catch {
+        originHost = null;
+      }
+      if (originHost === null || originHost !== new URL(c.req.url).host) {
+        return c.json(
+          { statusCode: 403, error: 'ORIGIN_MISMATCH', message: 'Origin does not match host' },
+          403,
+        );
+      }
+    }
+  }
+  await next();
+  try {
+    const headers = c.res.headers;
+    headers.set('Content-Security-Policy', CONSOLE_CSP_VALUE);
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Referrer-Policy', 'no-referrer');
+    headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  } catch {
+    // ヘッダを変更できないレスポンスでは黙って諦める
+  }
+});
+
 function user(c: AppContext): AuthUser {
   return c.get('user');
+}
+
+/** テーブルに列が存在するか (マイグレーション未適用環境との後方互換用) */
+async function hasColumn(c: AppContext, table: string, column: string): Promise<boolean> {
+  try {
+    const { results } = await c.env.DB.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+    return results.some((r) => r.name === column);
+  } catch {
+    return false;
+  }
+}
+
+/** テーブル自体が存在するか (0017 の passkey 系など) */
+async function hasTable(c: AppContext, table: string): Promise<boolean> {
+  try {
+    const row = await c.env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+    )
+      .bind(table)
+      .first<{ name: string }>();
+    return row !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 重要操作の再認証 (ステップアップ、0017)。セッションの step_up_at が
+ * 10 分以内でなければ 403 STEP_UP_REQUIRED。ログイン自体が step_up_at を
+ * 打つため、ログイン直後はそのまま通る。step_up_at 列が無い環境
+ * (0017 未適用) では強制しない (店舗側と同仕様)。
+ */
+async function requireStepUp(c: AppContext): Promise<void> {
+  if (!(await hasColumn(c, 'sessions', 'step_up_at'))) return;
+  const session = await currentSessionRow(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  if (!session) return;
+  if (session.stepUpAt !== null && Date.now() - session.stepUpAt <= STEP_UP_WINDOW_MS) return;
+  throw new ApiError(403, 'STEP_UP_REQUIRED', 'Step-up authentication is required');
 }
 
 /** workers 側 lib (verifyToken / syncUserFromPayload) は店舗アプリの Env 型を取るため変換する */
@@ -127,9 +241,12 @@ async function listRoles(c: AppContext): Promise<{ code: string; name: string }[
 // ------------------------------------------------------------ 認証 (Google 認可コードフロー)
 
 // ログイン開始 (サーバー側リダイレクト)。店舗アプリと同じクライアント ID を使う。
+// ?stepup=1 はステップアップ再認証用: 既存セッションの step_up_at を打ち直す
+// ための再ログインで、Google 側にも再認証を強制する (prompt=login)。
 app.get('/auth/login', (c) => {
   const clientId = c.env.OIDC_CLIENT_ID ?? '';
   if (!clientId) return c.text('OIDC is not configured', 503);
+  const stepup = new URL(c.req.url).searchParams.get('stepup') === '1';
   const nonce = crypto.randomUUID();
   const params = new URLSearchParams({
     client_id: clientId,
@@ -138,15 +255,17 @@ app.get('/auth/login', (c) => {
     scope: 'openid email profile',
     nonce,
     state: nonce,
-    prompt: 'select_account',
+    prompt: stepup ? 'login' : 'select_account',
   });
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
-      'Set-Cookie': `oauth_nonce=${nonce}; Path=/; Max-Age=600; SameSite=Lax`,
-    },
+  const headers = new Headers({
+    Location: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
   });
+  headers.append('Set-Cookie', `oauth_nonce=${nonce}; Path=/; Max-Age=600; SameSite=Lax`);
+  if (stepup) {
+    // nonce と紐付けて、コールバックで「この往復がステップアップ用か」を判定する
+    headers.append('Set-Cookie', `oauth_stepup=${nonce}; Path=/; Max-Age=600; SameSite=Lax`);
+  }
+  return new Response(null, { status: 302, headers });
 });
 
 // OAuth リダイレクト受け口。店舗アプリとの違いは2点:
@@ -199,9 +318,10 @@ ${body}
   }
 
   let authUser: AuthUser;
+  let cookieNonce = '';
   try {
     const payload = await verifyToken(asWorkersEnv(c.env), tokenJson.id_token);
-    const cookieNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_nonce=([^;]*)/)?.[1] ?? '';
+    cookieNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_nonce=([^;]*)/)?.[1] ?? '';
     if (cookieNonce && payload.nonce !== cookieNonce) {
       return page('ログインに失敗しました', '<p>nonce が一致しません。もう一度ログインしてください。</p>', 400);
     }
@@ -220,7 +340,39 @@ ${body}
     );
   }
 
-  const sessionToken = await createSession(c.env.DB, authUser.userId, { scope: 'platform' });
+  // ログイン履歴と新しい端末の通知 (0017)。失敗してもログインは止めない。
+  await recordLoginEvent(c.env.DB, c.env, {
+    userId: authUser.userId,
+    method: 'google',
+    ip: clientIp(c.req.raw),
+    userAgent: c.req.header('user-agent') ?? null,
+  });
+
+  // ステップアップ再認証の往復: 既存の platform セッションが同じユーザーなら
+  // 新規発行せず、そのセッションの step_up_at を打ち直してコンソールへ戻す。
+  const stepupNonce = (c.req.header('cookie') ?? '').match(/(?:^|;\s*)oauth_stepup=([^;]*)/)?.[1] ?? '';
+  if (stepupNonce && cookieNonce && stepupNonce === cookieNonce) {
+    try {
+      const sessionUser = await resolveSessionUser(c.env.DB, c.req.raw, {
+        cookieName: PLATFORM_SESSION_COOKIE_NAME,
+        scope: 'platform',
+      });
+      if (sessionUser && sessionUser.userId === authUser.userId) {
+        await markSessionStepUp(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+        const headers = new Headers({ Location: '/' });
+        headers.append('Set-Cookie', 'oauth_stepup=; Path=/; Max-Age=0; SameSite=Lax');
+        return new Response(null, { status: 302, headers });
+      }
+    } catch {
+      // セッションが引けない場合は通常のログインとして続行する
+    }
+  }
+
+  const sessionToken = await createSession(c.env.DB, authUser.userId, {
+    scope: 'platform',
+    userAgent: c.req.header('user-agent') ?? null,
+    ip: clientIp(c.req.raw),
+  });
   const res = page(
     'ログインしました',
     `<p>メールアドレス: ${authUser.email}</p><p>全体管理者としてログインしました (セッションの有効期限は2時間です)。</p><p><a href="/">全体管理コンソールを開く</a></p>`,
@@ -249,6 +401,13 @@ app.get('/', (c) => c.html(CONSOLE_HTML));
 // さらに各ハンドラで全体管理者の割当を検証する (403)。
 
 app.use('/api/platform/*', async (c, next) => {
+  // パスキーのログイン開始・検証は未認証で受ける (認証そのものが目的)
+  if (
+    c.req.path === '/api/platform/auth/passkey/login/options' ||
+    c.req.path === '/api/platform/auth/passkey/login/verify'
+  ) {
+    return next();
+  }
   let sessionUser: AuthUser | null = null;
   try {
     sessionUser = await resolveSessionUser(c.env.DB, c.req.raw, {
@@ -326,12 +485,16 @@ async function platformAudit(
   payload: unknown,
   storeId: number | null,
 ): Promise<void> {
-  await c.env.DB.prepare(
-    `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-  )
-    .bind(user(c).userId, action, targetType, targetId, JSON.stringify(payload), storeId, Date.now())
-    .run();
+  // 監査はハッシュチェーン経由で記録する (0017、改ざん検知)。
+  // チェーン未適用の環境ではヘルパーが従来形式にフォールバックする。
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action,
+    targetType,
+    targetId,
+    payload,
+    storeId,
+  });
 }
 
 app.get('/api/platform/stores', async (c) => {
@@ -416,6 +579,15 @@ async function upsertFeatureFlag(
   enabled: boolean,
 ): Promise<void> {
   const now = Date.now();
+  const auditStmt = await buildAuditInsert(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'feature_flag.update',
+    targetType: 'feature_flag',
+    targetId: key,
+    payload: { enabled, storeId, via: 'platform' },
+    storeId,
+    createdAt: now,
+  });
   await c.env.DB.batch([
     c.env.DB
       .prepare(
@@ -423,12 +595,7 @@ async function upsertFeatureFlag(
          ON CONFLICT(store_id, key) DO UPDATE SET enabled = excluded.enabled, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
       )
       .bind(storeId, key, enabled ? 1 : 0, user(c).userId, now),
-    c.env.DB
-      .prepare(
-        `INSERT INTO audit_logs (actor_id, action, target_type, target_id, payload, store_id, created_at)
-         VALUES (?1, 'feature_flag.update', 'feature_flag', ?2, ?3, ?4, ?5)`,
-      )
-      .bind(user(c).userId, key, JSON.stringify({ enabled, storeId, via: 'platform' }), storeId, now),
+    auditStmt,
   ]);
 }
 
@@ -1019,6 +1186,7 @@ app.get('/api/platform/backups/:id/download', async (c) => {
  */
 app.post('/api/platform/backups/:id/restore', async (c) => {
   requirePlatformAdmin(c);
+  await requireStepUp(c);
   await requireBackupsTable(c);
   const id = Number(c.req.param('id'));
   if ((await readBackupJson(c.env.DB, id)) === null) throw notFound('Backup not found');
@@ -1925,6 +2093,7 @@ app.delete('/api/platform/maintenance/presets/:id', async (c) => {
 /** 全セッション失効 (呼び出し元 = 操作中の全体管理者自身のセッションは残す) */
 app.post('/api/platform/revoke-all-sessions', async (c) => {
   requirePlatformAdmin(c);
+  await requireStepUp(c);
   const token = readSessionToken(c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
   let res: D1Result;
   if (token) {
@@ -1936,6 +2105,372 @@ app.post('/api/platform/revoke-all-sessions', async (c) => {
   const revoked = res.meta.changes ?? 0;
   await platformAudit(c, 'platform.sessions.revoke_all', 'session', 'all', { revoked }, null);
   return c.json({ revoked });
+});
+
+// ------------------------------------------------- パスキー / ステップアップ / 自分のセッション (0017)
+// WebAuthn (Face ID 等) による platform ログイン、重要操作の再認証、
+// 自分の platform セッション管理。検証ロジックは店舗側と共有の
+// lib/webauthn.ts、ログイン記録は lib/login-events.ts。
+// 注意: パスキーは rpId (ホスト名) 単位で束縛されるため、店舗アプリの
+// ホストで登録したクレデンシャルはこのコンソールでは使えない。この
+// ホスト用に、Google ログイン済みの状態から登録する導線を用意する。
+// 失敗は詳細を漏らさない汎用エラーに倒す。
+
+const PASSKEY_FAILED = () =>
+  new ApiError(400, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
+
+function rpIdOf(c: AppContext): string {
+  return new URL(c.req.url).hostname;
+}
+
+function originOf(c: AppContext): string {
+  return new URL(c.req.url).origin;
+}
+
+async function requirePasskeyTables(c: AppContext): Promise<void> {
+  if (!(await hasTable(c, 'passkey_credentials')) || !(await hasTable(c, 'webauthn_challenges'))) {
+    throw new ApiError(503, 'PASSKEY_NOT_CONFIGURED', 'Passkey is not configured (migration 0017)');
+  }
+}
+
+const passkeyRegisterVerifySchema = z.object({
+  credentialId: z.string().min(1),
+  clientDataJSON: z.string().min(1),
+  attestationObject: z.string().min(1),
+  transports: z.array(z.string()).optional(),
+  label: z.string().max(100).optional(),
+});
+
+const passkeyAssertionSchema = z.object({
+  credentialId: z.string().min(1),
+  clientDataJSON: z.string().min(1),
+  authenticatorData: z.string().min(1),
+  signature: z.string().min(1),
+});
+
+interface PasskeyCredentialRow {
+  id: number;
+  user_id: number;
+  credential_id: string;
+  public_key_jwk: string;
+  sign_count: number;
+  transports: string | null;
+  label: string | null;
+  created_at: number;
+  last_used_at: number | null;
+}
+
+/**
+ * assertion を検証する共通処理 (ログインとステップアップで共用、店舗側と同方式)。
+ * 成功したら該当クレデンシャル行を返し、sign_count / last_used_at を更新する。
+ */
+async function verifyPasskeyAssertion(
+  c: AppContext,
+  dto: z.infer<typeof passkeyAssertionSchema>,
+  purpose: 'login' | 'step_up',
+  expectedUserId: number | null,
+): Promise<PasskeyCredentialRow> {
+  const db = c.env.DB;
+  let clientDataBytes: Uint8Array;
+  let authenticatorDataBytes: Uint8Array;
+  let signatureBytes: Uint8Array;
+  try {
+    clientDataBytes = base64UrlDecode(dto.clientDataJSON);
+    authenticatorDataBytes = base64UrlDecode(dto.authenticatorData);
+    signatureBytes = base64UrlDecode(dto.signature);
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  let challenge: string;
+  try {
+    challenge = parseClientData(clientDataBytes).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const challengeRow = await consumeChallenge(db, challenge, purpose);
+  if (!challengeRow) throw PASSKEY_FAILED();
+  if (expectedUserId !== null && challengeRow.user_id !== expectedUserId) throw PASSKEY_FAILED();
+
+  const credential = await db
+    .prepare('SELECT * FROM passkey_credentials WHERE credential_id = ?1')
+    .bind(dto.credentialId)
+    .first<PasskeyCredentialRow>();
+  if (!credential) throw PASSKEY_FAILED();
+  if (expectedUserId !== null && credential.user_id !== expectedUserId) throw PASSKEY_FAILED();
+
+  try {
+    const clientData = parseClientData(clientDataBytes);
+    checkClientData(clientData, { type: 'webauthn.get', challenge, origin: originOf(c) });
+    const authData = parseAuthenticatorData(authenticatorDataBytes);
+    const expectedRpHash = await sha256Bytes(rpIdOf(c));
+    if (!bytesEqual(authData.rpIdHash, expectedRpHash)) throw new Error('rpIdHash mismatch');
+    if (!authData.userPresent || !authData.userVerified) throw new Error('UP/UV required');
+    // signCount が戻っている assertion は複製の疑いがあるため拒否する。
+    // カウンタを持たない authenticator (双方 0) は許容する。
+    if (
+      (authData.signCount !== 0 || credential.sign_count !== 0) &&
+      authData.signCount <= credential.sign_count
+    ) {
+      throw new Error('signCount regression');
+    }
+    const clientHash = await sha256Bytes(clientDataBytes);
+    const signedData = new Uint8Array(authenticatorDataBytes.length + clientHash.length);
+    signedData.set(authenticatorDataBytes, 0);
+    signedData.set(clientHash, authenticatorDataBytes.length);
+    const jwk = JSON.parse(credential.public_key_jwk) as JsonWebKey;
+    const ok = await verifyAssertionSignature(jwk, signatureBytes, signedData);
+    if (!ok) throw new Error('signature mismatch');
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+
+  const verifiedCount = parseAuthenticatorData(authenticatorDataBytes).signCount;
+  await db
+    .prepare('UPDATE passkey_credentials SET sign_count = ?1, last_used_at = ?2 WHERE id = ?3')
+    .bind(verifiedCount, Date.now(), credential.id)
+    .run();
+  return credential;
+}
+
+/** このコンソール用パスキー登録の開始 (platform セッション必須) */
+app.post('/api/platform/auth/passkey/register/options', async (c) => {
+  requirePlatformAdmin(c);
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const challenge = await issueChallenge(c.env.DB, { userId: me.userId, purpose: 'register' });
+  const { results } = await c.env.DB.prepare(
+    'SELECT credential_id FROM passkey_credentials WHERE user_id = ?1 ORDER BY id ASC',
+  )
+    .bind(me.userId)
+    .all<{ credential_id: string }>();
+  return c.json({
+    challenge,
+    rp: { name: '全体管理コンソール', id: rpIdOf(c) },
+    user: {
+      id: base64UrlEncode(new TextEncoder().encode(String(me.userId))),
+      name: me.email,
+      displayName: me.displayName || me.email,
+    },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+    timeout: 60000,
+    attestation: 'none',
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+    excludeCredentials: results.map((r) => ({ type: 'public-key', id: r.credential_id })),
+  });
+});
+
+/** このコンソール用パスキー登録の検証・保存 */
+app.post('/api/platform/auth/passkey/register/verify', async (c) => {
+  requirePlatformAdmin(c);
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const dto = parseWith(passkeyRegisterVerifySchema, await parseJson(c));
+  let clientDataBytes: Uint8Array;
+  let attestationBytes: Uint8Array;
+  try {
+    clientDataBytes = base64UrlDecode(dto.clientDataJSON);
+    attestationBytes = base64UrlDecode(dto.attestationObject);
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  let challenge: string;
+  try {
+    challenge = parseClientData(clientDataBytes).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const challengeRow = await consumeChallenge(c.env.DB, challenge, 'register');
+  if (!challengeRow || challengeRow.user_id !== me.userId) throw PASSKEY_FAILED();
+
+  try {
+    const clientData = parseClientData(clientDataBytes);
+    checkClientData(clientData, { type: 'webauthn.create', challenge, origin: originOf(c) });
+    const { authData } = parseAttestationObject(attestationBytes);
+    const expectedRpHash = await sha256Bytes(rpIdOf(c));
+    if (!bytesEqual(authData.rpIdHash, expectedRpHash)) throw new Error('rpIdHash mismatch');
+    if (!authData.userPresent || !authData.userVerified) throw new Error('UP/UV required');
+    if (!authData.attestedCredentialData) throw new Error('no attested credential data');
+    const jwk = coseEc2ToJwk(authData.attestedCredentialData.cosePublicKey);
+    if (!(await verifyAttestationSignature(attestationBytes, clientDataBytes, jwk))) {
+      throw new Error('attestation signature invalid');
+    }
+    const credentialId = base64UrlEncode(authData.attestedCredentialData.credentialId);
+    if (dto.credentialId !== credentialId) throw new Error('credential id mismatch');
+    const now = Date.now();
+    const inserted = await c.env.DB.prepare(
+      `INSERT INTO passkey_credentials (user_id, credential_id, public_key_jwk, sign_count, transports, label, created_at, last_used_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)`,
+    )
+      .bind(
+        me.userId,
+        credentialId,
+        JSON.stringify(jwk),
+        authData.signCount,
+        dto.transports ? JSON.stringify(dto.transports) : null,
+        dto.label ?? null,
+        now,
+      )
+      .run();
+    return c.json({ id: Number(inserted.meta.last_row_id), credentialId, createdAt: now }, 201);
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw PASSKEY_FAILED();
+  }
+});
+
+/** パスキーログインの開始 (未認証。ユーザー名なし・discoverable) */
+app.post('/api/platform/auth/passkey/login/options', async (c) => {
+  await requirePasskeyTables(c);
+  const challenge = await issueChallenge(c.env.DB, { userId: null, purpose: 'login' });
+  return c.json({
+    challenge,
+    rpId: rpIdOf(c),
+    timeout: 60000,
+    userVerification: 'required',
+  });
+});
+
+/**
+ * パスキーログインの検証。Google ログインと同じ条件 (全体管理者の割当が
+ * あること) を満たす場合のみ platform スコープのセッションを発行する。
+ * 割当が無ければ 403 で、セッションは作らない。
+ */
+app.post('/api/platform/auth/passkey/login/verify', async (c) => {
+  await requirePasskeyTables(c);
+  const dto = parseWith(passkeyAssertionSchema, await parseJson(c));
+  const credential = await verifyPasskeyAssertion(c, dto, 'login', null);
+  const target = await c.env.DB.prepare('SELECT id, status FROM users WHERE id = ?1')
+    .bind(credential.user_id)
+    .first<{ id: number; status: string }>();
+  if (!target || target.status !== 'active') throw PASSKEY_FAILED();
+  const { results: roleRows } = await c.env.DB.prepare(
+    'SELECT role_code, warehouse_id, store_id FROM user_roles WHERE user_id = ?1',
+  )
+    .bind(target.id)
+    .all<{ role_code: string; warehouse_id: number | null; store_id: number | null }>();
+  const assignments = roleRows.map((r) => ({
+    roleCode: r.role_code as RoleCode,
+    warehouseId: r.warehouse_id,
+    storeId: r.store_id,
+  }));
+  if (!isPlatformAdmin(assignments)) {
+    throw new ApiError(403, 'PLATFORM_ADMIN_REQUIRED', 'Platform admin only');
+  }
+  await recordLoginEvent(c.env.DB, c.env, {
+    userId: target.id,
+    method: 'passkey',
+    ip: clientIp(c.req.raw),
+    userAgent: c.req.header('user-agent') ?? null,
+  });
+  const token = await createSession(c.env.DB, target.id, {
+    scope: 'platform',
+    userAgent: c.req.header('user-agent') ?? null,
+    ip: clientIp(c.req.raw),
+  });
+  return c.json({ ok: true }, 200, {
+    'Set-Cookie': sessionCookieHeader(token, { name: PLATFORM_SESSION_COOKIE_NAME }),
+  });
+});
+
+/** ステップアップ用のチャレンジ発行 (現在の platform セッションに紐付ける) */
+app.post('/api/platform/auth/passkey/step-up/options', async (c) => {
+  requirePlatformAdmin(c);
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const session = await currentSessionRow(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  const challenge = await issueChallenge(c.env.DB, {
+    userId: me.userId,
+    purpose: 'step_up',
+    sessionId: session?.id ?? null,
+  });
+  return c.json({
+    challenge,
+    rpId: rpIdOf(c),
+    timeout: 60000,
+    userVerification: 'required',
+  });
+});
+
+/** ステップアップ再認証 (パスキー)。現在のセッションに step_up_at を打つ */
+app.post('/api/platform/auth/step-up/passkey', async (c) => {
+  requirePlatformAdmin(c);
+  await requirePasskeyTables(c);
+  const me = user(c);
+  const dto = parseWith(passkeyAssertionSchema, await parseJson(c));
+  // チャレンジが現在のセッション用に発行されたものかも検証する
+  let challengeText: string;
+  try {
+    challengeText = parseClientData(base64UrlDecode(dto.clientDataJSON)).challenge;
+  } catch {
+    throw PASSKEY_FAILED();
+  }
+  const session = await currentSessionRow(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  if (!session) throw PASSKEY_FAILED();
+  const challengeRow = await c.env.DB.prepare(
+    'SELECT session_id FROM webauthn_challenges WHERE challenge = ?1 AND purpose = ?2',
+  )
+    .bind(challengeText, 'step_up')
+    .first<{ session_id: number | null }>();
+  if (!challengeRow || challengeRow.session_id !== session.id) throw PASSKEY_FAILED();
+  await verifyPasskeyAssertion(c, dto, 'step_up', me.userId);
+  await markSessionStepUp(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  return c.json({ ok: true });
+});
+
+/** 自分の有効な platform セッション一覧 (現在のセッションには印を付ける) */
+app.get('/api/platform/auth/sessions', async (c) => {
+  requirePlatformAdmin(c);
+  const me = user(c);
+  const token = readSessionToken(c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  const currentHash = token ? await hashSessionToken(token) : null;
+  const hasMeta = await hasColumn(c, 'sessions', 'user_agent');
+  const metaCols = hasMeta ? ', user_agent, ip, last_seen_at' : '';
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, token_hash, created_at, expires_at${metaCols}
+       FROM sessions
+      WHERE user_id = ?1 AND scope = 'platform' AND expires_at > ?2
+      ORDER BY created_at DESC`,
+  )
+    .bind(me.userId, Date.now())
+    .all<Record<string, unknown>>();
+  return c.json(
+    results.map((r) => ({
+      id: Number(r.id),
+      createdAt: Number(r.created_at),
+      lastSeenAt: r.last_seen_at != null ? Number(r.last_seen_at) : null,
+      userAgent: (r.user_agent as string | null) ?? null,
+      ip: (r.ip as string | null) ?? null,
+      current: currentHash !== null && r.token_hash === currentHash,
+    })),
+  );
+});
+
+/** 自分の他の platform セッションを失効させる (現在のセッション自身は対象外) */
+app.delete('/api/platform/auth/sessions/:id', async (c) => {
+  requirePlatformAdmin(c);
+  const me = user(c);
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) throw notFound('Session not found');
+  const row = await c.env.DB.prepare(
+    "SELECT id, token_hash FROM sessions WHERE id = ?1 AND user_id = ?2 AND scope = 'platform'",
+  )
+    .bind(id, me.userId)
+    .first<{ id: number; token_hash: string }>();
+  if (!row) throw notFound('Session not found');
+  const token = readSessionToken(c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  const currentHash = token ? await hashSessionToken(token) : null;
+  if (currentHash !== null && row.token_hash === currentHash) {
+    throw new ApiError(400, 'CURRENT_SESSION', 'Current session cannot be revoked here. Use logout.');
+  }
+  await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?1').bind(id).run();
+  return c.json({ id, revoked: true });
+});
+
+/** 監査ハッシュチェーンの整合性チェック (改ざん検知) */
+app.get('/api/platform/audit-integrity', async (c) => {
+  requirePlatformAdmin(c);
+  const result = await verifyAuditChain(c.env.DB);
+  return c.json(result);
 });
 
 /**
