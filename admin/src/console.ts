@@ -1,4 +1,5 @@
 import { APP_CSS } from '../../workers/src/app/styles';
+import { PWA_HEAD } from './pwa';
 
 /**
  * 全体管理コンソール画面 (GET /)。
@@ -69,7 +70,7 @@ const EXTRA_CSS = `
 export const CONSOLE_HTML = `<!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>全体管理 | 在庫管理システム</title>
+<title>全体管理 | 在庫管理システム</title>${PWA_HEAD}
 <style>${APP_CSS}</style>
 <style>${EXTRA_CSS}</style></head>
 <body>

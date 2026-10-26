@@ -93,6 +93,7 @@ import {
   resolveStorePlan,
 } from '../../workers/src/lib/plans';
 import { CONSOLE_HTML } from './console';
+import { iconResponse, manifestResponse } from './pwa';
 
 /**
  * 在庫管理システム — 全体管理 (プラットフォーム管理) 専用 Worker。
@@ -406,6 +407,10 @@ app.post('/api/auth/logout', async (c) => {
 
 // ------------------------------------------------------------ 全体管理コンソール画面
 app.get('/', (c) => c.html(CONSOLE_HTML));
+
+// PWA (ホーム画面アイコン用)。ログイン前から取得できる必要があるため公開ルート。
+app.get('/manifest.webmanifest', () => manifestResponse());
+app.get('/icons/:name', (c) => iconResponse(c.req.param('name')) ?? c.notFound());
 
 // ------------------------------------------------------------ 全体管理 API
 // 全エンドポイントで「platform スコープのセッション」必須 (401)。
