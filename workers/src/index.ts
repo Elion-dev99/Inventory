@@ -88,6 +88,12 @@ import {
   bundleConsumptionSchema,
   bulkMovementsSchema,
   consumptionSchema,
+  createNamedMasterSchema,
+  createReasonCodeSchema,
+  storeSettingsSchema,
+  updateCategorySchema,
+  updateNamedMasterSchema,
+  updateReasonCodeSchema,
   consumeReservationSchema,
   countedQuantitySchema,
   createApprovalSchema,
@@ -129,6 +135,16 @@ import {
   type ReservationDbRow,
 } from './lib/commercial';
 import { computeFreeQuantities } from './lib/free-stock';
+import {
+  SUPPORTED_CURRENCIES,
+  assertReasonCodeUsable,
+  ensureReasonCodesSeeded,
+  getStoreSettings,
+  isValidTimezone,
+  listReasonCodes,
+  setStoreSettings,
+  type ReasonKind,
+} from './lib/store-masters';
 import { maybeAutoBackup } from './lib/backup';
 import {
   defaultFeatures,
@@ -1038,6 +1054,17 @@ function maintenanceFeatureFor(method: string, path: string): string | null {
   if (p === '/pick-lists' || p.startsWith('/pick-lists/')) return 'outbound';
   if (p === '/purchase-order-templates' || p.startsWith('/purchase-order-templates/')) return 'purchase_orders';
   if (p === '/admin/products/bulk') return 'master_products';
+  if (p === '/settings') return 'master_products';
+  if (
+    p === '/master/reason-codes' ||
+    p.startsWith('/master/reason-codes/') ||
+    p === '/master/departments' ||
+    p.startsWith('/master/departments/') ||
+    p === '/master/categories' ||
+    p.startsWith('/master/categories/')
+  ) {
+    return 'master_products';
+  }
   if (p === '/negative-approvals' || p.startsWith('/negative-approvals/')) return 'outbound';
   if (p === '/stocktakes' || p.startsWith('/stocktakes/')) return 'stocktakes';
   if (p === '/purchase-orders' || p.startsWith('/purchase-orders/')) return 'purchase_orders';
@@ -1552,11 +1579,12 @@ app.get('/api/v1/me', async (c) => {
   // 起動時の要所なので、互いに独立した読み取りは並列に走らせる
   const [rp, ctx] = await Promise.all([loadRolePermissions(c), softStoreContext(c)]);
   const platform = isPlatformAdmin(me.assignments);
-  const [stores, features, plan, maintenanceRes] = await Promise.all([
+  const [stores, features, plan, settings, maintenanceRes] = await Promise.all([
     // stores 未適用の環境では店舗なしとして扱う
     accessibleStores(c.env.DB, me).catch(() => [] as StoreInfo[]),
     ctx ? effectiveFeatures(c, ctx.store.id) : Promise.resolve(defaultFeatures()),
     ctx ? planSummaryForStore(c, ctx.store.id) : Promise.resolve(null),
+    ctx ? getStoreSettings(c.env.DB, ctx.store.id) : Promise.resolve({ currency: 'JPY', timezone: 'Asia/Tokyo' }),
     (async () =>
       c.get('maintenance') ?? (await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null)))(),
   ]);
@@ -1572,6 +1600,7 @@ app.get('/api/v1/me', async (c) => {
         : [],
     features,
     plan,
+    settings,
     stores,
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
@@ -2365,6 +2394,8 @@ interface ProductRow {
   lead_time_days?: number | null;
   /** 0015 で追加 (セット品フラグ)。同上 */
   is_bundle?: number;
+  /** 0020 で追加 (商品カテゴリ)。同上 */
+  category_id?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -2384,9 +2415,36 @@ function productJson(r: ProductRow): Record<string, unknown> {
     caseSize: r.case_size ?? null,
     leadTimeDays: r.lead_time_days ?? null,
     isBundle: r.is_bundle === 1,
+    categoryId: r.category_id ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
+}
+
+/** カテゴリ ID が現在の店舗の有効なカテゴリか検証する (0020) */
+async function assertCategoryExists(c: AppContext, storeId: number, categoryId: number): Promise<void> {
+  if (!(await hasTable(c, 'product_categories'))) {
+    throw badRequest('categoryId is not supported in this environment');
+  }
+  const row = await c.env.DB.prepare(
+    'SELECT id FROM product_categories WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(categoryId, storeId)
+    .first<{ id: number }>();
+  if (!row) throw badRequest('categoryId does not exist');
+}
+
+/** 店舗のカテゴリ名マップ (id -> name)。テーブルが無い環境では空 */
+async function categoryNameMap(c: AppContext, storeId: number): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  if (!(await hasTable(c, 'product_categories'))) return map;
+  const { results } = await c.env.DB.prepare(
+    'SELECT id, name FROM product_categories WHERE store_id = ?1 AND deleted_at IS NULL',
+  )
+    .bind(storeId)
+    .all<{ id: number; name: string }>();
+  for (const r of results) map.set(r.id, r.name);
+  return map;
 }
 
 async function listProducts(c: AppContext): Promise<Response> {
@@ -2394,12 +2452,27 @@ async function listProducts(c: AppContext): Promise<Response> {
   const ctx = await storeContext(c);
   const skip = Number(c.req.query('skip') ?? 0);
   const take = Math.min(Number(c.req.query('take') ?? 50), 200);
+  const categoryFilter = c.req.query('categoryId');
+  const conditions = ['store_id = ?1', 'deleted_at IS NULL'];
+  const params: (number | string)[] = [ctx.store.id];
+  if (categoryFilter !== undefined && categoryFilter !== '' && (await hasColumn(c, 'products', 'category_id'))) {
+    if (categoryFilter === 'none') {
+      conditions.push('category_id IS NULL');
+    } else {
+      conditions.push('category_id = ?');
+      params.push(Number(categoryFilter));
+    }
+  }
   const { results } = await c.env.DB.prepare(
-    'SELECT * FROM products WHERE store_id = ?1 AND deleted_at IS NULL ORDER BY id ASC LIMIT ?2 OFFSET ?3',
+    `SELECT * FROM products WHERE ${conditions.join(' AND ')} ORDER BY id ASC LIMIT ? OFFSET ?`,
   )
-    .bind(ctx.store.id, take, skip)
+    .bind(...params, take, skip)
     .all<ProductRow>();
-  const out = results.map(productJson);
+  const catNames = await categoryNameMap(c, ctx.store.id);
+  const out: Record<string, unknown>[] = results.map((r) => ({
+    ...productJson(r),
+    categoryName: r.category_id != null ? (catNames.get(r.category_id) ?? null) : null,
+  }));
   // セット品の単価は構成品の合算で出す (0015。セット品自体は単価を持たない)
   if (results.some((r) => r.is_bundle === 1) && (await hasTable(c, 'product_bundles'))) {
     for (let i = 0; i < results.length; i++) {
@@ -2432,6 +2505,10 @@ async function createProduct(c: AppContext): Promise<Response> {
   if (await hasColumn(c, 'products', 'case_size')) { cols.push('case_size'); binds.push(dto.caseSize ?? null); }
   if (await hasColumn(c, 'products', 'lead_time_days')) { cols.push('lead_time_days'); binds.push(dto.leadTimeDays ?? null); }
   if (await hasColumn(c, 'products', 'is_bundle')) { cols.push('is_bundle'); binds.push(dto.isBundle ? 1 : 0); }
+  if (dto.categoryId !== undefined && dto.categoryId !== null) {
+    await assertCategoryExists(c, ctx.store.id, dto.categoryId);
+  }
+  if (await hasColumn(c, 'products', 'category_id')) { cols.push('category_id'); binds.push(dto.categoryId ?? null); }
   cols.push('created_at', 'updated_at');
   binds.push(now, now);
   const placeholders = cols.map((_, i) => `?${i + 1}`).join(', ');
@@ -2685,6 +2762,11 @@ async function updateProduct(c: AppContext): Promise<Response> {
   if (dto.isBundle !== undefined && (await hasColumn(c, 'products', 'is_bundle'))) {
     sets.push('is_bundle = ?');
     params.push(dto.isBundle ? 1 : 0);
+  }
+  if (dto.categoryId !== undefined && (await hasColumn(c, 'products', 'category_id'))) {
+    if (dto.categoryId !== null) await assertCategoryExists(c, ctx.store.id, dto.categoryId);
+    sets.push('category_id = ?');
+    params.push(dto.categoryId);
   }
   if (sets.length > 0) {
     const now = Date.now();
@@ -3222,6 +3304,320 @@ for (const base of ['/api/v1/master', '/api/v1'] as const) {
   app.put(`${base}/suppliers/:id`, updateSupplier);
   app.delete(`${base}/suppliers/:id`, deleteSupplier);
 }
+
+// ------------------------------------------------ 店舗設定と運用マスタ (0020)
+
+/** 店舗設定の取得 (現在店舗のメンバーなら誰でも) */
+app.get('/api/v1/settings', async (c) => {
+  const ctx = await storeContext(c);
+  return c.json(await getStoreSettings(c.env.DB, ctx.store.id));
+});
+
+/** 店舗設定の更新 (master.write) */
+app.put('/api/v1/settings', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const dto = parseWith(storeSettingsSchema, await parseJson(c));
+  if (
+    dto.currency !== undefined &&
+    !(SUPPORTED_CURRENCIES as readonly string[]).includes(dto.currency)
+  ) {
+    throw badRequest('currency is not supported');
+  }
+  if (dto.timezone !== undefined && !isValidTimezone(dto.timezone)) {
+    throw badRequest('timezone must be a valid IANA timezone name');
+  }
+  return c.json(await setStoreSettings(c.env.DB, ctx.store.id, dto));
+});
+
+/** 無効分も含めてよいか (all=1 は master.write を持つ人だけ) */
+async function mayIncludeInactive(c: AppContext, ctx: StoreContext): Promise<boolean> {
+  if (c.req.query('all') !== '1') return false;
+  if (ctx.isPlatformAdmin) return true;
+  const rp = await loadRolePermissions(c);
+  return hasPermission(ctx.assignments, rp, Permission.MASTER_WRITE);
+}
+
+/** 理由コード一覧。フォーム用は有効分のみ返す */
+app.get('/api/v1/master/reason-codes', async (c) => {
+  const ctx = await storeContext(c);
+  const kindRaw = c.req.query('kind');
+  if (kindRaw !== 'return' && kindRaw !== 'disposal') {
+    throw badRequest('kind must be return or disposal');
+  }
+  await ensureReasonCodesSeeded(c.env.DB, ctx.store.id);
+  const includeInactive = await mayIncludeInactive(c, ctx);
+  return c.json(await listReasonCodes(c.env.DB, ctx.store.id, kindRaw, includeInactive));
+});
+
+app.post('/api/v1/master/reason-codes', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const dto = parseWith(createReasonCodeSchema, await parseJson(c));
+  await ensureReasonCodesSeeded(c.env.DB, ctx.store.id);
+  const dup = await c.env.DB.prepare(
+    `SELECT id FROM movement_reason_codes
+      WHERE store_id = ?1 AND kind = ?2 AND code = ?3 AND deleted_at IS NULL`,
+  )
+    .bind(ctx.store.id, dto.kind, dto.code)
+    .first<{ id: number }>();
+  if (dup) throw new ApiError(409, 'REASON_CODE_EXISTS', 'A reason code with this code already exists');
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO movement_reason_codes (store_id, kind, code, label, sort_order, is_active, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)`,
+  )
+    .bind(ctx.store.id, dto.kind, dto.code, dto.label, dto.sortOrder ?? 0, now)
+    .run();
+  return c.json(
+    {
+      id: Number(res.meta.last_row_id),
+      kind: dto.kind,
+      code: dto.code,
+      label: dto.label,
+      sortOrder: dto.sortOrder ?? 0,
+      isActive: true,
+    },
+    201,
+  );
+});
+
+app.put('/api/v1/master/reason-codes/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateReasonCodeSchema, await parseJson(c));
+  const row = await c.env.DB.prepare(
+    'SELECT id FROM movement_reason_codes WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Reason code not found');
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (dto.label !== undefined) { sets.push('label = ?'); params.push(dto.label); }
+  if (dto.isActive !== undefined) { sets.push('is_active = ?'); params.push(dto.isActive ? 1 : 0); }
+  if (dto.sortOrder !== undefined) { sets.push('sort_order = ?'); params.push(dto.sortOrder); }
+  if (sets.length > 0) {
+    await c.env.DB.prepare(
+      `UPDATE movement_reason_codes SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`,
+    )
+      .bind(...params, Date.now(), id)
+      .run();
+  }
+  const updated = await c.env.DB.prepare(
+    'SELECT id, kind, code, label, sort_order, is_active FROM movement_reason_codes WHERE id = ?1',
+  )
+    .bind(id)
+    .first<{ id: number; kind: string; code: string; label: string; sort_order: number; is_active: number }>();
+  return c.json({
+    id: updated!.id,
+    kind: updated!.kind,
+    code: updated!.code,
+    label: updated!.label,
+    sortOrder: updated!.sort_order,
+    isActive: updated!.is_active === 1,
+  });
+});
+
+app.delete('/api/v1/master/reason-codes/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const res = await c.env.DB.prepare(
+    'UPDATE movement_reason_codes SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND store_id = ?3 AND deleted_at IS NULL',
+  )
+    .bind(Date.now(), id, ctx.store.id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Reason code not found');
+  return c.json({ ok: true });
+});
+
+/** 部門マスタ一覧 (消費フォームの候補) */
+app.get('/api/v1/master/departments', async (c) => {
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'departments'))) return c.json([]);
+  const includeInactive = await mayIncludeInactive(c, ctx);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, name, sort_order, is_active FROM departments
+      WHERE store_id = ?1 AND deleted_at IS NULL${includeInactive ? '' : ' AND is_active = 1'}
+      ORDER BY sort_order ASC, id ASC`,
+  )
+    .bind(ctx.store.id)
+    .all<{ id: number; name: string; sort_order: number; is_active: number }>();
+  return c.json(
+    results.map((r) => ({ id: r.id, name: r.name, sortOrder: r.sort_order, isActive: r.is_active === 1 })),
+  );
+});
+
+app.post('/api/v1/master/departments', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const dto = parseWith(createNamedMasterSchema, await parseJson(c));
+  const dup = await c.env.DB.prepare(
+    'SELECT id FROM departments WHERE store_id = ?1 AND name = ?2 AND deleted_at IS NULL',
+  )
+    .bind(ctx.store.id, dto.name)
+    .first<{ id: number }>();
+  if (dup) throw new ApiError(409, 'DEPARTMENT_EXISTS', 'A department with this name already exists');
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO departments (store_id, name, sort_order, is_active, created_at, updated_at)
+     VALUES (?1, ?2, ?3, 1, ?4, ?4)`,
+  )
+    .bind(ctx.store.id, dto.name, dto.sortOrder ?? 0, now)
+    .run();
+  return c.json(
+    { id: Number(res.meta.last_row_id), name: dto.name, sortOrder: dto.sortOrder ?? 0, isActive: true },
+    201,
+  );
+});
+
+app.put('/api/v1/master/departments/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateNamedMasterSchema, await parseJson(c));
+  const row = await c.env.DB.prepare(
+    'SELECT id FROM departments WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Department not found');
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (dto.isActive !== undefined) { sets.push('is_active = ?'); params.push(dto.isActive ? 1 : 0); }
+  if (dto.sortOrder !== undefined) { sets.push('sort_order = ?'); params.push(dto.sortOrder); }
+  if (sets.length > 0) {
+    await c.env.DB.prepare(`UPDATE departments SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`)
+      .bind(...params, Date.now(), id)
+      .run();
+  }
+  const updated = await c.env.DB.prepare(
+    'SELECT id, name, sort_order, is_active FROM departments WHERE id = ?1',
+  )
+    .bind(id)
+    .first<{ id: number; name: string; sort_order: number; is_active: number }>();
+  return c.json({
+    id: updated!.id,
+    name: updated!.name,
+    sortOrder: updated!.sort_order,
+    isActive: updated!.is_active === 1,
+  });
+});
+
+app.delete('/api/v1/master/departments/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const res = await c.env.DB.prepare(
+    'UPDATE departments SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND store_id = ?3 AND deleted_at IS NULL',
+  )
+    .bind(Date.now(), id, ctx.store.id)
+    .run();
+  if (res.meta.changes === 0) throw notFound('Department not found');
+  return c.json({ ok: true });
+});
+
+/** 商品カテゴリ一覧 (商品件数つき) */
+app.get('/api/v1/master/categories', async (c) => {
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'product_categories'))) return c.json([]);
+  const withCount = await hasColumn(c, 'products', 'category_id');
+  const { results } = await c.env.DB.prepare(
+    `SELECT cat.id, cat.name, cat.sort_order
+            ${withCount ? ', (SELECT COUNT(*) FROM products p WHERE p.category_id = cat.id AND p.deleted_at IS NULL) AS product_count' : ', 0 AS product_count'}
+       FROM product_categories cat
+      WHERE cat.store_id = ?1 AND cat.deleted_at IS NULL
+      ORDER BY cat.sort_order ASC, cat.id ASC`,
+  )
+    .bind(ctx.store.id)
+    .all<{ id: number; name: string; sort_order: number; product_count: number }>();
+  return c.json(
+    results.map((r) => ({ id: r.id, name: r.name, sortOrder: r.sort_order, productCount: r.product_count })),
+  );
+});
+
+app.post('/api/v1/master/categories', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const dto = parseWith(createNamedMasterSchema, await parseJson(c));
+  const dup = await c.env.DB.prepare(
+    'SELECT id FROM product_categories WHERE store_id = ?1 AND name = ?2 AND deleted_at IS NULL',
+  )
+    .bind(ctx.store.id, dto.name)
+    .first<{ id: number }>();
+  if (dup) throw new ApiError(409, 'CATEGORY_EXISTS', 'A category with this name already exists');
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    `INSERT INTO product_categories (store_id, name, sort_order, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?4)`,
+  )
+    .bind(ctx.store.id, dto.name, dto.sortOrder ?? 0, now)
+    .run();
+  return c.json(
+    { id: Number(res.meta.last_row_id), name: dto.name, sortOrder: dto.sortOrder ?? 0, productCount: 0 },
+    201,
+  );
+});
+
+app.put('/api/v1/master/categories/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const dto = parseWith(updateCategorySchema, await parseJson(c));
+  const row = await c.env.DB.prepare(
+    'SELECT id FROM product_categories WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Category not found');
+  const sets: string[] = [];
+  const params: (string | number)[] = [];
+  if (dto.name !== undefined) { sets.push('name = ?'); params.push(dto.name); }
+  if (dto.sortOrder !== undefined) { sets.push('sort_order = ?'); params.push(dto.sortOrder); }
+  if (sets.length > 0) {
+    await c.env.DB.prepare(
+      `UPDATE product_categories SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`,
+    )
+      .bind(...params, Date.now(), id)
+      .run();
+  }
+  const updated = await c.env.DB.prepare(
+    'SELECT id, name, sort_order FROM product_categories WHERE id = ?1',
+  )
+    .bind(id)
+    .first<{ id: number; name: string; sort_order: number }>();
+  return c.json({ id: updated!.id, name: updated!.name, sortOrder: updated!.sort_order });
+});
+
+/** カテゴリ削除: 紐づく商品は未分類に戻してから論理削除する */
+app.delete('/api/v1/master/categories/:id', async (c) => {
+  await requirePermission(c, Permission.MASTER_WRITE);
+  const ctx = await storeContext(c);
+  const id = Number(c.req.param('id'));
+  const row = await c.env.DB.prepare(
+    'SELECT id FROM product_categories WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ id: number }>();
+  if (!row) throw notFound('Category not found');
+  const now = Date.now();
+  if (await hasColumn(c, 'products', 'category_id')) {
+    await c.env.DB.prepare(
+      'UPDATE products SET category_id = NULL, updated_at = ?1 WHERE category_id = ?2 AND store_id = ?3',
+    )
+      .bind(now, id, ctx.store.id)
+      .run();
+  }
+  await c.env.DB.prepare(
+    'UPDATE product_categories SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2',
+  )
+    .bind(now, id)
+    .run();
+  return c.json({ ok: true });
+});
 
 // ---------------------------------------------------------------- 在庫参照
 
@@ -3861,6 +4257,7 @@ app.post('/api/v1/movements/return', async (c) => {
   const ctx = await storeContext(c);
   const raw = (await parseJson(c)) as Record<string, unknown>;
   const dto = parseWith(returnMovementSchema, raw);
+  await assertReasonCodeUsable(c.env.DB, ctx.store.id, 'return', dto.reasonCode);
   const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
   if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {
     throw forbidden('Out of warehouse scope');
@@ -3895,6 +4292,7 @@ app.post('/api/v1/movements/disposal', async (c) => {
   const ctx = await storeContext(c);
   const raw = (await parseJson(c)) as Record<string, unknown>;
   const dto = parseWith(disposalSchema, raw);
+  await assertReasonCodeUsable(c.env.DB, ctx.store.id, 'disposal', dto.reasonCode);
   if (dto.locationId !== undefined) {
     const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
     if (!canPerformInStore(ctx, rp, warehouseId, Permission.MOVEMENTS_CONSUME)) {

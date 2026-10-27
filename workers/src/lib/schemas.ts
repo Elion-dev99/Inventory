@@ -25,6 +25,8 @@ export const createProductSchema = z.object({
   leadTimeDays: z.number().int().min(0).nullable().optional(),
   /** セット品フラグ (0015)。セット品は自前の在庫行を持たない */
   isBundle: z.boolean().optional(),
+  /** 商品カテゴリ (0020)。null = 未分類 */
+  categoryId: idValue.nullable().optional(),
 });
 
 export const createWarehouseSchema = z.object({
@@ -120,6 +122,7 @@ export const updateProductSchema = z.object({
   caseSize: z.number().int().min(1).nullable().optional(),
   leadTimeDays: z.number().int().min(0).nullable().optional(),
   isBundle: z.boolean().optional(),
+  categoryId: idValue.nullable().optional(),
 });
 
 /** 仕入先マスタ */
@@ -222,10 +225,53 @@ export const decideApprovalSchema = z.object({
   decision: z.enum(['approved', 'rejected']),
 });
 
+/* ------------------------------------------------------------------ 0020 設定の汎用化 */
+
+/** 店舗設定 (通貨・タイムゾーン)。通貨コードの実在はハンドラ側で検証する */
+export const storeSettingsSchema = z.object({
+  currency: z.string().min(1).max(8).optional(),
+  timezone: z.string().min(1).max(64).optional(),
+});
+
+/** 理由コードの新規作成。code は URL や履歴で使う識別子 (英小文字・数字・_・-) */
+export const createReasonCodeSchema = z.object({
+  kind: z.enum(['return', 'disposal']),
+  code: z.string().regex(/^[a-z0-9_-]{1,64}$/, 'code must be lowercase letters, digits, _ or -'),
+  label: z.string().min(1).max(50),
+  sortOrder: z.number().int().min(0).optional(),
+});
+
+export const updateReasonCodeSchema = z.object({
+  label: z.string().min(1).max(50).optional(),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+});
+
+/** 部門・カテゴリなど名前だけのマスタ */
+export const createNamedMasterSchema = z.object({
+  name: z.string().min(1).max(100),
+  sortOrder: z.number().int().min(0).optional(),
+});
+
+export const updateNamedMasterSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+});
+
+export const updateCategorySchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  sortOrder: z.number().int().min(0).optional(),
+});
+
 /* ------------------------------------------------------------------ 0015 商用レベル第1弾 */
 
-/** 返品・廃棄の理由コード (この 2 種別でのみ必須) */
-export const reasonCodeSchema = z.enum(['damaged', 'expired', 'defective', 'other']);
+/**
+ * 返品・廃棄の理由コード (この 2 種別でのみ必須)。
+ * 0020 以降は店舗マスタ (movement_reason_codes) で検証するため、
+ * ここでは文字列として受け、実在チェックはハンドラ側で行う。
+ */
+export const reasonCodeSchema = z.string().min(1).max(64);
 
 /** 返品 (社内から戻り = 在庫+)。入庫と同じ形に理由コードとメモを必須で足したもの */
 export const returnMovementSchema = z.object({
