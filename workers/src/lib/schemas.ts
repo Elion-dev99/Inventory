@@ -388,6 +388,28 @@ export const signupSchema = z.object({
   templateKey: z.string().min(1).max(50).optional(),
 });
 
+// ------------------------------------------------------- 招待・保留 (0021)
+
+/** 招待リンクの作成 (メモは任意) */
+export const inviteCreateSchema = z.object({
+  memo: z.string().trim().max(100).optional(),
+});
+
+/** 招待の受付 (参加リクエスト) */
+export const inviteAcceptSchema = z.object({
+  token: z.string().min(16).max(200),
+});
+
+/** 保留ユーザーへのロール付与 */
+export const pendingGrantSchema = z.object({
+  roleCode: z.string().min(1).max(50),
+});
+
+/** 自分のユーザー名 (表示名) の設定 */
+export const profilePatchSchema = z.object({
+  displayName: z.string().trim().min(1).max(50),
+});
+
 /** 'YYYY-MM-DD' -> UTC 0時のミリ秒。不正な日付は null */
 export function parseDateOnly(s: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);

@@ -50,6 +50,7 @@ export interface AuthUser {
 interface UserRow {
   id: number;
   status: string;
+  display_name: string;
 }
 
 interface AssignmentRow {
@@ -58,19 +59,45 @@ interface AssignmentRow {
   store_id: number | null;
 }
 
+// users.display_name_custom 列 (0021) の有無を DB ごとにキャッシュする。
+// 列が無い環境 (マイグレーション未適用のテスト DB 等) では従来どおり
+// Google の表示名で上書きする。
+const customNameColCache = new WeakMap<D1Database, Promise<boolean>>();
+
+function usersHasCustomNameCol(db: D1Database): Promise<boolean> {
+  let cached = customNameColCache.get(db);
+  if (!cached) {
+    cached = (async () => {
+      try {
+        const { results } = await db.prepare('PRAGMA table_info(users)').all<{ name: string }>();
+        return results.some((r) => r.name === 'display_name_custom');
+      } catch {
+        return false;
+      }
+    })();
+    customNameColCache.set(db, cached);
+  }
+  return cached;
+}
+
 /** クレームから users を同期し、ロール割当を解決する (Nest 版 UsersService 相当) */
 export async function syncUserAndAssignments(
   db: D1Database,
   claims: { sub: string; email: string; displayName: string },
 ): Promise<AuthUser> {
   const now = Date.now();
+  // display_name_custom = 1 のユーザー (自分でユーザー名を設定済み) は、
+  // ログイン同期で Google の表示名に戻さない
+  const keepCustom = (await usersHasCustomNameCol(db))
+    ? 'display_name = CASE WHEN users.display_name_custom = 1 THEN users.display_name ELSE excluded.display_name END,'
+    : 'display_name = excluded.display_name,';
   await db
     .prepare(
       `INSERT INTO users (external_id, email, display_name, status, last_login_at, created_at, updated_at)
        VALUES (?1, ?2, ?3, 'active', ?4, ?4, ?4)
        ON CONFLICT (external_id) DO UPDATE SET
          email = excluded.email,
-         display_name = excluded.display_name,
+         ${keepCustom}
          last_login_at = excluded.last_login_at,
          updated_at = excluded.updated_at`,
     )
@@ -78,7 +105,7 @@ export async function syncUserAndAssignments(
     .run();
 
   const user = await db
-    .prepare('SELECT id, status FROM users WHERE external_id = ?1')
+    .prepare('SELECT id, status, display_name FROM users WHERE external_id = ?1')
     .bind(claims.sub)
     .first<UserRow>();
   if (!user) throw unauthorized('User sync failed');
@@ -93,7 +120,7 @@ export async function syncUserAndAssignments(
     userId: user.id,
     externalId: claims.sub,
     email: claims.email,
-    displayName: claims.displayName,
+    displayName: user.display_name ?? claims.displayName,
     assignments: results.map((r) => ({
       roleCode: r.role_code as RoleCode,
       warehouseId: r.warehouse_id,

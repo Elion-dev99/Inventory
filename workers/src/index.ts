@@ -117,6 +117,10 @@ import {
   receivePurchaseOrderSchema,
   returnMovementSchema,
   signupSchema,
+  inviteCreateSchema,
+  inviteAcceptSchema,
+  pendingGrantSchema,
+  profilePatchSchema,
   transferSchema,
   updateLocationSchema,
   updateLotSchema,
@@ -671,6 +675,18 @@ app.get('/admin/permissions', (c) =>
 
 <h2>ユーザーとロール付与</h2>
 <div id="users"><div class="skl skl-row"></div><div class="skl skl-row"></div></div>
+
+<h2>招待リンク</h2>
+<p class="small muted">リンクか QR コードを渡すと、受け取った人が参加リクエストを送れます。実際の入店は下の「参加リクエスト」でロールを付与した時点です。リンクの有効期限は発行から7日で、同じリンクから複数人がリクエストできます。</p>
+<div class="card" style="margin-bottom:0.75rem; padding: 1rem;">
+  <label>メモ (任意) <input id="inviteMemo" type="text" maxlength="100" placeholder="例: 新規スタッフ用" style="width: 16em;"></label>
+  <button id="inviteCreateBtn" type="button">招待リンクを発行する</button>
+  <div id="inviteList" style="margin-top:0.75rem;"></div>
+</div>
+
+<h2>参加リクエスト (保留中)</h2>
+<p class="small muted">招待を受けて参加リクエスト中のユーザーです。ロールを選んで付与すると、この店舗のメンバーになります。</p>
+<div id="pendingList"><div class="skl skl-row"></div></div>
 </main>
 
 <script>
@@ -697,6 +713,8 @@ let catalog = [];
 let roleList = [];
 let matrix = {};
 let userList = [];
+let inviteList = [];
+let pendingList = [];
 
 let currentRole = '';
 let savingPerms = false;
@@ -889,6 +907,134 @@ async function onUserAction(act, userId, idx) {
   }
 }
 
+function escH(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function fmtDateTime(ts) { return new Date(ts).toLocaleString('ja-JP'); }
+
+function renderInvites() {
+  const box = document.getElementById('inviteList');
+  if (inviteList.length === 0) { box.textContent = '招待リンクはまだありません。'; return; }
+  box.innerHTML = '';
+  for (const inv of inviteList) {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.style.marginBottom = '0.5rem';
+    div.style.padding = '0.75rem 1rem';
+    const statusLabel = inv.status === 'active' ? '有効' : (inv.status === 'expired' ? '期限切れ' : '取消済み');
+    let html = '<strong>' + escH(inv.memo || '招待リンク') + '</strong> (' + statusLabel + ', 受付 ' + inv.acceptedCount + ' 人, 期限 ' + fmtDateTime(inv.expiresAt) + ')<br>' +
+      '<input type="text" readonly value="' + escH(inv.url) + '" style="width: 100%; max-width: 34em; margin-top: 0.35rem;" onclick="this.select()">';
+    if (inv.status === 'active') {
+      html += '<div style="margin-top: 0.5rem;"><button data-inv-copy="' + inv.id + '">リンクをコピー</button> ' +
+        '<button data-inv-revoke="' + inv.id + '">取り消す</button></div>' +
+        '<img src="/api/v1/admin/invites/' + inv.id + '/qr" alt="招待QRコード" style="width: 132px; height: 132px; margin-top: 0.5rem;">';
+    }
+    div.innerHTML = html;
+    box.appendChild(div);
+  }
+  box.querySelectorAll('button[data-inv-copy]').forEach((btn) => {
+    btn.onclick = () => {
+      const inv = inviteList.find((x) => x.id === Number(btn.dataset.invCopy));
+      if (inv && navigator.clipboard) {
+        navigator.clipboard.writeText(inv.url).then(() => setStatus('招待リンクをコピーしました。')).catch(() => setError('コピーできませんでした。リンクの欄から手動でコピーしてください。'));
+      }
+    };
+  });
+  box.querySelectorAll('button[data-inv-revoke]').forEach((btn) => {
+    btn.onclick = () => revokeInvite(Number(btn.dataset.invRevoke));
+  });
+}
+
+function renderPending() {
+  const box = document.getElementById('pendingList');
+  if (pendingList.length === 0) { box.textContent = '保留中のリクエストはありません。'; return; }
+  box.innerHTML = '';
+  const roleOptions = roleList.map((r) => '<option value="' + r.code + '">' + r.code + '</option>').join('');
+  for (const p of pendingList) {
+    const div = document.createElement('div');
+    div.className = 'card';
+    div.style.marginBottom = '0.5rem';
+    div.style.padding = '0.75rem 1rem';
+    div.innerHTML = '<strong>' + escH(p.displayName || '') + ' (' + escH(p.email) + ')</strong><br>' +
+      '<span class="small muted">リクエスト: ' + fmtDateTime(p.requestedAt) + (p.inviteMemo ? ' / 招待メモ: ' + escH(p.inviteMemo) : '') + '</span><br>' +
+      '<select id="prole-' + p.userId + '">' + roleOptions + '</select> ' +
+      '<button data-pend-grant="' + p.userId + '">付与する</button> ' +
+      '<button data-pend-reject="' + p.userId + '">却下</button>';
+    box.appendChild(div);
+  }
+  box.querySelectorAll('button[data-pend-grant]').forEach((btn) => {
+    btn.onclick = () => grantPending(Number(btn.dataset.pendGrant));
+  });
+  box.querySelectorAll('button[data-pend-reject]').forEach((btn) => {
+    btn.onclick = () => rejectPending(Number(btn.dataset.pendReject));
+  });
+}
+
+async function loadInvitesAndPending() {
+  try {
+    inviteList = await api('/api/v1/admin/invites');
+    renderInvites();
+  } catch (e) {
+    document.getElementById('inviteList').textContent = '招待リンクを読み込めませんでした。';
+  }
+  try {
+    pendingList = await api('/api/v1/admin/pending-members');
+    renderPending();
+  } catch (e) {
+    document.getElementById('pendingList').textContent = '参加リクエストを読み込めませんでした。';
+  }
+}
+
+async function createInvite() {
+  setError(''); setStatus('');
+  const memo = document.getElementById('inviteMemo').value.trim();
+  try {
+    await api('/api/v1/admin/invites', { method: 'POST', body: JSON.stringify(memo ? { memo } : {}) });
+    document.getElementById('inviteMemo').value = '';
+    setStatus('招待リンクを発行しました。');
+    loadInvitesAndPending();
+  } catch (e) {
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
+async function revokeInvite(id) {
+  if (!confirm('この招待リンクを取り消しますか?')) return;
+  setError(''); setStatus('');
+  try {
+    await api('/api/v1/admin/invites/' + id, { method: 'DELETE' });
+    setStatus('招待リンクを取り消しました。');
+    loadInvitesAndPending();
+  } catch (e) {
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
+async function grantPending(userId) {
+  setError(''); setStatus('');
+  const roleCode = document.getElementById('prole-' + userId).value;
+  try {
+    await api('/api/v1/admin/pending-members/' + userId + '/grant', { method: 'POST', body: JSON.stringify({ roleCode }) });
+    setStatus('ユーザー #' + userId + ' に ' + roleCode + ' を付与しました。');
+    loadInvitesAndPending();
+    try { userList = await api('/api/v1/admin/users'); renderUsers(); } catch (e) {}
+  } catch (e) {
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
+async function rejectPending(userId) {
+  if (!confirm('この参加リクエストを却下しますか?')) return;
+  setError(''); setStatus('');
+  try {
+    await api('/api/v1/admin/pending-members/' + userId, { method: 'DELETE' });
+    setStatus('参加リクエストを却下しました。');
+    loadInvitesAndPending();
+  } catch (e) {
+    setError(String(e && e.message ? e.message : e));
+  }
+}
+
 async function loadAll() {
   try {
     const me = await api('/api/v1/me');
@@ -925,6 +1071,8 @@ async function loadAll() {
     document.getElementById('users').textContent = '';
     setError(String(e && e.message ? e.message : e));
   }
+  document.getElementById('inviteCreateBtn').onclick = createInvite;
+  loadInvitesAndPending();
 }
 
 loadAll();
@@ -1086,6 +1234,29 @@ app.get('/auth/callback', async (c) => {
   );
   res.headers.append('Set-Cookie', sessionCookieHeader(sessionToken));
   return res;
+});
+
+/**
+ * 招待リンクの入口 (公開)。有効なトークンならアプリへ ?invite= 付きで転送し、
+ * 受付はログイン後のアプリ側 (POST /api/v1/invites/accept) で行う。
+ * 無効・期限切れ・取消済みは案内ページを返す。
+ */
+app.get('/invite/:token', async (c) => {
+  const token = c.req.param('token');
+  const invalid = (status: 404) =>
+    c.html(
+      simplePageHtml(
+        '招待リンクが無効です',
+        '<p>リンクの有効期限が切れているか、取り消されています。店舗の管理者に新しいリンクを発行してもらってください。</p>',
+      ),
+      status,
+    );
+  if (!(await hasTable(c, 'store_invites'))) return invalid(404);
+  const invite = await findInviteByToken(c.env.DB, token);
+  if (!invite || invite.revoked_at !== null || invite.expires_at <= Date.now()) {
+    return invalid(404);
+  }
+  return c.redirect(`/app?invite=${encodeURIComponent(token)}`, 302);
 });
 
 // ---------------------------------------------------------------- 認証
@@ -1695,7 +1866,7 @@ app.get('/api/v1/me', async (c) => {
   // 起動時の要所なので、互いに独立した読み取りは並列に走らせる
   const [rp, ctx] = await Promise.all([loadRolePermissions(c), softStoreContext(c)]);
   const platform = isPlatformAdmin(me.assignments);
-  const [stores, features, plan, settings, maintenanceRes] = await Promise.all([
+  const [stores, features, plan, settings, maintenanceRes, pendingStores] = await Promise.all([
     // stores 未適用の環境では店舗なしとして扱う
     accessibleStores(c.env.DB, me).catch(() => [] as StoreInfo[]),
     ctx ? effectiveFeatures(c, ctx.store.id) : Promise.resolve(defaultFeatures()),
@@ -1703,6 +1874,19 @@ app.get('/api/v1/me', async (c) => {
     ctx ? getStoreSettings(c.env.DB, ctx.store.id) : Promise.resolve({ currency: 'JPY', timezone: 'Asia/Tokyo' }),
     (async () =>
       c.get('maintenance') ?? (await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null)))(),
+    // 参加リクエスト中 (保留) の店舗 (0021)。テーブルが無ければ空
+    (async () => {
+      if (!(await hasTable(c, 'store_pending_members'))) return [];
+      const { results } = await c.env.DB.prepare(
+        `SELECT p.store_id AS storeId, s.name AS storeName, s.code AS storeCode,
+                p.created_at AS requestedAt
+           FROM store_pending_members p JOIN stores s ON s.id = p.store_id
+          WHERE p.user_id = ?1 ORDER BY p.created_at ASC`,
+      )
+        .bind(me.userId)
+        .all<{ storeId: number; storeName: string; storeCode: string; requestedAt: number }>();
+      return results;
+    })().catch(() => []),
   ]);
   return c.json({
     id: me.userId,
@@ -1717,6 +1901,7 @@ app.get('/api/v1/me', async (c) => {
     features,
     plan,
     settings,
+    pendingStores,
     stores,
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
@@ -1737,6 +1922,42 @@ app.get('/api/v1/me', async (c) => {
 });
 
 // ------------------------------------------------------------ 店舗の選択
+
+/**
+ * 自分のユーザー名 (表示名) を設定する (0021)。
+ * 設定した名前は display_name_custom = 1 になり、以後 Google ログイン時の
+ * 同期で Google 側の表示名に上書きされなくなる。
+ */
+app.patch('/api/v1/me', async (c) => {
+  const me = user(c);
+  const dto = parseWith(profilePatchSchema, await parseJson(c));
+  const name = dto.displayName;
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw new ApiError(400, 'INVALID_DISPLAY_NAME', 'Display name contains invalid characters');
+  }
+  const now = Date.now();
+  if (await hasColumn(c, 'users', 'display_name_custom')) {
+    await c.env.DB.prepare(
+      'UPDATE users SET display_name = ?1, display_name_custom = 1, updated_at = ?2 WHERE id = ?3',
+    )
+      .bind(name, now, me.userId)
+      .run();
+  } else {
+    await c.env.DB.prepare('UPDATE users SET display_name = ?1, updated_at = ?2 WHERE id = ?3')
+      .bind(name, now, me.userId)
+      .run();
+  }
+  await insertAudit(c.env.DB, {
+    actorId: me.userId,
+    action: 'user.profile.update',
+    targetType: 'user',
+    targetId: String(me.userId),
+    payload: { displayName: name },
+    storeId: null,
+    createdAt: now,
+  });
+  return c.json({ id: me.userId, email: me.email, displayName: name });
+});
 
 /** 自分が入れる店舗の一覧と、現在選択中の店舗 */
 app.get('/api/v1/stores', async (c) => {
@@ -1774,6 +1995,122 @@ app.post('/api/v1/session/store', async (c) => {
   }
   await setSessionStore(c.env.DB, c.req.raw, dto.storeId);
   return c.json({ currentStore: store });
+});
+
+// ------------------------------------------------- 招待リンク・参加リクエスト
+
+/** 招待リンクの有効期間 (発行から7日) */
+const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface InviteRow {
+  id: number;
+  store_id: number;
+  token: string;
+  memo: string | null;
+  created_by: number;
+  expires_at: number;
+  revoked_at: number | null;
+  accepted_count: number;
+  created_at: number;
+}
+
+function newInviteToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function findInviteByToken(db: D1Database, token: string): Promise<InviteRow | null> {
+  return db
+    .prepare(
+      'SELECT id, store_id, token, memo, created_by, expires_at, revoked_at, accepted_count, created_at FROM store_invites WHERE token = ?1',
+    )
+    .bind(token)
+    .first<InviteRow>();
+}
+
+function inviteUrl(c: AppContext, token: string): string {
+  return `${new URL(c.req.url).origin}/invite/${token}`;
+}
+
+/**
+ * 招待の受付 (参加リクエスト)。ログイン済みユーザーが招待トークンを送ると、
+ * その店舗の保留エリア (store_pending_members) に入る。実際の入店は管理者が
+ * 保留一覧からロールを付与した時点。既に所属していれば already_member、
+ * 既に保留中なら already_pending を返し、どちらも冪等。
+ */
+app.post('/api/v1/invites/accept', async (c) => {
+  const me = user(c);
+  if (!(await hasTable(c, 'store_invites'))) {
+    throw new ApiError(503, 'INVITES_UNAVAILABLE', 'Invites are not available in this environment');
+  }
+  const dto = parseWith(inviteAcceptSchema, await parseJson(c));
+  const invite = await findInviteByToken(c.env.DB, dto.token);
+  if (!invite) throw new ApiError(404, 'INVITE_NOT_FOUND', 'Invite not found');
+  if (invite.revoked_at !== null) {
+    throw new ApiError(400, 'INVITE_REVOKED', 'This invite has been revoked');
+  }
+  if (invite.expires_at <= Date.now()) {
+    throw new ApiError(400, 'INVITE_EXPIRED', 'This invite has expired');
+  }
+  const store = await getStore(c.env.DB, invite.store_id);
+  if (!store) throw new ApiError(404, 'INVITE_NOT_FOUND', 'Invite store not found');
+  if (store.status === 'suspended' && !isPlatformAdmin(me.assignments)) {
+    throw new ApiError(403, 'STORE_SUSPENDED', 'This store is suspended.');
+  }
+  const storeJson = { id: store.id, name: store.name, code: store.code };
+  if (isPlatformAdmin(me.assignments) || me.assignments.some((a) => a.storeId === store.id)) {
+    return c.json({ status: 'already_member', store: storeJson });
+  }
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM store_pending_members WHERE store_id = ?1 AND user_id = ?2',
+  )
+    .bind(store.id, me.userId)
+    .first<{ id: number }>();
+  if (existing) return c.json({ status: 'already_pending', store: storeJson });
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare('INSERT INTO store_pending_members (store_id, user_id, invite_id, created_at) VALUES (?1, ?2, ?3, ?4)')
+      .bind(store.id, me.userId, invite.id, now),
+    c.env.DB
+      .prepare('UPDATE store_invites SET accepted_count = accepted_count + 1 WHERE id = ?1')
+      .bind(invite.id),
+    await buildAuditInsert(c.env.DB, {
+      actorId: me.userId,
+      action: 'invite.accepted',
+      targetType: 'store',
+      targetId: String(store.id),
+      payload: { inviteId: invite.id },
+      storeId: store.id,
+      createdAt: now,
+    }),
+  ]);
+  return c.json({ status: 'pending', store: storeJson });
+});
+
+/** 自分の参加リクエストを取り消す */
+app.delete('/api/v1/me/pending/:storeId', async (c) => {
+  const me = user(c);
+  if (!(await hasTable(c, 'store_pending_members'))) throw notFound('Pending request not found');
+  const storeId = Number(c.req.param('storeId'));
+  if (!Number.isInteger(storeId) || storeId <= 0) throw notFound('Pending request not found');
+  const res = await c.env.DB.prepare(
+    'DELETE FROM store_pending_members WHERE store_id = ?1 AND user_id = ?2',
+  )
+    .bind(storeId, me.userId)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) throw notFound('Pending request not found');
+  await insertAudit(c.env.DB, {
+    actorId: me.userId,
+    action: 'invite.pending.withdrawn',
+    targetType: 'store',
+    targetId: String(storeId),
+    payload: null,
+    storeId,
+    createdAt: Date.now(),
+  });
+  return c.json({ ok: true });
 });
 
 // ------------------------------------------------- セルフサインアップ
@@ -6671,6 +7008,243 @@ app.put('/api/v1/admin/users/:userId/roles', async (c) => {
   ];
   await c.env.DB.batch(stmts);
   return c.json({ userId, assignments });
+});
+
+// ------------------------------------------------- 招待リンク・保留 (店舗管理者)
+
+/**
+ * 招待リンクの発行 (admin.users、現在店舗)。トークンは推測不能な乱数で、
+ * 有効期限7日・取消し可能。同じリンクから複数人が参加リクエストできる。
+ */
+app.post('/api/v1/admin/invites', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_invites'))) {
+    throw new ApiError(503, 'INVITES_UNAVAILABLE', 'Invites are not available in this environment');
+  }
+  const dto = parseWith(inviteCreateSchema, await parseJson(c));
+  const now = Date.now();
+  const token = newInviteToken();
+  const res = await c.env.DB.prepare(
+    'INSERT INTO store_invites (store_id, token, memo, created_by, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
+  )
+    .bind(ctx.store.id, token, dto.memo ?? null, user(c).userId, now + INVITE_TTL_MS, now)
+    .run();
+  const inviteId = Number(res.meta.last_row_id);
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'invite.create',
+    targetType: 'store_invite',
+    targetId: String(inviteId),
+    payload: { memo: dto.memo ?? null },
+    storeId: ctx.store.id,
+    createdAt: now,
+  });
+  return c.json({
+    id: inviteId,
+    token,
+    url: inviteUrl(c, token),
+    memo: dto.memo ?? null,
+    expiresAt: now + INVITE_TTL_MS,
+    createdAt: now,
+  });
+});
+
+/** 招待リンクの一覧 (現在店舗)。状態と受付数つき */
+app.get('/api/v1/admin/invites', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_invites'))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, token, memo, expires_at AS expiresAt, revoked_at AS revokedAt,
+            accepted_count AS acceptedCount, created_at AS createdAt
+       FROM store_invites WHERE store_id = ?1 ORDER BY id DESC`,
+  )
+    .bind(ctx.store.id)
+    .all<{
+      id: number;
+      token: string;
+      memo: string | null;
+      expiresAt: number;
+      revokedAt: number | null;
+      acceptedCount: number;
+      createdAt: number;
+    }>();
+  const now = Date.now();
+  return c.json(
+    results.map((r) => ({
+      ...r,
+      url: inviteUrl(c, r.token),
+      status: r.revokedAt !== null ? 'revoked' : r.expiresAt <= now ? 'expired' : 'active',
+    })),
+  );
+});
+
+/** 招待リンクの取り消し (現在店舗のものだけ) */
+app.delete('/api/v1/admin/invites/:id', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_invites'))) throw notFound('Invite not found');
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) throw notFound('Invite not found');
+  const now = Date.now();
+  const res = await c.env.DB.prepare(
+    'UPDATE store_invites SET revoked_at = ?1 WHERE id = ?2 AND store_id = ?3 AND revoked_at IS NULL',
+  )
+    .bind(now, id, ctx.store.id)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) throw notFound('Invite not found');
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'invite.revoke',
+    targetType: 'store_invite',
+    targetId: String(id),
+    payload: null,
+    storeId: ctx.store.id,
+    createdAt: now,
+  });
+  return c.json({ ok: true });
+});
+
+/** 招待 QR コードの SVG (現在店舗の招待だけ) */
+app.get('/api/v1/admin/invites/:id/qr', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_invites'))) throw notFound('Invite not found');
+  const id = Number(c.req.param('id'));
+  if (!Number.isInteger(id) || id <= 0) throw notFound('Invite not found');
+  const invite = await c.env.DB.prepare(
+    'SELECT token FROM store_invites WHERE id = ?1 AND store_id = ?2',
+  )
+    .bind(id, ctx.store.id)
+    .first<{ token: string }>();
+  if (!invite) throw notFound('Invite not found');
+  return new Response(qrSvg(inviteUrl(c, invite.token), 5, 10), {
+    headers: { 'Content-Type': 'image/svg+xml' },
+  });
+});
+
+/** 保留中 (参加リクエスト) のユーザー一覧。全体管理者は店舗側に出さない */
+app.get('/api/v1/admin/pending-members', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_pending_members'))) return c.json([]);
+  const { results } = await c.env.DB.prepare(
+    `SELECT p.id AS pendingId, p.user_id AS userId, u.email, u.display_name AS displayName,
+            p.created_at AS requestedAt, i.memo AS inviteMemo
+       FROM store_pending_members p
+       JOIN users u ON u.id = p.user_id
+       LEFT JOIN store_invites i ON i.id = p.invite_id
+      WHERE p.store_id = ?1 ORDER BY p.created_at ASC`,
+  )
+    .bind(ctx.store.id)
+    .all<{
+      pendingId: number;
+      userId: number;
+      email: string;
+      displayName: string;
+      requestedAt: number;
+      inviteMemo: string | null;
+    }>();
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json(results.filter((r) => !hidden.has(r.userId)));
+});
+
+/**
+ * 保留ユーザーへのロール付与。割当の追加と保留の削除を1バッチで行う。
+ * プランのユーザー上限は通常のロール付与と同じルールで数える。
+ */
+app.post('/api/v1/admin/pending-members/:userId/grant', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_pending_members'))) throw notFound('Pending request not found');
+  const userId = Number(c.req.param('userId'));
+  if (!Number.isInteger(userId) || userId <= 0) throw notFound('Pending request not found');
+  if ((await hiddenPlatformUserIds(c, ctx.store.id)).has(userId)) {
+    throw notFound('Pending request not found');
+  }
+  const pending = await c.env.DB.prepare(
+    'SELECT id FROM store_pending_members WHERE store_id = ?1 AND user_id = ?2',
+  )
+    .bind(ctx.store.id, userId)
+    .first<{ id: number }>();
+  if (!pending) throw notFound('Pending request not found');
+  const dto = parseWith(pendingGrantSchema, await parseJson(c));
+  const roles = await listRoles(c);
+  if (!roles.some((r) => r.code === dto.roleCode)) {
+    throw new ApiError(422, 'UNKNOWN_ROLE', `Unknown role: ${dto.roleCode}`);
+  }
+  // プランのユーザー上限: 組織に未所属のユーザーを増やす場合だけ数える
+  const plan = await resolveStorePlan(c.env.DB, ctx.store.id);
+  if (plan.organization && plan.def.limits.users !== null) {
+    const member = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM user_roles
+        WHERE user_id = ?1 AND store_id IN (SELECT id FROM stores WHERE organization_id = ?2)`,
+    )
+      .bind(userId, plan.organization.id)
+      .first<{ n: number }>();
+    if ((member?.n ?? 0) === 0) {
+      const usage = await organizationUsage(c.env.DB, plan.organization.id);
+      if (exceedsLimit(plan.def.limits.users, usage.users, 1)) {
+        throw planLimitError(plan.def.key, 'users', plan.def.limits.users, usage.users);
+      }
+    }
+  }
+  const now = Date.now();
+  const already = await c.env.DB.prepare(
+    'SELECT id FROM user_roles WHERE user_id = ?1 AND role_code = ?2 AND store_id = ?3 AND warehouse_id IS NULL',
+  )
+    .bind(userId, dto.roleCode, ctx.store.id)
+    .first<{ id: number }>();
+  const stmts: D1PreparedStatement[] = [];
+  if (!already) {
+    stmts.push(
+      c.env.DB
+        .prepare('INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (?1, ?2, NULL, ?3)')
+        .bind(userId, dto.roleCode, ctx.store.id),
+    );
+  }
+  stmts.push(
+    c.env.DB
+      .prepare('DELETE FROM store_pending_members WHERE store_id = ?1 AND user_id = ?2')
+      .bind(ctx.store.id, userId),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'invite.pending.granted',
+      targetType: 'user',
+      targetId: String(userId),
+      payload: { roleCode: dto.roleCode, storeId: ctx.store.id },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
+  );
+  await c.env.DB.batch(stmts);
+  return c.json({ userId, roleCode: dto.roleCode });
+});
+
+/** 保留ユーザーの却下 (保留を取り消す。アカウント自体は消えない) */
+app.delete('/api/v1/admin/pending-members/:userId', async (c) => {
+  await requirePermission(c, Permission.ADMIN_USERS);
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_pending_members'))) throw notFound('Pending request not found');
+  const userId = Number(c.req.param('userId'));
+  if (!Number.isInteger(userId) || userId <= 0) throw notFound('Pending request not found');
+  const res = await c.env.DB.prepare(
+    'DELETE FROM store_pending_members WHERE store_id = ?1 AND user_id = ?2',
+  )
+    .bind(ctx.store.id, userId)
+    .run();
+  if ((res.meta.changes ?? 0) === 0) throw notFound('Pending request not found');
+  await insertAudit(c.env.DB, {
+    actorId: user(c).userId,
+    action: 'invite.pending.rejected',
+    targetType: 'user',
+    targetId: String(userId),
+    payload: null,
+    storeId: ctx.store.id,
+    createdAt: Date.now(),
+  });
+  return c.json({ ok: true });
 });
 
 // ------------------------------------------------------- 監査ログ / エクスポート

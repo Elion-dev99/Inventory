@@ -48,6 +48,7 @@ export const APP_HTML = `<!doctype html>
 
 <div id="noAssignBox" class="center-box" style="display:none">
   <h2>はじめる</h2>
+  <div id="pendingArea" style="display:none"></div>
   <p class="muted">ログインはできていますが、このアカウントにはまだ店舗が割り当てられていません。自分の組織と店舗を作成して使い始めるか、管理者にロール付与を依頼してください。</p>
   <form class="grid" id="signupForm" style="text-align:left">
     <label>組織名<input id="signupOrgName" type="text" maxlength="100" placeholder="例: 株式会社サンプル" autocomplete="organization"></label>

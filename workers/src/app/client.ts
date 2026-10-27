@@ -332,6 +332,9 @@ function errMsg(e) {
   if (e && e.code === 'PLAN_FEATURE_NOT_AVAILABLE') return '現在のプランでは使えません';
   if (e && e.code === 'STEP_UP_REQUIRED') return '再認証が必要です。';
   if (e && e.code === 'STEP_UP_CANCELLED') return '再認証がキャンセルされました。';
+  if (e && e.code === 'INVITE_NOT_FOUND') return '招待リンクが見つかりません。';
+  if (e && e.code === 'INVITE_EXPIRED') return '招待リンクの有効期限が切れています。管理者に新しいリンクを発行してもらってください。';
+  if (e && e.code === 'INVITE_REVOKED') return 'この招待リンクは取り消されています。管理者に新しいリンクを発行してもらってください。';
   return e && e.message ? e.message : String(e);
 }
 function msgHtml(kind, text) {
@@ -351,6 +354,8 @@ var state = {
   masterExtras: null,
   masterError: '',
   flash: '',
+  /* 招待受付の失敗メッセージ (はじめる画面の保留エリアに出す) */
+  inviteError: '',
   refreshTimer: null,
   /* お知らせの未読数 (ドックのホームバッジと連動) */
   annUnread: 0,
@@ -1007,13 +1012,23 @@ function loadMore() {
   }
   h += '<h3>アカウント</h3><div class="group">';
   if (state.me) {
-    h += '<div class="group-row static"><span class="row-label">' + esc(state.me.email) + (state.me.displayName ? ' (' + esc(state.me.displayName) + ')' : '') + '</span></div>';
+    h += '<button class="group-row" id="moreProfileName"><span class="row-label">ユーザー名: ' + esc(state.me.displayName || '未設定') + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
+    h += '<div class="group-row static"><span class="row-label">' + esc(state.me.email) + '</span></div>';
     if (state.me.currentStore) {
       h += '<div class="group-row static"><span class="row-label">現在の店舗: ' + esc(state.me.currentStore.name) + ' (' + esc(state.me.currentStore.code) + ')</span></div>';
     }
   }
   h += '<button class="group-row danger" id="moreLogout"><span class="row-label">ログアウト</span></button>';
   h += '</div>';
+  var pendList = (state.me && state.me.pendingStores) || [];
+  if (pendList.length) {
+    h += '<h3>参加リクエスト中</h3><div class="group">';
+    pendList.forEach(function (p) {
+      h += '<div class="group-row static"><span class="row-label">' + esc(p.storeName) + ' — 承認待ち</span></div>';
+      h += '<button class="group-row danger" data-withdraw="' + p.storeId + '"><span class="row-label">' + esc(p.storeName) + ' へのリクエストを取り消す</span></button>';
+    });
+    h += '</div>';
+  }
   el('view').innerHTML = h;
   var rows = el('view').querySelectorAll('button[data-view]');
   for (var j = 0; j < rows.length; j++) {
@@ -1021,6 +1036,26 @@ function loadMore() {
   }
   var lo = el('moreLogout');
   if (lo) lo.onclick = doLogout;
+  var pn = el('moreProfileName');
+  if (pn) pn.onclick = editProfileName;
+  var wbs = el('view').querySelectorAll('button[data-withdraw]');
+  for (var w = 0; w < wbs.length; w++) {
+    wbs[w].onclick = function () { withdrawPending(Number(this.getAttribute('data-withdraw'))); };
+  }
+}
+/* ユーザー名 (表示名) の変更。設定した名前は Google ログインでも上書きされない */
+function editProfileName() {
+  var current = (state.me && state.me.displayName) || '';
+  var name = prompt('ユーザー名を入力してください (50文字まで)', current);
+  if (name === null) return;
+  name = name.trim();
+  if (!name) { alert('ユーザー名を入力してください。'); return; }
+  if (name.length > 50) { alert('ユーザー名は50文字までです。'); return; }
+  api('/api/v1/me', { method: 'PATCH', body: { displayName: name } }).then(function (r) {
+    state.me.displayName = r.displayName;
+    el('userLabel').textContent = state.me.email + (r.displayName ? ' (' + r.displayName + ')' : '');
+    showView('more');
+  }).catch(function (e) { alert(errMsg(e)); });
 }
 function doLogout() {
   api('/api/v1/auth/logout', { method: 'POST' }).then(function () { location.href = '/'; })
@@ -5207,10 +5242,74 @@ function initSignupForm() {
   };
 }
 
+/* ---------------- 招待リンクの受付 (参加リクエスト) ---------------- */
+/* /invite/:token は /app?invite=TOKEN へ転送してくる。トークンは
+   localStorage に退避し (Google ログインの往復を跨ぐため)、ログインが
+   確認できた起動タイミングで POST /api/v1/invites/accept を送る */
+function captureInviteToken() {
+  try {
+    var m = /[?&]invite=([^&]+)/.exec(location.search || '');
+    if (m) {
+      localStorage.setItem('pendingInvite', decodeURIComponent(m[1]));
+      history.replaceState(null, '', location.pathname);
+    }
+  } catch (e) {}
+}
+function stashedInviteToken() {
+  try { return localStorage.getItem('pendingInvite'); } catch (e) { return null; }
+}
+function acceptStashedInvite() {
+  var token = stashedInviteToken();
+  if (!token) return Promise.resolve();
+  return api('/api/v1/invites/accept', { method: 'POST', body: { token: token } }).then(function (r) {
+    try { localStorage.removeItem('pendingInvite'); } catch (e) {}
+    if (r && r.status === 'pending' && r.store) {
+      state.flash = r.store.name + ' への参加リクエストを送信しました。管理者の承認をお待ちください。';
+    } else if (r && r.status === 'already_member' && r.store) {
+      state.flash = r.store.name + ' には既に参加しています。';
+    }
+  }).catch(function (e) {
+    try { localStorage.removeItem('pendingInvite'); } catch (e2) {}
+    state.inviteError = errMsg(e);
+  });
+}
+/* はじめる画面の保留エリア: リクエスト中の店舗と取り消しボタン */
+function renderPendingArea() {
+  var area = el('pendingArea');
+  if (!area) return;
+  var list = (state.me && state.me.pendingStores) || [];
+  var h = '';
+  if (state.inviteError) h += msgHtml('error', state.inviteError);
+  list.forEach(function (p) {
+    h += '<div class="group" style="text-align:left; margin-bottom:0.75rem;"><div class="group-row static" style="display:block">' +
+      '<span class="row-label">' + esc(p.storeName) + '</span><br>' +
+      '<span class="small muted">参加リクエスト中 — 管理者の承認待ちです</span><br>' +
+      '<button class="btn secondary small" type="button" data-withdraw="' + p.storeId + '" style="margin-top:0.45rem">リクエストを取り消す</button>' +
+      '</div></div>';
+  });
+  if (!h) { area.style.display = 'none'; area.innerHTML = ''; return; }
+  area.innerHTML = h;
+  area.style.display = '';
+  var btns = area.querySelectorAll('button[data-withdraw]');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].onclick = function () { withdrawPending(Number(this.getAttribute('data-withdraw'))); };
+  }
+}
+function withdrawPending(storeId) {
+  api('/api/v1/me/pending/' + storeId, { method: 'DELETE' }).then(function () { location.reload(); })
+    .catch(function (e) { state.inviteError = errMsg(e); renderPendingArea(); });
+}
+
 function boot() {
   el('sheetOverlay').addEventListener('click', function (e) { if (e.target === this) closeSheet(); });
   el('sheetCancel').onclick = closeSheet;
+  captureInviteToken();
   api('/api/v1/me').then(function (me) {
+    if (stashedInviteToken()) {
+      return acceptStashedInvite().then(function () { return api('/api/v1/me'); });
+    }
+    return me;
+  }).then(function (me) {
     state.me = me;
     state.features = me.features || {};
     (me.permissions || []).forEach(function (p) { state.perms[p] = true; });
@@ -5218,6 +5317,7 @@ function boot() {
     if ((!me.assignments || me.assignments.length === 0) && !me.isPlatformAdmin) {
       el('noAssignBox').style.display = '';
       initSignupForm();
+      renderPendingArea();
       return;
     }
     if (applyMaintenance(me.maintenance)) return;
