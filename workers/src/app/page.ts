@@ -74,6 +74,7 @@ export const APP_HTML = `<!doctype html>
   <p class="muted">複数の店舗に所属しています。作業する店舗を選ぶと、その店舗のデータだけが表示されます。</p>
   <div id="storeList" class="group" style="text-align:left"></div>
   <p id="storeMsg"></p>
+  <p><button class="btn secondary" id="storeLogoutBtn" type="button">ログアウト</button></p>
 </div>
 
 <div id="appBox" style="display:none">

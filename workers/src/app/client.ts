@@ -4700,6 +4700,7 @@ function selectStore(storeId) {
 }
 function showStorePicker(me) {
   el('storeBox').style.display = '';
+  el('storeLogoutBtn').onclick = doLogout;
   var stores = me.stores || [];
   var h = '';
   for (var i = 0; i < stores.length; i++) {
