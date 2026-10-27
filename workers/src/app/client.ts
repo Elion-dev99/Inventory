@@ -1272,6 +1272,7 @@ function loadSetup() {
       { key: 'products', label: '商品を登録', detail: '現在 ' + d.counts.products + ' 件', view: 'master', btn: 'マスタ管理' },
       { key: 'members', label: 'ユーザーを2人以上割り当てる', detail: '現在 ' + d.counts.members + ' 人', href: '/admin/permissions', btn: '権限管理' },
       { key: 'features', label: '機能設定を確認', detail: '使う機能のオン/オフ', href: '/admin/permissions', btn: '権限管理' },
+      { key: 'settings', label: '店舗設定を確認', detail: '通貨とタイムゾーン', view: 'storeSettings', btn: '店舗設定' },
     ];
     var h = '<h2>はじめに</h2>';
     h += '<p class="muted">セットアップ ' + d.doneCount + ' / ' + d.totalCount + (d.complete ? ' — 完了しています' : '') + '</p>';
@@ -5162,6 +5163,48 @@ function renderSecurity(creds, sessions, events) {
   }
 }
 
+/* ---------------- セルフサインアップ (割当なしユーザー向け) ---------------- */
+/* noAssignBox のフォームを初期化する。テンプレート一覧を取り、作成ボタンで
+   POST /api/v1/signup を呼ぶ。成功したら再読み込みして通常の起動フローに入る */
+var signupInitDone = false;
+function initSignupForm() {
+  if (signupInitDone) return;
+  signupInitDone = true;
+  var sel = el('signupTemplate');
+  api('/api/v1/signup/templates').then(function (d) {
+    var h = '';
+    (d.templates || []).forEach(function (t) {
+      h += '<option value="' + esc(t.key) + '">' + esc(t.name) + ' — ' + esc(t.description) + '</option>';
+    });
+    sel.innerHTML = h;
+  }).catch(function () {
+    sel.innerHTML = '<option value="general">汎用</option>';
+  });
+  el('signupBtn').onclick = function () {
+    var orgName = el('signupOrgName').value.trim();
+    var storeName = el('signupStoreName').value.trim();
+    var msg = el('signupMsg');
+    msg.style.display = 'none';
+    if (!orgName || !storeName) {
+      msg.textContent = '組織名と店舗名を入力してください。';
+      msg.style.display = '';
+      return;
+    }
+    var btn = el('signupBtn');
+    btn.disabled = true;
+    api('/api/v1/signup', {
+      method: 'POST',
+      body: { organizationName: orgName, storeName: storeName, templateKey: sel.value || 'general' },
+    }).then(function () {
+      location.reload();
+    }).catch(function (e) {
+      btn.disabled = false;
+      msg.textContent = errMsg(e);
+      msg.style.display = '';
+    });
+  };
+}
+
 function boot() {
   el('sheetOverlay').addEventListener('click', function (e) { if (e.target === this) closeSheet(); });
   el('sheetCancel').onclick = closeSheet;
@@ -5172,6 +5215,7 @@ function boot() {
     el('loadingBox').style.display = 'none';
     if ((!me.assignments || me.assignments.length === 0) && !me.isPlatformAdmin) {
       el('noAssignBox').style.display = '';
+      initSignupForm();
       return;
     }
     if (applyMaintenance(me.maintenance)) return;
@@ -5210,7 +5254,7 @@ function boot() {
     el('noAssignBox').style.display = 'none';
     el('errorBox').style.display = 'none';
     if (err && err.status === 401) el('loginBox').style.display = '';
-    else if (err && err.status === 403) el('noAssignBox').style.display = '';
+    else if (err && err.status === 403) { el('noAssignBox').style.display = ''; initSignupForm(); }
     else el('errorBox').style.display = '';
   });
   var retryBtn = el('bootRetryBtn');

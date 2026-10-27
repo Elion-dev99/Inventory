@@ -377,6 +377,17 @@ export const bulkProductsSchema = z.object({
   }),
 });
 
+/**
+ * セルフサインアップ (導入の汎用化)。組織名と最初の店舗名、業種テンプレートで
+ * 組織 (フリープラン)・店舗・既定倉庫を作り、作成者を店舗の SYSTEM_ADMIN にする。
+ * templateKey の実在検証は lib/templates.ts のカタログ側で行う。
+ */
+export const signupSchema = z.object({
+  organizationName: z.string().trim().min(1).max(100),
+  storeName: z.string().trim().min(1).max(100),
+  templateKey: z.string().min(1).max(50).optional(),
+});
+
 /** 'YYYY-MM-DD' -> UTC 0時のミリ秒。不正な日付は null */
 export function parseDateOnly(s: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);

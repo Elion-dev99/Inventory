@@ -289,4 +289,64 @@ describe('組織・プラン管理', () => {
     expect(changed.status).toBe(200);
     expect(changed.body.planKey).toBe('pro');
   });
+
+  it('店舗作成で業種テンプレートを指定すると初期データが投入される', async () => {
+    // この spec は 0020 を適用しないため、テンプレートが使う 3 テーブルだけ
+    // 0020 と同形で用意する
+    for (const ddl of [
+      `CREATE TABLE IF NOT EXISTS movement_reason_codes (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER NOT NULL, kind TEXT NOT NULL,
+         code TEXT NOT NULL, label TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0,
+         is_active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL, deleted_at INTEGER)`,
+      `CREATE TABLE IF NOT EXISTS departments (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER NOT NULL, name TEXT NOT NULL,
+         sort_order INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1,
+         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER)`,
+      `CREATE TABLE IF NOT EXISTS product_categories (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, store_id INTEGER NOT NULL, name TEXT NOT NULL,
+         sort_order INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL, deleted_at INTEGER)`,
+    ]) {
+      await testEnv.DB.prepare(ddl).run();
+    }
+
+    const orgs = await api('/api/platform/organizations', { cookie: adminCookie });
+    const dgosk = (orgs.body.organizations as { id: number; name: string }[]).find((o) => o.name === 'DGOSK');
+
+    // 未知のテンプレートは店舗を作らずに 400
+    const bad = await api('/api/platform/stores', {
+      cookie: adminCookie,
+      method: 'POST',
+      body: { code: 'TPL-BAD', name: '不正テンプレート', organizationId: dgosk?.id, template: 'nope' },
+    });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toBe('INVALID_TEMPLATE');
+
+    const created = await api('/api/platform/stores', {
+      cookie: adminCookie,
+      method: 'POST',
+      body: { code: 'TPL-FOOD', name: 'テンプレート店舗', organizationId: dgosk?.id, template: 'food' },
+    });
+    expect(created.status).toBe(201);
+    const applied = (created.body.templateApplied as { key: string; applied: { categories: number; departments: number; locations: number } }).applied;
+    expect(applied.categories).toBe(5);
+    expect(applied.departments).toBe(3);
+    expect(applied.locations).toBe(1);
+    const storeId = created.body.id as number;
+
+    const catCount = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM product_categories WHERE store_id = ?1 AND deleted_at IS NULL',
+    ).bind(storeId).first<{ n: number }>();
+    expect(catCount?.n).toBe(5);
+    const qualityCount = await testEnv.DB.prepare(
+      "SELECT COUNT(*) AS n FROM movement_reason_codes WHERE store_id = ?1 AND kind = 'disposal' AND code = 'quality'",
+    ).bind(storeId).first<{ n: number }>();
+    expect(qualityCount?.n).toBe(1);
+    const locCount = await testEnv.DB.prepare(
+      `SELECT COUNT(*) AS n FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+        WHERE w.store_id = ?1 AND loc.code = 'KITCHEN'`,
+    ).bind(storeId).first<{ n: number }>();
+    expect(locCount?.n).toBe(1);
+  });
 });

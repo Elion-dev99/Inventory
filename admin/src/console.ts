@@ -123,6 +123,14 @@ export const CONSOLE_HTML = `<!doctype html>
     <input id="newStoreCode" type="text" placeholder="店舗コード (例: TOKYO1)" style="width: 12em;">
     <input id="newStoreName" type="text" placeholder="店舗名" style="width: 14em;">
     <label>組織 <select id="newStoreOrg"></select></label>
+    <label>業種テンプレート <select id="newStoreTemplate">
+      <option value="">なし</option>
+      <option value="general">汎用</option>
+      <option value="retail">小売・店舗</option>
+      <option value="food">飲食店</option>
+      <option value="office">オフィス</option>
+      <option value="warehouse">倉庫・物流</option>
+    </select></label>
     <button class="btn" id="createStore">作成</button>
   </div></div>
   <div id="storeDetail" class="detail-box"></div>
@@ -635,6 +643,8 @@ async function createStore() {
   const orgSel = el('newStoreOrg');
   const body = { code, name };
   if (orgSel && orgSel.value) body.organizationId = Number(orgSel.value);
+  const tplSel = el('newStoreTemplate');
+  if (tplSel && tplSel.value) body.template = tplSel.value;
   setError(''); setStatus('作成中…');
   try {
     await api('/api/platform/stores', { method: 'POST', body: JSON.stringify(body) });

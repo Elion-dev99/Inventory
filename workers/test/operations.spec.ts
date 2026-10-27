@@ -159,10 +159,11 @@ beforeAll(async () => {
 
 describe('初期セットアップ支援', () => {
   it('setup/status は実データで段階的に判定される', async () => {
-    // 初期状態: 場所・商品なし / メンバー 1 人 / 機能フラグ未設定
+    // 初期状態: 場所・商品なし / メンバー 1 人 / 機能フラグ・店舗設定 未設定
     let res = await api('/api/v1/setup/status', managerToken);
     expect(res.status).toBe(200);
-    expect(res.body.items).toEqual({ locations: false, products: false, members: false, features: false });
+    expect(res.body.items).toEqual({ locations: false, products: false, members: false, features: false, settings: false });
+    expect(res.body.totalCount).toBe(5);
     expect(res.body.doneCount).toBe(0);
     expect(res.body.complete).toBe(false);
 
@@ -194,7 +195,7 @@ describe('初期セットアップ支援', () => {
     expect(res.body.items.members).toBe(true);
     expect(res.body.counts.members).toBe(2);
 
-    // 機能フラグを 1 件でも設定すると features が立ち、完了になる
+    // 機能フラグを 1 件でも設定すると features が立つ
     await testEnv.DB.prepare(
       `INSERT INTO feature_flags (store_id, key, enabled, updated_by, updated_at)
        VALUES (1, 'alerts', 1, 2, ?1)`,
@@ -202,6 +203,26 @@ describe('初期セットアップ支援', () => {
     res = await api('/api/v1/setup/status', managerToken);
     expect(res.body.items.features).toBe(true);
     expect(res.body.doneCount).toBe(4);
+    expect(res.body.complete).toBe(false);
+
+    // 店舗設定を保存すると settings が立ち、完了になる
+    // (この spec は 0020 を適用しないため、store_settings だけ 0020 と同形で用意する)
+    await testEnv.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS store_settings (
+         store_id INTEGER NOT NULL REFERENCES stores(id),
+         key TEXT NOT NULL,
+         value TEXT NOT NULL,
+         updated_at INTEGER NOT NULL,
+         PRIMARY KEY (store_id, key)
+       )`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO store_settings (store_id, key, value, updated_at)
+       VALUES (1, 'currency', 'JPY', ?1)`,
+    ).bind(Date.now()).run();
+    res = await api('/api/v1/setup/status', managerToken);
+    expect(res.body.items.settings).toBe(true);
+    expect(res.body.doneCount).toBe(5);
     expect(res.body.complete).toBe(true);
   });
 

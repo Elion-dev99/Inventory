@@ -47,8 +47,16 @@ export const APP_HTML = `<!doctype html>
 </div>
 
 <div id="noAssignBox" class="center-box" style="display:none">
-  <h2>権限が付与されていません</h2>
-  <p class="muted">ログインはできていますが、このアカウントにはまだロールが割り当てられていません。管理者にロール付与を依頼してください。</p>
+  <h2>はじめる</h2>
+  <p class="muted">ログインはできていますが、このアカウントにはまだ店舗が割り当てられていません。自分の組織と店舗を作成して使い始めるか、管理者にロール付与を依頼してください。</p>
+  <form class="grid" id="signupForm" style="text-align:left">
+    <label>組織名<input id="signupOrgName" type="text" maxlength="100" placeholder="例: 株式会社サンプル" autocomplete="organization"></label>
+    <label>店舗名<input id="signupStoreName" type="text" maxlength="100" placeholder="例: 本店"></label>
+    <label>業種テンプレート<select id="signupTemplate"></select></label>
+  </form>
+  <p class="small muted">テンプレートを選ぶと、カテゴリ・部門・理由コードと最初の保管場所が初期設定されます。プランはフリーで始まります。</p>
+  <p><button class="btn" id="signupBtn" type="button">組織と店舗を作成して始める</button></p>
+  <p class="small danger" id="signupMsg" style="display:none"></p>
 </div>
 
 <div id="maintenanceBox" class="center-box" style="display:none">

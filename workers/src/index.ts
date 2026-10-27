@@ -116,6 +116,7 @@ import {
   poScheduleSchema,
   receivePurchaseOrderSchema,
   returnMovementSchema,
+  signupSchema,
   transferSchema,
   updateLocationSchema,
   updateLotSchema,
@@ -156,6 +157,7 @@ import {
 } from './lib/features';
 import {
   exceedsLimit,
+  hasOrganizationsTable,
   organizationUsage,
   planAllowsFeature,
   planAllowsModule,
@@ -165,6 +167,12 @@ import {
   singleStoreUsage,
   type ModuleKey,
 } from './lib/plans';
+import {
+  applyIndustryTemplate,
+  findTemplate,
+  isTemplateKey,
+  templateCatalogJson,
+} from './lib/templates';
 import { parseCsv, toCsv } from './lib/csv';
 import {
   recordMaintenanceRejections,
@@ -1015,7 +1023,7 @@ ${body}
   const note =
     authUser.assignments.length > 0
       ? '<p>このまま業務 API を利用できます。</p>'
-      : '<p>アカウントは作成されましたが、権限はまだ付いていません。この画面が出たことをチャットで教えてください。管理者ロールを付与します。</p>';
+      : '<p>アカウントは作成されましたが、権限はまだ付いていません。アプリを開くと、そのまま自分の組織・店舗を作成して使い始めるか、管理者にロール付与を依頼できます。</p>';
   // ブラウザ向けにログインセッションを発行する (Cookie は HttpOnly)。
   // 以後の API / WebSocket はこのセッションで認証できる。
   // 発行時の UA / IP はセッション管理画面での端末表示用に記録する (0017)。
@@ -1660,6 +1668,117 @@ app.post('/api/v1/session/store', async (c) => {
   return c.json({ currentStore: store });
 });
 
+// ------------------------------------------------- セルフサインアップ
+
+/** 業種テンプレートのカタログ (サインアップ画面の選択肢) */
+app.get('/api/v1/signup/templates', async (c) => {
+  user(c);
+  return c.json({ templates: templateCatalogJson() });
+});
+
+/**
+ * セルフサインアップ (導入の汎用化)。ログイン済みで割当がまだ無いユーザーが、
+ * 自分の組織 (フリープラン) と最初の店舗を作って使い始める導線。
+ * - 組織 + 店舗 + 既定倉庫 (WH-01) を作り、作成者を店舗の SYSTEM_ADMIN にする
+ * - 業種テンプレートでカテゴリ・部門・理由コード・最初の保管場所を初期投入する
+ * - セッションの現在店舗を新しい店舗に切り替える
+ * 既に割当があるユーザー (全体管理者を含む) は 409、Bearer 認証はセッションが
+ * 無いため 400 (現在店舗をセッションに保存できない)。
+ */
+app.post('/api/v1/signup', async (c) => {
+  const me = user(c);
+  if (!me.viaSession) {
+    throw new ApiError(400, 'SESSION_REQUIRED', 'Signup requires a login session');
+  }
+  if (isPlatformAdmin(me.assignments)) {
+    throw new ApiError(409, 'ALREADY_ASSIGNED', 'Platform administrators do not need signup');
+  }
+  if (me.assignments.length > 0) {
+    throw new ApiError(409, 'ALREADY_ASSIGNED', 'This account already belongs to a store');
+  }
+  if (!(await hasOrganizationsTable(c.env.DB))) {
+    throw new ApiError(503, 'SIGNUP_UNAVAILABLE', 'Signup is not available in this environment');
+  }
+  // 新規ログイン停止中はサインアップも止める (/auth/callback の発行抑止と同じ考え方)
+  const loginBlock = await loginMaintenanceBlock(c);
+  if (loginBlock) {
+    throw new ApiError(503, 'MAINTENANCE', loginBlock.message);
+  }
+  const dto = parseWith(signupSchema, await parseJson(c));
+  const templateKey = dto.templateKey ?? 'general';
+  if (!isTemplateKey(templateKey)) {
+    throw new ApiError(400, 'INVALID_TEMPLATE', `Unknown template: ${templateKey}`);
+  }
+  const template = findTemplate(templateKey);
+  const db = c.env.DB;
+  const now = Date.now();
+
+  const orgRes = await db
+    .prepare('INSERT INTO organizations (name, plan_key, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)')
+    .bind(dto.organizationName, 'free', now)
+    .run();
+  const organizationId = Number(orgRes.meta.last_row_id);
+
+  // 店舗コードは全店舗で一意。自動生成して衝突したら数回だけ引き直す
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  let storeId = 0;
+  let storeCode = '';
+  for (let attempt = 0; attempt < 5 && storeId === 0; attempt++) {
+    let suffix = '';
+    const bytes = new Uint8Array(6);
+    crypto.getRandomValues(bytes);
+    for (const b of bytes) suffix += alphabet[b % alphabet.length];
+    storeCode = `S${suffix}`;
+    try {
+      const res = await db
+        .prepare(
+          `INSERT INTO stores (code, name, status, organization_id, created_at, updated_at)
+           VALUES (?1, ?2, 'active', ?3, ?4, ?4)`,
+        )
+        .bind(storeCode, dto.storeName, organizationId, now)
+        .run();
+      storeId = Number(res.meta.last_row_id);
+    } catch {
+      // コード衝突時は次の候補で再試行する
+    }
+  }
+  if (storeId === 0) throw new ApiError(500, 'SIGNUP_FAILED', 'Failed to allocate a store code');
+
+  const whRes = await db
+    .prepare('INSERT INTO warehouses (store_id, code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)')
+    .bind(storeId, 'WH-01', '倉庫', now)
+    .run();
+  const warehouseId = Number(whRes.meta.last_row_id);
+
+  await db
+    .prepare('INSERT INTO user_roles (user_id, role_code, warehouse_id, store_id) VALUES (?1, ?2, NULL, ?3)')
+    .bind(me.userId, RoleCode.SYSTEM_ADMIN, storeId)
+    .run();
+
+  const applied = await applyIndustryTemplate(db, storeId, templateKey, { warehouseId });
+
+  await setSessionStore(db, c.req.raw, storeId).catch(() => {});
+  await insertAudit(db, {
+    actorId: me.userId,
+    action: 'store.signup',
+    targetType: 'store',
+    targetId: String(storeId),
+    payload: { organizationId, organizationName: dto.organizationName, storeCode, templateKey },
+    storeId,
+    createdAt: now,
+  });
+
+  return c.json(
+    {
+      organization: { id: organizationId, name: dto.organizationName, planKey: 'free' },
+      store: { id: storeId, code: storeCode, name: dto.storeName, status: 'active' },
+      warehouse: { id: warehouseId, code: 'WH-01', name: '倉庫' },
+      template: { key: template.key, name: template.name, applied },
+    },
+    201,
+  );
+});
+
 // ------------------------------------------------------- 初期セットアップ
 
 /**
@@ -1669,6 +1788,8 @@ app.post('/api/v1/session/store', async (c) => {
  * - products: 商品が 1 件以上 (削除済みを除く)
  * - members: 現在店舗に割当のあるユーザーが 2 人以上
  * - features: 機能フラグが 1 件でも明示設定されていれば「確認済み」とみなす
+ * - settings: 店舗設定 (通貨・タイムゾーン) が 1 件でも明示保存されていれば
+ *   「確認済み」とみなす (0020 の汎用化に合わせて追加)
  */
 app.get('/api/v1/setup/status', async (c) => {
   await requirePermission(c, Permission.MASTER_READ);
@@ -1699,19 +1820,24 @@ app.get('/api/v1/setup/status', async (c) => {
     'SELECT COUNT(*) AS n FROM feature_flags WHERE store_id = ?1',
     ctx.store.id,
   );
+  const settingsCount = await count(
+    'SELECT COUNT(*) AS n FROM store_settings WHERE store_id = ?1',
+    ctx.store.id,
+  );
   const items = {
     locations: locationCount >= 1,
     products: productCount >= 1,
     members: memberCount >= 2,
     features: featureFlagCount >= 1,
+    settings: settingsCount >= 1,
   };
   const doneCount = Object.values(items).filter(Boolean).length;
   return c.json({
     items,
     counts: { locations: locationCount, products: productCount, members: memberCount },
     doneCount,
-    totalCount: 4,
-    complete: doneCount === 4,
+    totalCount: 5,
+    complete: doneCount === 5,
   });
 });
 

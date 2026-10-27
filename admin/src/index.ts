@@ -92,6 +92,10 @@ import {
   planLimitError,
   resolveStorePlan,
 } from '../../workers/src/lib/plans';
+import {
+  applyIndustryTemplate,
+  isTemplateKey,
+} from '../../workers/src/lib/templates';
 import { CONSOLE_HTML } from './console';
 import { iconResponse, manifestResponse } from './pwa';
 
@@ -591,6 +595,8 @@ const createStoreBodySchema = z.object({
   code: z.string().min(1).max(50),
   name: z.string().min(1).max(100),
   organizationId: z.number().int().positive().optional(),
+  /** 業種テンプレート (導入の汎用化)。指定時は既定倉庫も作って初期投入する */
+  template: z.string().min(1).max(50).optional(),
 });
 
 /**
@@ -601,6 +607,9 @@ const createStoreBodySchema = z.object({
 app.post('/api/platform/stores', async (c) => {
   requirePlatformAdmin(c);
   const dto = parseWith(createStoreBodySchema, await parseJson(c));
+  if (dto.template !== undefined && !isTemplateKey(dto.template)) {
+    throw new ApiError(400, 'INVALID_TEMPLATE', `Unknown template: ${dto.template}`);
+  }
   const hasOrgs = await hasOrganizationsTable(c.env.DB);
   let organizationId: number | null = null;
   if (hasOrgs) {
@@ -636,15 +645,33 @@ app.post('/api/platform/stores', async (c) => {
     throw new ApiError(409, 'DUPLICATE', 'Store with this code already exists');
   }
   const id = Number(res.meta.last_row_id);
+  // 業種テンプレート指定時は、既定倉庫を作ったうえで初期データを投入する
+  // (セルフサインアップと同じ内容)。失敗しても店舗作成自体は成立させる。
+  let templateApplied: Record<string, unknown> | null = null;
+  if (dto.template !== undefined) {
+    try {
+      const wh = await c.env.DB.prepare(
+        'INSERT INTO warehouses (store_id, code, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)',
+      )
+        .bind(id, 'WH-01', '倉庫', now)
+        .run();
+      const applied = await applyIndustryTemplate(c.env.DB, id, dto.template, {
+        warehouseId: Number(wh.meta.last_row_id),
+      });
+      templateApplied = { key: dto.template, applied };
+    } catch {
+      templateApplied = { key: dto.template, applied: null };
+    }
+  }
   await platformAudit(
     c,
     'platform.store.create',
     'store',
     String(id),
-    { code: dto.code, name: dto.name, organizationId },
+    { code: dto.code, name: dto.name, organizationId, template: dto.template ?? null },
     id,
   );
-  return c.json(storeJson(await storeRow(c, id)), 201);
+  return c.json({ ...storeJson(await storeRow(c, id)), templateApplied }, 201);
 });
 
 // ------------------------------------------------------------ 組織・プラン
