@@ -972,19 +972,7 @@ app.get('/auth/login', async (c) => {
 // 結果をそのまま表示する。画面側のボタン操作は不要。
 app.get('/auth/callback', async (c) => {
   const page = (title: string, body: string, status: 200 | 400 | 500 | 503 = 200) =>
-    c.html(
-      `<!doctype html>
-<html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${title} | 在庫管理システム</title></head>
-<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
-<h1>${title}</h1>
-${body}
-<p><a href="/login">ログイン画面へ</a></p>
-</body>
-</html>`,
-      status,
-    );
+    c.html(simplePageHtml(title, body), status);
 
   const url = new URL(c.req.url);
   const code = url.searchParams.get('code');
@@ -1077,8 +1065,8 @@ ${body}
       : '未付与';
   const note =
     authUser.assignments.length > 0
-      ? '<p>このまま業務 API を利用できます。</p>'
-      : '<p>アカウントは作成されましたが、権限はまだ付いていません。アプリを開くと、そのまま自分の組織・店舗を作成して使い始めるか、管理者にロール付与を依頼できます。</p>';
+      ? '<p class="note">アプリを開いてそのまま利用できます。</p>'
+      : '<p class="note">アカウントは作成されましたが、権限はまだ付いていません。アプリを開くと、そのまま自分の組織・店舗を作成して使い始めるか、管理者にロール付与を依頼できます。</p>';
   // ブラウザ向けにログインセッションを発行する (Cookie は HttpOnly)。
   // 以後の API / WebSocket はこのセッションで認証できる。
   // 発行時の UA / IP はセッション管理画面での端末表示用に記録する (0017)。
@@ -1086,9 +1074,15 @@ ${body}
     userAgent: c.req.header('user-agent') ?? null,
     ip: clientIp(c.req.raw),
   });
+  const escHtml = (s: string): string =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const res = page(
     'ログインしました',
-    `<p>メールアドレス: ${authUser.email}</p><p>ユーザー ID: ${authUser.userId}</p><p>現在のロール: ${roles}</p>${note}<p><a href="/app">アプリを開く</a></p>`,
+    `<div class="rows">` +
+      `<div class="row"><span>メールアドレス</span><b>${escHtml(authUser.email)}</b></div>` +
+      `<div class="row"><span>ユーザー ID</span><b>${authUser.userId}</b></div>` +
+      `<div class="row"><span>現在のロール</span><b>${escHtml(roles)}</b></div>` +
+      `</div>${note}<a class="btn primary" href="/app">アプリを開く</a>`,
   );
   res.headers.append('Set-Cookie', sessionCookieHeader(sessionToken));
   return res;
@@ -1181,6 +1175,72 @@ async function loginMaintenanceBlock(
   return null;
 }
 
+/**
+ * ログイン前後の単純ページ (ログイン結果・メンテナンス案内など) の共通外枠。
+ * トップページと同じデザイン言語 (アプリのトークン、ダークモード対応) で出す。
+ */
+function simplePageHtml(title: string, bodyHtml: string): string {
+  return `<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title} | 在庫管理システム</title>${PWA_HEAD}
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --fg: #1d1d1f; --muted: #86868b;
+  --line: rgba(0, 0, 0, 0.08); --accent: #0071e3; --accent-press: #0060c9;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #060608; --surface: #1c1c1e; --fg: #f5f5f7; --muted: #98989d;
+    --line: rgba(255, 255, 255, 0.12);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.35);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 560px; margin: 0 auto; padding: 56px 24px 40px; text-align: center; }
+.icon { width: 72px; height: 72px; border-radius: 18px; box-shadow: var(--shadow); }
+h1 { font-size: 26px; font-weight: 700; margin: 18px 0 20px; }
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+  box-shadow: var(--shadow); padding: 22px; text-align: left;
+}
+.card p { font-size: 15px; line-height: 1.75; margin: 0 0 12px; }
+.card p:last-child { margin-bottom: 0; }
+.rows { margin: 0 0 14px; }
+.row {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 16px;
+  padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 14.5px;
+}
+.row:last-child { border-bottom: none; }
+.row span { color: var(--muted); flex-shrink: 0; }
+.row b { font-weight: 600; text-align: right; word-break: break-all; }
+.note { color: var(--muted); font-size: 14px; }
+.btn {
+  display: block; padding: 14px 20px; border-radius: 980px; font-size: 16px; font-weight: 600;
+  text-decoration: none; text-align: center; margin-top: 18px;
+}
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.primary:active { background: var(--accent-press); }
+.foot { margin-top: 24px; font-size: 13.5px; }
+.foot a { color: var(--accent); text-decoration: none; }
+</style></head>
+<body>
+<main class="wrap">
+  <img class="icon" src="/icons/icon-512.png" alt="">
+  <h1>${title}</h1>
+  <section class="card">${bodyHtml}</section>
+  <p class="foot"><a href="/">トップページへ</a></p>
+</main>
+</body>
+</html>`;
+}
+
 /** ログイン停止中の案内ページ (503) */
 function loginMaintenancePage(message: string, endsAt: number | null): string {
   const safeMessage = message
@@ -1190,17 +1250,10 @@ function loginMaintenancePage(message: string, endsAt: number | null): string {
   const endText = endsAt
     ? `<p>終了予定: ${new Date(endsAt).toLocaleString('ja-JP')}</p>`
     : '<p>終了時刻は未定です。</p>';
-  return `<!doctype html>
-<html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>メンテナンス中 | 在庫管理システム</title></head>
-<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
-<h1>メンテナンス中</h1>
-<p>${safeMessage}</p>
-${endText}
-<p>ログイン中のセッションはそのまま利用できます。</p>
-</body>
-</html>`;
+  return simplePageHtml(
+    'メンテナンス中',
+    `<p>${safeMessage}</p>${endText}<p class="note">ログイン中のセッションはそのまま利用できます。</p>`,
+  );
 }
 
 app.use('/api/v1/*', async (c, next) => {
