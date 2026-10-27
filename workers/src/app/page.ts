@@ -1,9 +1,10 @@
-import { APP_CSS } from './styles';
-import { APP_JS } from './client';
+import { APP_CSS_URL, APP_JS_URL } from './assets';
 import { PWA_HEAD } from '../pwa';
 
 /**
- * /app の SPA シェル。Worker から直接配信する単一 HTML。
+ * /app の SPA シェル。Worker から直接配信する HTML。
+ * CSS / JS は内容ハッシュ付きの別アセットとして配信し、ブラウザと
+ * Service Worker にキャッシュさせる (毎回の全量ダウンロードを避ける)。
  * 認証は Cookie セッション (HttpOnly) のため、ページ自体は未ログインでも
  * 配信し、初期表示で /api/v1/me を引いてログイン導線に分岐する。
  */
@@ -13,7 +14,7 @@ export const APP_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>在庫管理システム</title>${PWA_HEAD}
-<style>${APP_CSS}</style>
+<link rel="stylesheet" href="${APP_CSS_URL}">
 </head>
 <body>
 <header class="app-header">
@@ -81,6 +82,6 @@ export const APP_HTML = `<!doctype html>
 
 <div id="scannerOverlay" class="scanner-overlay" style="display:none"></div>
 
-<script>${APP_JS}</script>
+<script src="${APP_JS_URL}" defer></script>
 </body>
 </html>`;

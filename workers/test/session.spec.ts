@@ -305,6 +305,7 @@ describe('セッション認証 (D1 結合)', () => {
     const html = await res.text();
     expect(html).toContain('在庫管理システム');
     expect(html).toContain('id="appBox"');
-    expect(html).toContain('/api/v1/me');
+    // JS 本体はハッシュ付き別アセット (起動時に /api/v1/me を引くのは JS 側)
+    expect(html).toContain('/assets/app.js?v=');
   });
 });

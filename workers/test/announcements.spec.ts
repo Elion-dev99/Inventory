@@ -800,4 +800,37 @@ describe('Service Worker', () => {
     expect(js).toContain("addEventListener('notificationclick'");
     expect(js).toContain('/app');
   });
+
+  it('/sw.js がアプリシェルのキャッシュ (fetch ハンドラ) を含む', async () => {
+    const res = await SELF.fetch('https://example.com/sw.js');
+    const js = await res.text();
+    expect(js).toContain("addEventListener('fetch'");
+    expect(js).toContain('app-shell-');
+  });
+});
+
+describe('アプリシェルのアセット配信 (読み込み高速化)', () => {
+  it('/app の HTML は CSS / JS をハッシュ付き別アセットで参照し、本体を内包しない', async () => {
+    const res = await SELF.fetch('https://example.com/app');
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('/assets/app.css?v=');
+    expect(html).toContain('/assets/app.js?v=');
+    // JS 本体が HTML に埋め込まれていないこと (固有の API パスで確認)
+    expect(html).not.toContain('/api/v1/stocks?take=200');
+  });
+
+  it('/assets/app.js と /assets/app.css が immutable キャッシュで返る', async () => {
+    const js = await SELF.fetch('https://example.com/assets/app.js');
+    expect(js.status).toBe(200);
+    expect(js.headers.get('Content-Type')).toContain('text/javascript');
+    expect(js.headers.get('Cache-Control')).toContain('immutable');
+    expect((await js.text()).length).toBeGreaterThan(100000);
+
+    const css = await SELF.fetch('https://example.com/assets/app.css');
+    expect(css.status).toBe(200);
+    expect(css.headers.get('Content-Type')).toContain('text/css');
+    expect(css.headers.get('Cache-Control')).toContain('immutable');
+    expect((await css.text()).length).toBeGreaterThan(10000);
+  });
 });

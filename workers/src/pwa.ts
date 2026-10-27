@@ -4,6 +4,7 @@
  * HTML 側は PWA_HEAD のメタ/リンクを <head> に入れる。
  */
 import { ICON_192, ICON_512, ICON_APPLE } from './pwa-icons';
+import { APP_SHELL_CACHE } from './app/assets';
 
 export const PWA_HEAD = `
 <link rel="manifest" href="/manifest.webmanifest">
@@ -60,9 +61,11 @@ export function iconResponse(name: string): Response | null {
 }
 
 /**
- * Web Push 用 Service Worker (/sw.js)。
- * push イベントで通知を表示し、クリックで /app を開く (既に開いていれば前面化)。
- * ペイロードは lib/push.ts が送る JSON ({ title, body, url, announcementId })。
+ * Service Worker (/sw.js)。
+ * - push: 通知を表示し、クリックで /app を開く (既に開いていれば前面化)。
+ *   ペイロードは lib/push.ts が送る JSON ({ title, body, url, announcementId })。
+ * - fetch: アプリシェル (/app HTML とハッシュ付きアセット、アイコン) を
+ *   キャッシュして起動を速くする。API はキャッシュしない。
  */
 export const SERVICE_WORKER_JS = `self.addEventListener('push', function (event) {
   var data = {};
@@ -78,6 +81,56 @@ export const SERVICE_WORKER_JS = `self.addEventListener('push', function (event)
     data: { url: data.url || '/app', announcementId: data.announcementId || null }
   };
   event.waitUntil(self.registration.showNotification(title, options));
+});
+var SHELL_CACHE = '${APP_SHELL_CACHE}';
+self.addEventListener('install', function (event) {
+  self.skipWaiting();
+});
+self.addEventListener('activate', function (event) {
+  event.waitUntil(
+    caches.keys().then(function (keys) {
+      return Promise.all(keys.map(function (k) {
+        return k.indexOf('app-shell-') === 0 && k !== SHELL_CACHE ? caches.delete(k) : Promise.resolve();
+      }));
+    }).then(function () { return self.clients.claim(); })
+  );
+});
+self.addEventListener('fetch', function (event) {
+  var req = event.request;
+  if (req.method !== 'GET') return;
+  var url;
+  try { url = new URL(req.url); } catch (e) { return; }
+  if (url.origin !== self.location.origin) return;
+  var isAsset = url.pathname.indexOf('/assets/app.') === 0 || url.pathname.indexOf('/icons/') === 0;
+  if (isAsset) {
+    /* ハッシュ付きアセットとアイコンはキャッシュ優先 (無ければ取得して保存) */
+    event.respondWith(
+      caches.open(SHELL_CACHE).then(function (cache) {
+        return cache.match(req).then(function (hit) {
+          if (hit) return hit;
+          return fetch(req).then(function (res) {
+            if (res.ok) cache.put(req, res.clone());
+            return res;
+          });
+        });
+      })
+    );
+    return;
+  }
+  if (url.pathname === '/app') {
+    /* シェル HTML はキャッシュを即返し、裏で最新を取り直す (次回起動に反映) */
+    event.respondWith(
+      caches.open(SHELL_CACHE).then(function (cache) {
+        var network = fetch(req).then(function (res) {
+          if (res.ok) cache.put(req, res.clone());
+          return res;
+        });
+        event.waitUntil(network.catch(function () {}));
+        return cache.match(req).then(function (hit) { return hit || network; });
+      })
+    );
+  }
+  /* API などそれ以外は通常どおりネットワーク (キャッシュしない) */
 });
 self.addEventListener('notificationclick', function (event) {
   event.notification.close();

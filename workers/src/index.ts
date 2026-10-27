@@ -76,6 +76,7 @@ import {
 import { clientIp, recordLoginEvent } from './lib/login-events';
 import { APP_HTML } from './app/page';
 import { APP_CSS } from './app/styles';
+import { APP_JS } from './app/client';
 import { PWA_HEAD, manifestResponse, iconResponse, serviceWorkerResponse } from './pwa';
 import { ApiError, badRequest, forbidden, notFound } from './lib/errors';
 import { isExpired } from './fefo';
@@ -299,6 +300,25 @@ app.get('/', (c) =>
 // /app で配信する単一ページアプリ (src/app/)。認証は Cookie セッションで、
 // 未ログイン時はアプリ側が /api/v1/me の 401 を見てログイン導線を出す。
 app.get('/app', (c) => c.html(APP_HTML));
+
+// /app の CSS / JS 本体。内容ハッシュ付き URL で参照され、内容が変わらない
+// 限り再ダウンロードされない (immutable)。シェル HTML は小さく保たれる。
+app.get('/assets/app.css', () =>
+  new Response(APP_CSS, {
+    headers: {
+      'Content-Type': 'text/css; charset=utf-8',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  }),
+);
+app.get('/assets/app.js', () =>
+  new Response(APP_JS, {
+    headers: {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  }),
+);
 
 // PWA: ホーム画面追加でブラウザのバーを出さずにフルスクリーン起動する
 app.get('/manifest.webmanifest', () => manifestResponse());
@@ -1524,16 +1544,18 @@ async function warehouseIdOfStock(c: AppContext, stockId: number): Promise<numbe
  * 一覧・現在店舗・全体管理者かどうかも返し、/app の店舗選択と出し分けに使う。
  */
 app.get('/api/v1/me', async (c) => {
-  const rp = await loadRolePermissions(c);
   const me = user(c);
-  const ctx = await softStoreContext(c);
+  // 起動時の要所なので、互いに独立した読み取りは並列に走らせる
+  const [rp, ctx] = await Promise.all([loadRolePermissions(c), softStoreContext(c)]);
   const platform = isPlatformAdmin(me.assignments);
-  let stores: StoreInfo[] = [];
-  try {
-    stores = await accessibleStores(c.env.DB, me);
-  } catch {
+  const [stores, features, plan, maintenanceRes] = await Promise.all([
     // stores 未適用の環境では店舗なしとして扱う
-  }
+    accessibleStores(c.env.DB, me).catch(() => [] as StoreInfo[]),
+    ctx ? effectiveFeatures(c, ctx.store.id) : Promise.resolve(defaultFeatures()),
+    ctx ? planSummaryForStore(c, ctx.store.id) : Promise.resolve(null),
+    (async () =>
+      c.get('maintenance') ?? (await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null)))(),
+  ]);
   return c.json({
     id: me.userId,
     email: me.email,
@@ -1544,29 +1566,24 @@ app.get('/api/v1/me', async (c) => {
       : ctx
         ? [...permissionsOf(ctx.assignments, rp)].sort()
         : [],
-    features: ctx ? await effectiveFeatures(c, ctx.store.id) : defaultFeatures(),
-    plan: ctx ? await planSummaryForStore(c, ctx.store.id) : null,
+    features,
+    plan,
     stores,
     currentStore: ctx ? ctx.store : null,
     isPlatformAdmin: platform,
-    maintenance: await (async () => {
-      const res =
-        c.get('maintenance') ??
-        (await resolveMaintenance(c.env.DB, ctx ? ctx.store.id : null));
-      return {
-        active: res.active
-          ? {
-              level: res.active.level,
-              features: res.active.features,
-              endsAt: res.active.endsAt,
-              message: resolvedMaintenanceMessage(res.active),
-              windows: res.active.windows,
-            }
-          : null,
-        upcoming: res.upcoming,
-        lastEnded: res.lastEnded,
-      };
-    })(),
+    maintenance: {
+      active: maintenanceRes.active
+        ? {
+            level: maintenanceRes.active.level,
+            features: maintenanceRes.active.features,
+            endsAt: maintenanceRes.active.endsAt,
+            message: resolvedMaintenanceMessage(maintenanceRes.active),
+            windows: maintenanceRes.active.windows,
+          }
+        : null,
+      upcoming: maintenanceRes.upcoming,
+      lastEnded: maintenanceRes.lastEnded,
+    },
   });
 });
 
