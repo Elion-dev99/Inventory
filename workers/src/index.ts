@@ -3284,6 +3284,118 @@ const STOCK_VIEW_SQL = `SELECT s.id, s.location_id, s.lot_id, s.quantity, s.vers
                           JOIN lots l ON l.id = s.lot_id
                           JOIN products p ON p.id = l.product_id`;
 
+// ------------------------------------------------------------ 横断検索
+/** LIKE のワイルドカードを文字として扱うためのエスケープ (ESCAPE '\' と対) */
+function escapeLikePattern(text: string): string {
+  return text.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+/**
+ * 商品・保管場所・入出庫履歴をまとめて検索する (stocks.read)。
+ * 対象は現在の店舗の中だけ。倉庫スコープは各一覧と同じに適用し、
+ * 商品の在庫合計も届く範囲の倉庫だけで数える。
+ */
+app.get('/api/v1/search', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  const q = (c.req.query('q') ?? '').trim();
+  if (q.length === 0) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'q: a search query is required');
+  }
+  const takeRaw = Number(c.req.query('take') ?? 8);
+  const take = Number.isFinite(takeRaw) ? Math.min(Math.max(Math.trunc(takeRaw), 1), 20) : 8;
+  const like = `%${escapeLikePattern(q)}%`;
+  const prefix = `${escapeLikePattern(q)}%`;
+  const reachable = reachableWarehouseIds(ctx.assignments);
+  const reachableIn =
+    reachable === null ? null : reachable.length === 0 ? 'IN (NULL)' : `IN (${reachable.map(() => '?').join(',')})`;
+  const reachableParams: number[] = reachable === null ? [] : reachable;
+
+  // 商品: バーコード完全一致 → SKU 完全一致 → 名前の前方一致 → 部分一致の順に並べる
+  const productSql =
+    `SELECT p.id, p.sku, p.name, p.unit, p.barcode,
+            COALESCE(SUM(s.quantity), 0) AS totalQuantity,
+            COUNT(DISTINCT s.location_id) AS locationCount
+       FROM products p
+       LEFT JOIN lots l ON l.product_id = p.id
+       LEFT JOIN stocks s ON s.lot_id = l.id AND s.store_id = p.store_id` +
+    (reachableIn === null
+      ? ''
+      : ` AND s.location_id IN (SELECT id FROM locations WHERE warehouse_id ${reachableIn})`) +
+    ` WHERE p.store_id = ? AND p.deleted_at IS NULL
+        AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.barcode LIKE ? ESCAPE '\\')
+      GROUP BY p.id
+      ORDER BY (p.barcode = ?) DESC, (p.sku = ?) DESC, (p.name LIKE ? ESCAPE '\\') DESC, p.name ASC
+      LIMIT ?`;
+  const productParams: (string | number)[] = [
+    ...reachableParams,
+    ctx.store.id,
+    like,
+    like,
+    like,
+    q,
+    q,
+    prefix,
+    take,
+  ];
+
+  // 保管場所: 親の名前も添える (階層が無い環境では parentName は null)
+  const withParent = await hasColumn(c, 'locations', 'parent_id');
+  const locationSql =
+    `SELECT loc.id, loc.code, loc.name, loc.warehouse_id AS warehouseId, w.name AS warehouseName,` +
+    (withParent ? ' parent.name AS parentName,' : ' NULL AS parentName,') +
+    ` (SELECT COUNT(*) FROM stocks s WHERE s.location_id = loc.id AND s.store_id = ?) AS stockCount
+       FROM locations loc
+       JOIN warehouses w ON w.id = loc.warehouse_id` +
+    (withParent ? ' LEFT JOIN locations parent ON parent.id = loc.parent_id' : '') +
+    ` WHERE w.store_id = ? AND loc.deleted_at IS NULL
+        AND (loc.name LIKE ? ESCAPE '\\' OR loc.code LIKE ? ESCAPE '\\')` +
+    (reachableIn === null ? '' : ` AND loc.warehouse_id ${reachableIn}`) +
+    ` ORDER BY loc.name ASC LIMIT ?`;
+  const locationParams: (string | number)[] = [
+    ctx.store.id,
+    ctx.store.id,
+    like,
+    like,
+    ...reachableParams,
+    take,
+  ];
+
+  // 入出庫履歴: 商品名・SKU・理由から探し、新しい順
+  const movementSql =
+    `SELECT mv.id, mv.document_id AS documentId, mv.type,
+            mv.quantity_change AS quantityChange, mv.quantity_before AS quantityBefore,
+            mv.quantity_after AS quantityAfter, mv.actor_id AS actorId, mv.reason,
+            mv.created_at AS createdAt, p.name AS productName, p.sku AS productSku,
+            loc.name AS locationName, l.lot_code AS lotCode
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN locations loc ON loc.id = s.location_id
+       JOIN lots l ON l.id = s.lot_id
+       JOIN products p ON p.id = l.product_id
+      WHERE mv.store_id = ?
+        AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR mv.reason LIKE ? ESCAPE '\\')` +
+    (reachableIn === null ? '' : ` AND loc.warehouse_id ${reachableIn}`) +
+    ` ORDER BY mv.id DESC LIMIT ?`;
+  const movementParams: (string | number)[] = [ctx.store.id, like, like, like, ...reachableParams, take];
+
+  const [products, locations, movements] = await Promise.all([
+    c.env.DB.prepare(productSql).bind(...productParams).all(),
+    c.env.DB.prepare(locationSql).bind(...locationParams).all(),
+    c.env.DB.prepare(movementSql).bind(...movementParams).all(),
+  ]);
+  // 全体管理者の操作は店舗側に actorId を出さない (履歴一覧と同じ扱い)
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({
+    query: q,
+    products: products.results,
+    locations: locations.results,
+    movements: movements.results.map((r) =>
+      anonymizeUserFields(r as Record<string, unknown>, hidden, ['actorId']),
+    ),
+  });
+});
+
 app.get('/api/v1/stocks', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);

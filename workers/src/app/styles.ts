@@ -237,6 +237,8 @@ main { padding: 1rem 1rem 2rem; padding-bottom: calc(7.6rem + env(safe-area-inse
 .group-row:last-child, .sheet-row:last-child { border-bottom: none; }
 .group-row:active, .sheet-row:active { background: var(--surface-2); }
 .group-row.static { cursor: default; }
+.search-entry { display: block; width: 100%; text-align: left; background: var(--surface-2); border: 1px solid var(--glass-border); border-radius: 999px; padding: 0.65rem 1rem; color: var(--muted); font-size: 0.95rem; font-family: inherit; margin-bottom: 1rem; cursor: pointer; }
+.search-entry:active { background: var(--surface); }
 .group-row.danger { color: #d70015; justify-content: center; font-weight: 600; }
 @media (prefers-color-scheme: dark) { .group-row.danger { color: #ff6961; } }
 .row-icon { flex: none; display: grid; place-items: center; width: 31px; height: 31px; border-radius: 8px; color: #fff; }

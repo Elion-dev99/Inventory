@@ -1011,6 +1011,7 @@ function showView(id) {
   buildNav();
   var loaders = {
     dashboard: loadDashboard,
+    search: loadSearch,
     stocks: loadStocks,
     inbound: loadInbound,
     consume: loadConsume,
@@ -1083,6 +1084,9 @@ function loadDashboard() {
     var orders = r[6];
     var setupData = r[7];
     var h = '<h2>ダッシュボード</h2>';
+    if (can('stocks.read')) {
+      h += '<button type="button" class="search-entry" id="dashSearch">商品・保管場所・履歴を検索</button>';
+    }
     var active = null;
     for (var i = 0; i < stocktakes.length; i++) {
       if (stocktakes[i].status === 'in_progress' || stocktakes[i].status === 'pending_approval') { active = stocktakes[i]; break; }
@@ -1209,6 +1213,8 @@ function loadDashboard() {
       }
     }
     el('view').innerHTML = h;
+    var dsch = el('dashSearch');
+    if (dsch) dsch.onclick = function () { showView('search'); };
     var da = el('dashAnnounce');
     if (da) da.onclick = function () { showView('announcements'); };
     var dsu = el('dashSetup');
@@ -2023,6 +2029,88 @@ function renderStockBundles() {
   }).catch(function () { box.innerHTML = ''; });
 }
 
+/* ---------------- 横断検索 ---------------- */
+function loadSearch() {
+  el('view').innerHTML =
+    '<h2>検索</h2>' +
+    '<div class="toolbar"><div style="flex:1 1 11rem"><label>キーワード</label><input id="gq" type="search" placeholder="商品名・SKU・バーコード・場所・理由"></div></div>' +
+    '<div id="gsBody"><p class="muted">商品・保管場所・入出庫履歴から探します。</p></div>';
+  var timer = null;
+  var seq = 0;
+  var run = function () {
+    var q = el('gq').value.replace(/^ +| +$/g, '');
+    if (!q) {
+      seq++;
+      el('gsBody').innerHTML = '<p class="muted">商品・保管場所・入出庫履歴から探します。</p>';
+      return;
+    }
+    var my = ++seq;
+    api('/api/v1/search?q=' + encodeURIComponent(q) + '&take=8').then(function (d) {
+      if (my !== seq || !el('gsBody')) return;
+      renderSearchResults(d);
+    }).catch(function (e) {
+      if (my !== seq || !el('gsBody')) return;
+      el('gsBody').innerHTML = msgHtml('error', errMsg(e));
+    });
+  };
+  el('gq').oninput = function () {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(run, 250);
+  };
+  el('gq').focus();
+}
+function renderSearchResults(d) {
+  var h = '';
+  var i;
+  if (d.products && d.products.length > 0) {
+    h += '<h3>商品</h3><div class="group">';
+    for (i = 0; i < d.products.length; i++) {
+      var p = d.products[i];
+      h += '<button type="button" class="group-row" data-gsku="' + esc(p.sku) + '"><span>' + esc(p.name) + '</span><span class="muted">' + esc(p.sku) + ' ・ 在庫 ' + p.totalQuantity + esc(p.unit || '') + '</span></button>';
+    }
+    h += '</div>';
+  }
+  if (d.locations && d.locations.length > 0) {
+    h += '<h3>保管場所</h3><div class="group">';
+    for (i = 0; i < d.locations.length; i++) {
+      var l = d.locations[i];
+      var path = (l.parentName ? esc(l.parentName) + ' / ' : '') + esc(l.name);
+      h += '<button type="button" class="group-row" data-gloc="' + l.id + '"><span>' + path + '</span><span class="muted">' + esc(l.warehouseName || '') + ' ・ 在庫 ' + l.stockCount + ' 件</span></button>';
+    }
+    h += '</div>';
+  }
+  if (d.movements && d.movements.length > 0) {
+    h += '<h3>入出庫履歴</h3><div class="group">';
+    for (i = 0; i < d.movements.length; i++) {
+      var m = d.movements[i];
+      var tl = MOVEMENT_TYPE_LABELS[m.type] || [m.type, ''];
+      var sign = m.quantityChange > 0 ? '+' + m.quantityChange : '' + m.quantityChange;
+      h += '<button type="button" class="group-row" data-gmove="1"><span>' + esc(tl[0]) + ' ・ ' + esc(m.productName || '') + '</span><span class="muted">' + sign + ' ・ ' + esc(m.locationName || '') + ' ・ ' + fmtDateTime(m.createdAt) + '</span></button>';
+    }
+    h += '</div>';
+  }
+  if (!h) h = '<p class="muted">見つかりませんでした。</p>';
+  el('gsBody').innerHTML = h;
+  var prods = el('gsBody').querySelectorAll('button[data-gsku]');
+  for (i = 0; i < prods.length; i++) {
+    prods[i].onclick = function () {
+      try { sessionStorage.setItem('pendingStockQuery', this.getAttribute('data-gsku')); } catch (e) {}
+      showView('stocks');
+    };
+  }
+  var locs = el('gsBody').querySelectorAll('button[data-gloc]');
+  for (i = 0; i < locs.length; i++) {
+    locs[i].onclick = function () {
+      try { sessionStorage.setItem('pendingStockLocation', this.getAttribute('data-gloc')); } catch (e) {}
+      showView('stocks');
+    };
+  }
+  var moves = el('gsBody').querySelectorAll('button[data-gmove]');
+  for (i = 0; i < moves.length; i++) {
+    moves[i].onclick = function () { showView('history'); };
+  }
+}
+
 function loadStocks() {
   var chipsHtml = '<div class="chips" id="stChips">';
   for (var ci = 0; ci < STOCK_CHIPS.length; ci++) {
@@ -2123,6 +2211,16 @@ function loadStocks() {
         },
       });
     };
+    try {
+      var pl = sessionStorage.getItem('pendingStockLocation');
+      if (pl) {
+        sessionStorage.removeItem('pendingStockLocation');
+        var locSel = el('stLoc');
+        for (var li2 = 0; li2 < locSel.options.length; li2++) {
+          if (String(locSel.options[li2].value) === String(pl)) { locSel.value = pl; break; }
+        }
+      }
+    } catch (e) {}
     fetchStocks();
     renderStockBundles();
     if (state.flash) { el('stMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
