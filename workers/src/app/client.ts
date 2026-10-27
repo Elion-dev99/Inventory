@@ -550,6 +550,7 @@ var VIEWS = [
   { id: 'alerts', label: 'アラート', visible: function () { return can('alerts.read') && feat('alerts'); } },
   { id: 'purchases', label: '発注', visible: function () { return can('purchases.read') && feat('purchase_orders'); } },
   { id: 'analytics', label: '分析', visible: function () { return can('stocks.read') && feat('analytics'); } },
+  { id: 'forecast', label: '予約と消費予測', visible: function () { return can('stocks.read') && feat('analytics'); } },
   { id: 'audit', label: '監査ログ', visible: function () { return can('admin.users'); } },
   { id: 'announcements', label: 'お知らせ', visible: function () { return feat('announcements'); } },
   { id: 'announceAdmin', label: 'お知らせ管理', visible: function () { return can('announcements.write') && feat('announcements'); } },
@@ -970,6 +971,7 @@ var MORE_ITEMS = [
   { view: 'master', icon: 'list', color: '#0071e3', label: 'マスタ管理', maintKeys: ['master_products', 'master_locations', 'suppliers', 'csv_import'] },
   { view: 'purchases', icon: 'cart', color: '#5e5ce6', label: '発注', maintKeys: ['purchase_orders'] },
   { view: 'analytics', icon: 'chart', color: '#0091ff', label: '分析レポート', maintKeys: ['analytics'] },
+  { view: 'forecast', icon: 'chart', color: '#ff6482', label: '予約と消費予測', maintKeys: ['analytics'] },
   { view: 'stocktakes', icon: 'clip', color: '#ff9500', label: '棚卸し', maintKeys: ['stocktakes'] },
   { view: 'alerts', icon: 'bell', color: '#ff3b30', label: 'アラート', maintKeys: ['alerts'] },
   { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫', maintKeys: ['outbound'] },
@@ -1079,6 +1081,7 @@ function showView(id) {
     alerts: loadAlerts,
     purchases: loadPurchases,
     analytics: loadAnalytics,
+    forecast: loadForecast,
     audit: loadAudit,
     announcements: loadAnnouncements,
     announceAdmin: loadAnnounceAdmin,
@@ -1131,6 +1134,10 @@ function loadDashboard() {
   jobs.push(viewVisible('setup')
     ? getJson('/api/v1/setup/status').catch(function () { return null; })
     : Promise.resolve(null));
+  /* 予約連動の消費予測: 切れそうな在庫をタスクに出す (失敗しても落とさない) */
+  jobs.push(can('stocks.read') && feat('analytics')
+    ? getJson('/api/v1/forecast').catch(function () { return null; })
+    : Promise.resolve(null));
   Promise.all(jobs).then(function (r) {
     var alerts = r[0];
     var stocks = r[1];
@@ -1140,6 +1147,7 @@ function loadDashboard() {
     var annData = r[5];
     var orders = r[6];
     var setupData = r[7];
+    var forecastData = r[8];
     var h = '<h2>ダッシュボード</h2>';
     if (can('stocks.read')) {
       h += '<button type="button" class="search-entry" id="dashSearch">商品・保管場所・履歴を検索</button>';
@@ -1205,6 +1213,13 @@ function loadDashboard() {
     }
     if (suggestions && suggestions.length > 0) {
       tasks.push({ view: 'purchases', icon: 'cart', color: '#5e5ce6', label: '発注提案 (発注点割れ)', count: suggestions.length, amber: true });
+    }
+    if (forecastData && forecastData.status === 'ok') {
+      var soonN = 0;
+      for (var fi = 0; fi < forecastData.items.length; fi++) {
+        if (forecastData.items[fi].daysLeft !== null && forecastData.items[fi].daysLeft <= 7) soonN++;
+      }
+      if (soonN > 0) tasks.push({ view: 'forecast', icon: 'chart', color: '#ff6482', label: 'まもなく切れる在庫 (予約ベース)', count: soonN, amber: true });
     }
     if (orders) {
       var overdueN = 0;
@@ -4570,6 +4585,93 @@ function monthlyChartSvg(monthly) {
   s += '<line x1="16" y1="' + base + '" x2="' + (W - 8) + '" y2="' + base + '" stroke="currentColor" stroke-opacity="0.25"></line>';
   return s + '</svg>';
 }
+/* ---- 予約と消費予測 (0022) ---- */
+function forecastHtml(fc) {
+  if (!fc) return '<p class="muted">予測を取得できませんでした。</p>';
+  if (fc.status !== 'ok') {
+    return '<div class="card"><p>予測に必要なデータが不足しています。</p>' +
+      '<p class="small muted">予約件数を3日分以上記録し、消費の記録が貯まると予測が表示されます。(現在の記録: ' + fc.basis.recordedDays + ' 日分)</p></div>';
+  }
+  var h = '<p class="small muted">直近' + fc.basis.windowDays + '日の記録 (' + fc.basis.recordedDays + '日・予約 ' + fc.basis.totalReservations + ' 件) から計算。今後7日の予約見込みは ' + fc.pace.next7Reservations + ' 件です。</p>';
+  if (!fc.items.length) return h + '<p class="muted">予約に連動した消費のある商品はまだありません。</p>';
+  h += '<div class="group">';
+  for (var i = 0; i < fc.items.length; i++) {
+    var it = fc.items[i];
+    var dl = it.daysLeft;
+    var dlText = dl === null ? '—' : 'あと約 ' + (dl < 10 ? dl : Math.round(dl)) + ' 日';
+    var dlStyle = dl !== null && dl <= 3 ? ' style="color:#ff3b30;font-weight:600;flex:none"' : (dl !== null && dl <= 7 ? ' style="color:#ff9500;font-weight:600;flex:none"' : ' style="flex:none"');
+    h += '<div class="group-row static"><span style="flex:1"><span>' + esc(it.name) + '</span>' +
+      '<span class="small muted" style="display:block">現在庫 ' + it.currentQuantity + ' ' + esc(it.unit) + ' / 1予約あたり ' + it.perReservation + ' ' + esc(it.unit) + ' / 7日で約 ' + it.expected7d + ' ' + esc(it.unit) + '</span></span>' +
+      '<span' + dlStyle + '>' + dlText + '</span></div>';
+  }
+  h += '</div>';
+  return h;
+}
+function loadForecast() {
+  viewLoading('予約と消費予測', 'list');
+  var canWrite = can('movements.consume');
+  function keyOf(offset) {
+    var d = new Date();
+    d.setHours(12, 0, 0, 0);
+    d.setDate(d.getDate() + offset);
+    var m = d.getMonth() + 1;
+    var dd = d.getDate();
+    return d.getFullYear() + '-' + (m < 10 ? '0' : '') + m + '-' + (dd < 10 ? '0' : '') + dd;
+  }
+  function labelOf(key) {
+    var p = key.split('-');
+    var d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+    return Number(p[1]) + '/' + Number(p[2]) + ' (' + '日月火水木金土'.charAt(d.getDay()) + ')';
+  }
+  Promise.all([
+    getJson('/api/v1/reservation-days?from=' + keyOf(-30) + '&to=' + keyOf(7)),
+    getJson('/api/v1/forecast').catch(function () { return null; })
+  ]).then(function (r) {
+    var dayMap = {};
+    var days = (r[0] && r[0].days) || [];
+    for (var i = 0; i < days.length; i++) dayMap[days[i].date] = days[i].count;
+    var h = '<h2>予約と消費予測</h2><div id="fcMsg"></div>';
+    h += '<h3>予約件数</h3>';
+    h += '<p class="small muted">日ごとの予約件数を記録すると、下の消費予測に反映されます。</p>';
+    h += '<div class="group">';
+    for (var o = -7; o <= 6; o++) {
+      var key = keyOf(o);
+      var v = dayMap[key];
+      h += '<div class="group-row static">' +
+        '<span class="row-label">' + labelOf(key) + (o === 0 ? ' (今日)' : '') + '</span>' +
+        '<input type="number" class="fc-input" id="fc-' + key + '" min="0" step="1" inputmode="numeric" placeholder="未記録" value="' + (v === undefined ? '' : v) + '"' + (canWrite ? '' : ' disabled') + '>' +
+        (canWrite ? '<button type="button" class="btn small" data-fcsave="' + key + '">保存</button>' : '') +
+        '</div>';
+    }
+    h += '</div>';
+    h += '<h3>切れる時期の予測</h3><div id="fcBody">' + forecastHtml(r[1]) + '</div>';
+    el('view').innerHTML = h;
+    var btns = document.querySelectorAll('[data-fcsave]');
+    for (var b = 0; b < btns.length; b++) {
+      btns[b].onclick = function () {
+        var date = this.getAttribute('data-fcsave');
+        var raw = (el('fc-' + date).value || '').trim();
+        if (raw === '' || !/^\d+$/.test(raw)) {
+          el('fcMsg').innerHTML = msgHtml('error', '予約件数は0以上の整数で入力してください。');
+          return;
+        }
+        var count = parseInt(raw, 10);
+        api('/api/v1/reservation-days', { method: 'PUT', body: { date: date, count: count } }).then(function () {
+          el('fcMsg').innerHTML = msgHtml('ok', labelOf(date) + ' の予約件数を ' + count + ' 件で記録しました。');
+          getJson('/api/v1/forecast').then(function (nf) {
+            var body = el('fcBody');
+            if (body) body.innerHTML = forecastHtml(nf);
+          }).catch(function () {});
+        }).catch(function (e) {
+          el('fcMsg').innerHTML = msgHtml('error', errMsg(e));
+        });
+      };
+    }
+  }).catch(function (e) {
+    el('view').innerHTML = '<h2>予約と消費予測</h2>' + msgHtml('error', errMsg(e));
+  });
+}
+
 function loadAnalytics() {
   viewLoading('分析レポート', 'cards');
   ensureMaster().then(function () {

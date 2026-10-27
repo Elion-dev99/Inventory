@@ -410,6 +410,14 @@ export const profilePatchSchema = z.object({
   displayName: z.string().trim().min(1).max(50),
 });
 
+// ------------------------------------------------------- 予約連動予測 (0022)
+
+/** 日ごとの予約件数の記録 (暦日キー + 件数) */
+export const reservationDayPutSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  count: z.number().int().min(0).max(100000),
+});
+
 /** 'YYYY-MM-DD' -> UTC 0時のミリ秒。不正な日付は null */
 export function parseDateOnly(s: string): number | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);

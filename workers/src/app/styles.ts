@@ -498,6 +498,7 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
 .center-box { max-width: 430px; margin: 3.5rem auto; background: var(--surface); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--shadow); padding: 2.4rem 2rem; text-align: center; }
 .center-box h2 { margin-top: 1rem; }
 .muted { color: var(--muted); }
+.fc-input { width: 5.2rem; text-align: right; flex: none; }
 .small { font-size: 0.85rem; }
 
 .section-box { background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.15rem; margin-bottom: 1rem; }

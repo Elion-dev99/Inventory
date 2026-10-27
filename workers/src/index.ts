@@ -121,6 +121,7 @@ import {
   inviteAcceptSchema,
   pendingGrantSchema,
   profilePatchSchema,
+  reservationDayPutSchema,
   transferSchema,
   updateLocationSchema,
   updateLotSchema,
@@ -150,6 +151,13 @@ import {
   setStoreSettings,
   type ReasonKind,
 } from './lib/store-masters';
+import {
+  addDaysToKey,
+  computeForecast,
+  dateKeyInTz,
+  isValidDateKey,
+  type ForecastProductInput,
+} from './lib/forecast';
 import { maybeAutoBackup } from './lib/backup';
 import {
   defaultFeatures,
@@ -6643,6 +6651,140 @@ app.post('/api/v1/purchase-orders/:id/close-residual', async (c) => {
  * - deadStock: 在庫があるのに最終移動から 90 日超 (または移動履歴なし) の商品
  * - topConsumed: 直近 90 日の消費 (OUT) 数量上位
  */
+// ------------------------------------------------- 予約件数と消費予測 (0022)
+
+/** 予約件数の一覧 (暦日キー範囲)。既定は過去27日〜今後7日 (店舗タイムゾーン) */
+app.get('/api/v1/reservation-days', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  await requireFeature(c, 'analytics');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_reservation_days'))) return c.json({ days: [], today: null });
+  const settings = await getStoreSettings(c.env.DB, ctx.store.id);
+  const today = dateKeyInTz(Date.now(), settings.timezone);
+  const fromQ = c.req.query('from');
+  const toQ = c.req.query('to');
+  const from = fromQ && isValidDateKey(fromQ) ? fromQ : addDaysToKey(today, -27);
+  const to = toQ && isValidDateKey(toQ) ? toQ : addDaysToKey(today, 7);
+  const { results } = await c.env.DB.prepare(
+    'SELECT date, count FROM store_reservation_days WHERE store_id = ?1 AND date >= ?2 AND date <= ?3 ORDER BY date ASC',
+  )
+    .bind(ctx.store.id, from, to)
+    .all<{ date: string; count: number }>();
+  return c.json({ days: results, today });
+});
+
+/** 予約件数の記録 (その日の分を upsert する) */
+app.put('/api/v1/reservation-days', async (c) => {
+  await requirePermission(c, Permission.MOVEMENTS_CONSUME);
+  await requireFeature(c, 'analytics');
+  const ctx = await storeContext(c);
+  if (!(await hasTable(c, 'store_reservation_days'))) {
+    throw new ApiError(503, 'FORECAST_UNAVAILABLE', 'Reservation forecast is not available in this environment');
+  }
+  const dto = parseWith(reservationDayPutSchema, await parseJson(c));
+  if (!isValidDateKey(dto.date)) {
+    throw new ApiError(400, 'INVALID_DATE', 'Invalid date');
+  }
+  const settings = await getStoreSettings(c.env.DB, ctx.store.id);
+  const today = dateKeyInTz(Date.now(), settings.timezone);
+  if (dto.date < '2020-01-01' || dto.date > addDaysToKey(today, 365)) {
+    throw new ApiError(400, 'INVALID_DATE', 'Date out of range');
+  }
+  const now = Date.now();
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `INSERT INTO store_reservation_days (store_id, date, count, updated_by, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT (store_id, date) DO UPDATE SET
+           count = excluded.count, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      )
+      .bind(ctx.store.id, dto.date, dto.count, user(c).userId, now),
+    await buildAuditInsert(c.env.DB, {
+      actorId: user(c).userId,
+      action: 'reservation_days.set',
+      targetType: 'store',
+      targetId: String(ctx.store.id),
+      payload: { date: dto.date, count: dto.count },
+      storeId: ctx.store.id,
+      createdAt: now,
+    }),
+  ]);
+  return c.json({ date: dto.date, count: dto.count });
+});
+
+/**
+ * 予約連動の消費予測。係数とペースの定義は lib/forecast.ts。
+ * 現在庫は店舗全体の合計 (分析レポートと同じ粒度)。
+ */
+app.get('/api/v1/forecast', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  await requireFeature(c, 'analytics');
+  const ctx = await storeContext(c);
+  const settings = await getStoreSettings(c.env.DB, ctx.store.id);
+  const now = Date.now();
+  const today = dateKeyInTz(now, settings.timezone);
+  if (!(await hasTable(c, 'store_reservation_days'))) {
+    return c.json({
+      status: 'insufficient_data',
+      timezone: settings.timezone,
+      today,
+      basis: { recordedDays: 0, totalReservations: 0, windowDays: 90 },
+      pace: { next7Reservations: null, dailyReservations: null },
+      items: [],
+    });
+  }
+  const { results: resRows } = await c.env.DB.prepare(
+    'SELECT date, count FROM store_reservation_days WHERE store_id = ?1 AND date >= ?2 AND date <= ?3',
+  )
+    .bind(ctx.store.id, addDaysToKey(today, -120), addDaysToKey(today, 7))
+    .all<{ date: string; count: number }>();
+  const reservationDays = new Map(resRows.map((r) => [r.date, r.count]));
+
+  const { results: productRows } = await c.env.DB.prepare(
+    `SELECT p.id AS productId, p.sku, p.name, p.unit, COALESCE(SUM(s.quantity), 0) AS qty
+       FROM products p
+       LEFT JOIN lots l ON l.product_id = p.id
+       LEFT JOIN stocks s ON s.lot_id = l.id AND s.store_id = ?1
+      WHERE p.store_id = ?1 AND p.deleted_at IS NULL
+      GROUP BY p.id`,
+  )
+    .bind(ctx.store.id)
+    .all<{ productId: number; sku: string; name: string; unit: string; qty: number }>();
+
+  // 直近100日の消費 (OUT) を店舗タイムゾーンの日別にバケットする
+  const since = now - 100 * 86_400_000;
+  const { results: mvRows } = await c.env.DB.prepare(
+    `SELECT mv.created_at AS createdAt, -mv.quantity_change AS qty, l.product_id AS productId
+       FROM stock_movements mv
+       JOIN stocks s ON s.id = mv.stock_id
+       JOIN lots l ON l.id = s.lot_id
+      WHERE mv.store_id = ?1 AND mv.type = 'OUT' AND mv.created_at >= ?2`,
+  )
+    .bind(ctx.store.id, since)
+    .all<{ createdAt: number; qty: number; productId: number }>();
+  const byProduct = new Map<number, Map<string, number>>();
+  for (const r of mvRows) {
+    let m = byProduct.get(r.productId);
+    if (!m) {
+      m = new Map();
+      byProduct.set(r.productId, m);
+    }
+    const key = dateKeyInTz(r.createdAt, settings.timezone);
+    m.set(key, (m.get(key) ?? 0) + r.qty);
+  }
+  const products: ForecastProductInput[] = productRows.map((p) => ({
+    productId: p.productId,
+    sku: p.sku,
+    name: p.name,
+    unit: p.unit,
+    currentQuantity: p.qty,
+    consumedByDay: byProduct.get(p.productId) ?? new Map<string, number>(),
+  }));
+  const result = computeForecast({ todayKey: today, reservationDays, products });
+  return c.json({ ...result, timezone: settings.timezone, today });
+});
+
 app.get('/api/v1/analytics', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
   await requireFeature(c, 'analytics');
