@@ -696,7 +696,7 @@ describe('プッシュ送信 (暗号化・VAPID・購読切れ削除)', () => {
     // ペイロードは購読側の秘密鍵で復号でき、お知らせの内容が入っている
     const plain = await decryptPushBody(okPush!.body, okSub);
     const payload = JSON.parse(plain) as { title: string; body: string; announcementId: number };
-    expect(payload.title).toBe('プッシュテスト');
+    expect(payload.title).toBe('【お知らせ】プッシュテスト');
     expect(payload.announcementId).toBe(Number(res.body.id));
 
     // 410 を返した購読は削除され、正常な購読は残る
@@ -708,6 +708,22 @@ describe('プッシュ送信 (暗号化・VAPID・購読切れ削除)', () => {
       .bind(okEndpoint)
       .all();
     expect(ok.results.length).toBe(1);
+  });
+
+  it('重要度「重要」のお知らせはタイトルが 【重要】 始まりになる', async () => {
+    capturedPushes.length = 0;
+    const res = await api('/api/v1/admin/announcements', {
+      cookie: cookieManager,
+      method: 'POST',
+      body: { title: '緊急のお知らせ', body: '重要な本文', storeId: 1, push: true, priority: 'important' },
+    });
+    expect(res.status).toBe(201);
+    const okPush = capturedPushes.find((p) => p.url === okEndpoint);
+    expect(okPush).toBeTruthy();
+    const plain = await decryptPushBody(okPush!.body, okSub);
+    const payload = JSON.parse(plain) as { title: string; important: boolean };
+    expect(payload.title).toBe('【重要】緊急のお知らせ');
+    expect(payload.important).toBe(true);
   });
 
   it('掲載前 (未来) の push=1 は作成時に送られない', async () => {

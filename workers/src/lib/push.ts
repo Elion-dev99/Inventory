@@ -332,7 +332,8 @@ export async function sendPushForAnnouncement(
 ): Promise<number> {
   const userIds = await targetUserIds(db, announcement.store_id);
   return sendPushToUsers(db, env, userIds, {
-    title: announcement.title,
+    // 通知の構造: 種別をタイトルの先頭に出す (重要は 【重要】、通常は 【お知らせ】)
+    title: (announcement.priority === 'important' ? '【重要】' : '【お知らせ】') + announcement.title,
     body: announcement.body.slice(0, 300),
     url: '/app',
     announcementId: announcement.id,
