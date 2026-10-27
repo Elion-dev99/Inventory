@@ -71,6 +71,34 @@ export const consumptionSchema = z.object({
   negativeApprovalId: idValue.optional(),
 });
 
+/** 一括入出庫 (IN = 入庫、OUT = 消費)。最大 50 行までを 1 リクエストで原子的に処理する */
+export const bulkMovementsSchema = z.object({
+  lines: z
+    .array(
+      z.discriminatedUnion('type', [
+        z.object({
+          type: z.literal('IN'),
+          locationId: idValue,
+          productId: idValue,
+          lotCode: z.string().min(1),
+          expiryDate: dateString.optional(),
+          quantity: z.number().int().min(1),
+          reason: z.string().optional(),
+        }),
+        z.object({
+          type: z.literal('OUT'),
+          productId: idValue,
+          locationId: idValue.optional(),
+          quantity: z.number().int().min(1),
+          department: z.string().min(1),
+          purpose: z.string().min(1),
+        }),
+      ]),
+    )
+    .min(1)
+    .max(50),
+});
+
 export const transferSchema = z.object({
   fromLocationId: idValue,
   toLocationId: idValue,

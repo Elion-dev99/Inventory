@@ -48,6 +48,8 @@ export interface InboundInput extends MovementContext {
   locationId: number;
   productId: number;
   lotCode: string;
+  /** 一括処理などで伝票を束ねる場合に呼び出し側が指定する。未指定は自動採番 */
+  documentId?: string;
   /** UTC 0時のミリ秒。null = 期限なし */
   expiryDateMs: number | null;
   quantity: number;
@@ -72,6 +74,8 @@ export interface ConsumeInput extends MovementContext {
   productId: number;
   locationId?: number;
   quantity: number;
+  /** 一括処理などで伝票を束ねる場合に呼び出し側が指定する。未指定は自動採番 */
+  documentId?: string;
   department: string;
   purpose: string;
   fefoDeviationReason?: string;
@@ -88,6 +92,37 @@ export interface ConsumeInput extends MovementContext {
   groupId?: string | null;
   /** 監査ログのアクション名。未指定 = 'stock.consume' */
   auditAction?: string;
+}
+
+/** 一括入出庫の 1 行 (IN = 入庫、OUT = 消費) */
+export type BulkLineInput =
+  | {
+      type: 'IN';
+      locationId: number;
+      productId: number;
+      lotCode: string;
+      expiryDateMs: number | null;
+      quantity: number;
+      reason?: string | null;
+    }
+  | {
+      type: 'OUT';
+      productId: number;
+      locationId?: number;
+      quantity: number;
+      department?: string;
+      purpose?: string;
+    };
+
+/**
+ * 一括入出庫。全行を先に検証・シミュレーションし、1 行でも規則違反や
+ * 在庫不足があれば全体を止める。通過したら行を順に実適用する。
+ * 行ごとの冪等キーで再送にも耐える (適用済みの行は読み戻してスキップ)。
+ */
+export interface BulkInput extends MovementContext {
+  lines: BulkLineInput[];
+  /** 消費してよい location の一覧。null = 全 location (全倉庫スコープ) */
+  allowedLocationIds: number[] | null;
 }
 
 /** セット品の消費入力 (0015)。構成品を FEFO で展開し、同一 group_id で記録する */
@@ -535,7 +570,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
     const db = this.env.DB;
     const now = Date.now();
-    const documentId = crypto.randomUUID();
+    const documentId = input.documentId ?? crypto.randomUUID();
     const batchId = crypto.randomUUID();
 
     // 商品・保管場所・ロットはすべて対象店舗のものだけを引く (他店舗の ID は存在しない扱い)
@@ -723,7 +758,7 @@ export class InventoryCoordinator extends DurableObject<Env> {
 
     const db = this.env.DB;
     const now = Date.now();
-    const documentId = crypto.randomUUID();
+    const documentId = input.documentId ?? crypto.randomUUID();
     const batchId = crypto.randomUUID();
 
     // FEFO 候補: 対象商品の stocks を id 昇順で読む (DO 内では他者が書き換えない)
@@ -899,6 +934,280 @@ export class InventoryCoordinator extends DurableObject<Env> {
         : {}),
       at: now,
     });
+    return this.envelope(201, body);
+  }
+
+  // ------------------------------------------------------------------ 一括入出庫
+
+  async bulkMovements(input: BulkInput): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.bulkInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  private async bulkInternal(input: BulkInput): Promise<Envelope> {
+    const stored = await this.findStoredResponse(input);
+    if (stored) return stored;
+    const db = this.env.DB;
+    const now = Date.now();
+    const documentId = crypto.randomUUID();
+    const lineError = (i: number, message: string): ApiError =>
+      new ApiError(422, 'BULK_LINE_INVALID', `line ${i + 1}: ${message}`);
+
+    // 行ごとの冪等コンテキスト。再送時は適用済みの行を読み戻してスキップする
+    const lineCtx: MovementContext[] = [];
+    for (let i = 0; i < input.lines.length; i++) {
+      const digest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(`${input.requestHash}#${i}`),
+      );
+      const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+      lineCtx.push({
+        actorId: input.actorId,
+        endpoint: input.endpoint,
+        idempotencyKey: `${input.idempotencyKey}#${i}`,
+        requestHash: hash,
+        storeId: input.storeId,
+      });
+    }
+    const lineStored: (Envelope | null)[] = [];
+    for (const ctx of lineCtx) lineStored.push(await this.findStoredResponse(ctx));
+
+    // ---- フェーズ 1: 全行の検証と在庫シミュレーション
+    const activeTake = await this.activeStocktakeScope(input.storeId);
+    if (activeTake?.scopeType === 'full') throw stocktakeLocked();
+    const lockedLocations: ReadonlySet<number> =
+      activeTake?.scopeType === 'locations' ? activeTake.locationIds : new Set<number>();
+
+    const withBundle = await this.hasColumn('products', 'is_bundle');
+    const productCache = new Map<number, { requiresExpiry: boolean; isBundle: boolean } | null>();
+    const loadProduct = async (
+      productId: number,
+    ): Promise<{ requiresExpiry: boolean; isBundle: boolean } | null> => {
+      const cached = productCache.get(productId);
+      if (cached !== undefined) return cached;
+      const row = await db
+        .prepare(
+          `SELECT requires_expiry${withBundle ? ', is_bundle' : ''} FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+        )
+        .bind(productId, input.storeId)
+        .first<{ requires_expiry: number; is_bundle?: number }>();
+      const value = row
+        ? { requiresExpiry: row.requires_expiry === 1, isBundle: row.is_bundle === 1 }
+        : null;
+      productCache.set(productId, value);
+      return value;
+    };
+    const locationCache = new Map<number, boolean>();
+    const locationExists = async (locationId: number): Promise<boolean> => {
+      const cached = locationCache.get(locationId);
+      if (cached !== undefined) return cached;
+      const row = await db
+        .prepare(
+          `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+            WHERE loc.id = ?1 AND loc.deleted_at IS NULL AND w.store_id = ?2`,
+        )
+        .bind(locationId, input.storeId)
+        .first<{ id: number }>();
+      const value = row !== null;
+      locationCache.set(locationId, value);
+      return value;
+    };
+    const candCache = new Map<number, CandidateRow[]>();
+    const loadCandidates = async (productId: number): Promise<CandidateRow[]> => {
+      const cached = candCache.get(productId);
+      if (cached) return cached;
+      const { results } = await db
+        .prepare(
+          `SELECT s.id AS stock_id, s.lot_id AS lot_id, s.location_id AS location_id,
+                  loc.warehouse_id AS warehouse_id, s.quantity AS quantity, s.version AS version,
+                  l.expiry_date AS expiry_date, l.received_at AS received_at
+             FROM stocks s
+             JOIN lots l ON l.id = s.lot_id
+             JOIN locations loc ON loc.id = s.location_id
+            WHERE l.product_id = ? AND s.store_id = ?
+            ORDER BY s.id ASC`,
+        )
+        .bind(productId, input.storeId)
+        .all<CandidateDbRow>();
+      const rows: CandidateRow[] = results.map((r) => ({
+        stockId: r.stock_id,
+        lotId: r.lot_id,
+        expiryDate: r.expiry_date,
+        quantity: r.quantity,
+        receivedAt: r.received_at,
+        version: r.version,
+        locationId: r.location_id,
+        warehouseId: r.warehouse_id,
+      }));
+      candCache.set(productId, rows);
+      return rows;
+    };
+    // 実在庫の作業数量 (stockId -> 数量) と、この一括で新規に生える在庫の受け皿
+    const overlay = new Map<number, number>();
+    interface Synthetic {
+      fakeId: number;
+      productId: number;
+      locationId: number;
+      expiryDate: number | null;
+      quantity: number;
+      receivedAt: number;
+    }
+    const synthetics = new Map<string, Synthetic>();
+    const syntheticByFakeId = new Map<number, Synthetic>();
+    let syntheticSeq = 0;
+
+    for (let i = 0; i < input.lines.length; i++) {
+      if (lineStored[i]) continue;
+      const line = input.lines[i]!;
+      const product = await loadProduct(line.productId);
+      if (!product) throw lineError(i, 'product not found');
+      if (line.type === 'IN') {
+        if (product.isBundle) {
+          throw new ApiError(422, 'BUNDLE_NO_STOCK', `line ${i + 1}: bundle products do not hold stock`);
+        }
+        if (product.requiresExpiry && line.expiryDateMs === null) {
+          throw lineError(i, 'expiryDate is required for this product');
+        }
+        if (!(await locationExists(line.locationId))) throw lineError(i, 'location not found');
+        if (lockedLocations.has(line.locationId)) throw stocktakeLocked();
+        const lot = await db
+          .prepare('SELECT id FROM lots WHERE product_id = ?1 AND lot_code = ?2 AND store_id = ?3')
+          .bind(line.productId, line.lotCode, input.storeId)
+          .first<{ id: number }>();
+        let appliedToExisting = false;
+        if (lot) {
+          const stock = await db
+            .prepare('SELECT id, quantity FROM stocks WHERE location_id = ?1 AND lot_id = ?2')
+            .bind(line.locationId, lot.id)
+            .first<{ id: number; quantity: number }>();
+          if (stock) {
+            overlay.set(stock.id, (overlay.get(stock.id) ?? stock.quantity) + line.quantity);
+            appliedToExisting = true;
+          }
+        }
+        if (!appliedToExisting) {
+          const key = `${line.locationId}|${line.productId}|${line.lotCode}`;
+          const syn = synthetics.get(key);
+          if (syn) {
+            syn.quantity += line.quantity;
+          } else {
+            syntheticSeq += 1;
+            const created: Synthetic = {
+              fakeId: -syntheticSeq,
+              productId: line.productId,
+              locationId: line.locationId,
+              expiryDate: line.expiryDateMs,
+              quantity: line.quantity,
+              receivedAt: now + syntheticSeq,
+            };
+            synthetics.set(key, created);
+            syntheticByFakeId.set(created.fakeId, created);
+          }
+        }
+      } else {
+        if (product.isBundle) {
+          throw lineError(i, 'bundle products are not supported in bulk; use the bundle consumption endpoint');
+        }
+        if (line.locationId !== undefined) {
+          if (!(await locationExists(line.locationId))) throw lineError(i, 'location not found');
+          if (lockedLocations.has(line.locationId)) throw stocktakeLocked();
+        }
+        const pristine = await loadCandidates(line.productId);
+        const buildCandidates = (includeLocked: boolean): CandidateRow[] => {
+          const out: CandidateRow[] = [];
+          for (const cd of pristine) {
+            if (line.locationId !== undefined && cd.locationId !== line.locationId) continue;
+            if (input.allowedLocationIds !== null && !input.allowedLocationIds.includes(cd.locationId)) continue;
+            if (!includeLocked && lockedLocations.has(cd.locationId)) continue;
+            out.push({ ...cd, quantity: overlay.get(cd.stockId) ?? cd.quantity });
+          }
+          for (const syn of synthetics.values()) {
+            if (syn.productId !== line.productId) continue;
+            if (line.locationId !== undefined && syn.locationId !== line.locationId) continue;
+            if (input.allowedLocationIds !== null && !input.allowedLocationIds.includes(syn.locationId)) continue;
+            out.push({
+              stockId: syn.fakeId,
+              lotId: syn.fakeId,
+              expiryDate: syn.expiryDate,
+              quantity: syn.quantity,
+              receivedAt: syn.receivedAt,
+              version: 0,
+              locationId: syn.locationId,
+              warehouseId: 0,
+            });
+          }
+          return out;
+        };
+        const plan = planConsumption(buildCandidates(false), line.quantity, now, null);
+        if (plan.shortfall > 0) {
+          if (
+            lockedLocations.size > 0 &&
+            planConsumption(buildCandidates(true), line.quantity, now, null).shortfall === 0
+          ) {
+            throw stocktakeLocked();
+          }
+          throw lineError(i, 'insufficient stock');
+        }
+        for (const a of plan.allocations) {
+          if (a.stockId >= 0) {
+            overlay.set(a.stockId, a.after);
+          } else {
+            const syn = syntheticByFakeId.get(a.stockId);
+            if (syn) syn.quantity = a.after;
+          }
+        }
+      }
+    }
+
+    // ---- フェーズ 2: 行を順に実適用する (内部処理が検証と冪等を再実行する)
+    const results: Record<string, unknown>[] = [];
+    for (let i = 0; i < input.lines.length; i++) {
+      const line = input.lines[i]!;
+      const already = lineStored[i];
+      if (already) {
+        results.push({ line: i + 1, type: line.type, ...(already.body as Record<string, unknown>) });
+        continue;
+      }
+      const ctx = lineCtx[i]!;
+      let envelope: Envelope;
+      try {
+        envelope =
+          line.type === 'IN'
+            ? await this.inboundInternal({
+                ...ctx,
+                locationId: line.locationId,
+                productId: line.productId,
+                lotCode: line.lotCode,
+                expiryDateMs: line.expiryDateMs,
+                quantity: line.quantity,
+                reason: line.reason ?? null,
+                documentId,
+              })
+            : await this.consumeInternal({
+                ...ctx,
+                productId: line.productId,
+                ...(line.locationId !== undefined ? { locationId: line.locationId } : {}),
+                quantity: line.quantity,
+                department: line.department ?? '',
+                purpose: line.purpose ?? '',
+                allowedLocationIds: input.allowedLocationIds,
+                documentId,
+              });
+      } catch (e) {
+        envelope = this.errorEnvelope(e);
+      }
+      // 検証済みのため通常は到達しない。到達した場合は一括の冪等記録を残さず、
+      // その行のエラーを返す (適用済みの行は行ごとの冪等キーで再送時にスキップされる)
+      if (envelope.status >= 400) return envelope;
+      results.push({ line: i + 1, type: line.type, ...(envelope.body as Record<string, unknown>) });
+    }
+    const body = { documentId, results };
+    await this.idempotencyStmt(input, 201, body).run();
     return this.envelope(201, body);
   }
 

@@ -3,6 +3,8 @@ import { z } from 'zod';
 import type { Env } from './env';
 import {
   InventoryCoordinator,
+  type BulkInput,
+  type BulkLineInput,
   type BundleConsumeInput,
   type ConsumeInput,
   type Envelope,
@@ -84,6 +86,7 @@ import {
   bulkProductsSchema,
   bundleComponentsSchema,
   bundleConsumptionSchema,
+  bulkMovementsSchema,
   consumptionSchema,
   consumeReservationSchema,
   countedQuantitySchema,
@@ -1475,6 +1478,7 @@ async function sha256Hex(text: string): Promise<string> {
 interface CoordinatorStub {
   inbound: (input: InboundInput) => Promise<Envelope>;
   consume: (input: ConsumeInput) => Promise<Envelope>;
+  bulkMovements: (input: BulkInput) => Promise<Envelope>;
   consumeBundle: (input: BundleConsumeInput) => Promise<Envelope>;
   confirmPick: (input: PickConfirmInput) => Promise<Envelope>;
   transfer: (input: TransferInput) => Promise<Envelope>;
@@ -2199,7 +2203,14 @@ app.get('/api/v1/movements', async (c) => {
     conditions.push('mv.type = ?');
     params.push(type);
   }
-  const skip = Number(c.req.query('skip') ?? 0);
+  // 差分取得: sinceId を渡すと「その ID より後」だけを古い順に返す (連携用)
+  const sinceIdRaw = c.req.query('sinceId');
+  const sinceId = sinceIdRaw !== undefined && sinceIdRaw !== '' ? Number(sinceIdRaw) : null;
+  if (sinceId !== null && Number.isFinite(sinceId)) {
+    conditions.push('mv.id > ?');
+    params.push(Math.trunc(sinceId));
+  }
+  const skip = sinceId !== null ? 0 : Number(c.req.query('skip') ?? 0);
   const take = Math.min(Number(c.req.query('take') ?? 50), 200);
   // 検品写真の件数 (0014 の movement_photos がある環境のみ数える)
   const photoCountSql = (await hasTable(c, 'movement_photos'))
@@ -2222,7 +2233,7 @@ app.get('/api/v1/movements', async (c) => {
        JOIN lots l ON l.id = s.lot_id
        JOIN products p ON p.id = l.product_id` +
     (conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '') +
-    ' ORDER BY mv.id DESC LIMIT ? OFFSET ?';
+    (sinceId !== null ? ' ORDER BY mv.id ASC LIMIT ? OFFSET ?' : ' ORDER BY mv.id DESC LIMIT ? OFFSET ?');
   params.push(take, skip);
   const { results } = await c.env.DB.prepare(sql).bind(...params).all();
   // 全体管理者の操作は actorId を伏せる (誰の操作かは店舗側に出さない)
@@ -3396,6 +3407,164 @@ app.get('/api/v1/search', async (c) => {
   });
 });
 
+// ------------------------------------------------------------ 在庫内訳・ロット追跡
+/**
+ * 商品の在庫内訳 (stocks.read)。場所・ロットごとの実在庫に、引当と
+ * フリー在庫 (実在庫 - 引当) を添えて返す。発注残 (発注済み・未入荷) も付ける。
+ */
+app.get('/api/v1/products/:id/availability', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  const productId = Number(c.req.param('id'));
+  const product = await c.env.DB.prepare(
+    `SELECT id, sku, name, unit, barcode, safety_stock AS safetyStock
+       FROM products WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+  )
+    .bind(productId, ctx.store.id)
+    .first<{ id: number; sku: string; name: string; unit: string; barcode: string | null; safetyStock: number }>();
+  if (!product) throw notFound('Product not found');
+  const reachable = reachableWarehouseIds(ctx.assignments);
+  let stocks: {
+    stockId: number; locationId: number; locationName: string; locationCode: string;
+    warehouseId: number; warehouseName: string; lotId: number; lotCode: string;
+    expiryDate: number | null; quantity: number;
+  }[] = [];
+  if (reachable === null || reachable.length > 0) {
+    const sql =
+      `SELECT s.id AS stockId, s.location_id AS locationId, loc.name AS locationName,
+              loc.code AS locationCode, loc.warehouse_id AS warehouseId, w.name AS warehouseName,
+              s.lot_id AS lotId, l.lot_code AS lotCode, l.expiry_date AS expiryDate, s.quantity
+         FROM stocks s
+         JOIN locations loc ON loc.id = s.location_id
+         JOIN warehouses w ON w.id = loc.warehouse_id
+         JOIN lots l ON l.id = s.lot_id
+        WHERE s.store_id = ? AND l.product_id = ?` +
+      (reachable === null ? '' : ` AND loc.warehouse_id IN (${reachable.map(() => '?').join(',')})`) +
+      ' ORDER BY s.id ASC';
+    const params: (number | string)[] = [ctx.store.id, productId, ...(reachable ?? [])];
+    stocks = (await c.env.DB.prepare(sql).bind(...params).all()).results as typeof stocks;
+  }
+  // フリー在庫: 引当テーブルがある環境でのみ計算する (無い場合は全量フリー)
+  let freeByStock: Map<number, number> | null = null;
+  if (stocks.length > 0 && (await hasTable(c, 'reservations'))) {
+    const reservations = await activeReservationRows(c.env.DB, ctx.store.id, Date.now());
+    const relevant = reservations.filter((r) => r.product_id === productId);
+    if (relevant.length > 0) {
+      freeByStock = computeFreeQuantities(
+        stocks.map((s) => ({ stockId: s.stockId, productId, locationId: s.locationId, quantity: s.quantity })),
+        relevant.map((r) => ({ productId: r.product_id, locationId: r.location_id, quantity: r.quantity })),
+      );
+    }
+  }
+  let onOrderQuantity = 0;
+  if (await hasTable(c, 'purchase_order_lines')) {
+    const row = await c.env.DB.prepare(
+      `SELECT COALESCE(SUM(pol.quantity - pol.received_quantity), 0) AS qty
+         FROM purchase_order_lines pol
+         JOIN purchase_orders po ON po.id = pol.po_id
+        WHERE po.store_id = ?1 AND po.status = 'ordered' AND pol.product_id = ?2`,
+    )
+      .bind(ctx.store.id, productId)
+      .first<{ qty: number }>();
+    onOrderQuantity = row?.qty ?? 0;
+  }
+  const stockJson = stocks.map((s) => {
+    const free = freeByStock ? (freeByStock.get(s.stockId) ?? s.quantity) : s.quantity;
+    return { ...s, freeQuantity: free, reservedQuantity: s.quantity - free };
+  });
+  return c.json({
+    product,
+    totals: {
+      quantity: stockJson.reduce((a, s) => a + s.quantity, 0),
+      reserved: stockJson.reduce((a, s) => a + s.reservedQuantity, 0),
+      free: stockJson.reduce((a, s) => a + s.freeQuantity, 0),
+    },
+    onOrderQuantity,
+    stocks: stockJson,
+  });
+});
+
+/**
+ * ロットの追跡 (stocks.read)。そのロットの現在庫 (場所ごと) と、
+ * 入庫から消費までの履歴・累計を返す。他店舗のロットは 404。
+ */
+app.get('/api/v1/lots/:id/history', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  const ctx = await storeContext(c);
+  const lotId = Number(c.req.param('id'));
+  const lot = await c.env.DB.prepare(
+    `SELECT l.id, l.lot_code AS lotCode, l.expiry_date AS expiryDate, l.received_at AS receivedAt,
+            l.product_id AS productId, p.sku AS productSku, p.name AS productName, p.unit AS productUnit
+       FROM lots l JOIN products p ON p.id = l.product_id
+      WHERE l.id = ?1 AND l.store_id = ?2`,
+  )
+    .bind(lotId, ctx.store.id)
+    .first<{
+      id: number; lotCode: string; expiryDate: number | null; receivedAt: number | null;
+      productId: number; productSku: string; productName: string; productUnit: string;
+    }>();
+  if (!lot) throw notFound('Lot not found');
+  const takeRaw = Number(c.req.query('take') ?? 50);
+  const take = Number.isFinite(takeRaw) ? Math.min(Math.max(Math.trunc(takeRaw), 1), 200) : 50;
+  const reachable = reachableWarehouseIds(ctx.assignments);
+  const reachableClause =
+    reachable === null ? '' : reachable.length === 0 ? ' AND 1 = 0' : ` AND loc.warehouse_id IN (${reachable.map(() => '?').join(',')})`;
+  const reachableParams: number[] = reachable ?? [];
+  const stocks = (
+    await c.env.DB.prepare(
+      `SELECT s.id AS stockId, s.location_id AS locationId, loc.name AS locationName,
+              loc.warehouse_id AS warehouseId, s.quantity
+         FROM stocks s JOIN locations loc ON loc.id = s.location_id
+        WHERE s.lot_id = ? AND s.store_id = ?${reachableClause}
+        ORDER BY s.id ASC`,
+    )
+      .bind(lotId, ctx.store.id, ...reachableParams)
+      .all()
+  ).results;
+  const totalRow = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(s.quantity), 0) AS currentQuantity
+       FROM stocks s WHERE s.lot_id = ?1 AND s.store_id = ?2`,
+  )
+    .bind(lotId, ctx.store.id)
+    .first<{ currentQuantity: number }>();
+  const sumRow = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(CASE WHEN mv.quantity_change > 0 THEN mv.quantity_change ELSE 0 END), 0) AS totalIn,
+            COALESCE(SUM(CASE WHEN mv.quantity_change < 0 THEN -mv.quantity_change ELSE 0 END), 0) AS totalOut
+       FROM stock_movements mv JOIN stocks s ON s.id = mv.stock_id
+      WHERE mv.store_id = ?1 AND s.lot_id = ?2`,
+  )
+    .bind(ctx.store.id, lotId)
+    .first<{ totalIn: number; totalOut: number }>();
+  const movements = (
+    await c.env.DB.prepare(
+      `SELECT mv.id, mv.document_id AS documentId, mv.type,
+              mv.quantity_change AS quantityChange, mv.quantity_before AS quantityBefore,
+              mv.quantity_after AS quantityAfter, mv.actor_id AS actorId, mv.reason,
+              mv.created_at AS createdAt, s.location_id AS locationId, loc.name AS locationName
+         FROM stock_movements mv
+         JOIN stocks s ON s.id = mv.stock_id
+         JOIN locations loc ON loc.id = s.location_id
+        WHERE mv.store_id = ? AND s.lot_id = ?${reachableClause}
+        ORDER BY mv.id DESC LIMIT ?`,
+    )
+      .bind(ctx.store.id, lotId, ...reachableParams, take)
+      .all()
+  ).results;
+  const hidden = await hiddenPlatformUserIds(c, ctx.store.id);
+  return c.json({
+    lot,
+    totals: {
+      totalIn: sumRow?.totalIn ?? 0,
+      totalOut: sumRow?.totalOut ?? 0,
+      currentQuantity: totalRow?.currentQuantity ?? 0,
+    },
+    stocks,
+    movements: movements.map((r) =>
+      anonymizeUserFields(r as Record<string, unknown>, hidden, ['actorId']),
+    ),
+  });
+});
+
 app.get('/api/v1/stocks', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
   const ctx = await storeContext(c);
@@ -3559,6 +3728,95 @@ app.post('/api/v1/movements/consumption', async (c) => {
     purpose: dto.purpose,
     ...(dto.fefoDeviationReason !== undefined ? { fefoDeviationReason: dto.fefoDeviationReason } : {}),
     ...(dto.negativeApprovalId !== undefined ? { negativeApprovalId: dto.negativeApprovalId } : {}),
+    allowedLocationIds: await allowedLocationIds(c),
+  });
+  return respond(c, envelope);
+});
+
+/**
+ * 一括入出庫 (最大 50 行)。全行を先に検証し、1 行でも規則違反・在庫不足が
+ * あれば全体を止める。通過した行は 1 つの伝票 (documentId) で順に適用する。
+ * セット品とマイナス在庫 (承認フロー) は一括の対象外。
+ */
+app.post('/api/v1/movements/bulk', async (c) => {
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(bulkMovementsSchema, raw);
+  const ctx = await storeContext(c);
+  const hasIn = dto.lines.some((l) => l.type === 'IN');
+  const hasOut = dto.lines.some((l) => l.type === 'OUT');
+  // メンテナンス (features レベル): 一括は inbound / outbound 両グループに触れる
+  const maintenance = c.get('maintenance');
+  if (
+    maintenance?.active &&
+    maintenance.active.level === 'features' &&
+    !isPlatformAdmin(user(c).assignments)
+  ) {
+    const active = maintenance.active;
+    const stopped = (key: string): boolean => {
+      const stage = active.features[key];
+      return stage === 'full' || stage === 'write';
+    };
+    if ((hasIn && stopped('inbound')) || (hasOut && stopped('outbound'))) {
+      return c.json(
+        {
+          statusCode: 503,
+          error: 'MAINTENANCE',
+          message: resolvedMaintenanceMessage(active),
+          level: active.level,
+          endsAt: active.endsAt,
+          features: active.features,
+        },
+        503,
+      );
+    }
+  }
+  const rpIn = hasIn ? await requirePermission(c, Permission.MOVEMENTS_INBOUND) : null;
+  const rpOut = hasOut ? await requirePermission(c, Permission.MOVEMENTS_CONSUME) : null;
+  const lines: BulkLineInput[] = [];
+  for (const line of dto.lines) {
+    if (line.type === 'IN') {
+      const warehouseId = await warehouseIdOfLocation(c, line.locationId);
+      if (!canPerformInStore(ctx, rpIn!, warehouseId, Permission.MOVEMENTS_INBOUND)) {
+        throw forbidden('Out of warehouse scope');
+      }
+      let expiryDateMs: number | null = null;
+      if (line.expiryDate !== undefined) {
+        expiryDateMs = parseDateOnly(line.expiryDate);
+        if (expiryDateMs === null) throw badRequest('expiryDate must be a valid YYYY-MM-DD date');
+      }
+      lines.push({
+        type: 'IN',
+        locationId: line.locationId,
+        productId: line.productId,
+        lotCode: line.lotCode,
+        expiryDateMs,
+        quantity: line.quantity,
+        ...(line.reason !== undefined ? { reason: line.reason } : {}),
+      });
+    } else {
+      if (line.locationId !== undefined) {
+        const warehouseId = await warehouseIdOfLocation(c, line.locationId);
+        if (!canPerformInStore(ctx, rpOut!, warehouseId, Permission.MOVEMENTS_CONSUME)) {
+          throw forbidden('Out of warehouse scope');
+        }
+      }
+      lines.push({
+        type: 'OUT',
+        productId: line.productId,
+        ...(line.locationId !== undefined ? { locationId: line.locationId } : {}),
+        quantity: line.quantity,
+        department: line.department,
+        purpose: line.purpose,
+      });
+    }
+  }
+  const envelope = await coordinator(c).bulkMovements({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/movements/bulk',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    lines,
     allowedLocationIds: await allowedLocationIds(c),
   });
   return respond(c, envelope);
