@@ -57,6 +57,8 @@ export const APP_HTML = `<!doctype html>
   <p class="small muted">テンプレートを選ぶと、カテゴリ・部門・理由コードと最初の保管場所が初期設定されます。プランはフリーで始まります。</p>
   <p><button class="btn" id="signupBtn" type="button">組織と店舗を作成して始める</button></p>
   <p class="small danger" id="signupMsg" style="display:none"></p>
+  <p style="margin-top:1.5rem"><button class="btn secondary" id="signupLogoutBtn" type="button">ログアウト</button></p>
+  <p class="small muted">別のアカウントでログインし直す場合は、先にログアウトしてください。</p>
 </div>
 
 <div id="maintenanceBox" class="center-box" style="display:none">

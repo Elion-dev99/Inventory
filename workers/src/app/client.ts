@@ -5170,6 +5170,7 @@ var signupInitDone = false;
 function initSignupForm() {
   if (signupInitDone) return;
   signupInitDone = true;
+  el('signupLogoutBtn').onclick = doLogout;
   var sel = el('signupTemplate');
   api('/api/v1/signup/templates').then(function (d) {
     var h = '';
