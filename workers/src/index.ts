@@ -302,23 +302,78 @@ app.use('*', async (c, next) => {
 // ------------------------------------------------------------ ヘルスチェック
 app.get('/api/v1/health', (c) => c.json({ status: 'ok' }));
 
-// ------------------------------------------------------------ ルート (案内ページ)
-// フロントエンド未実装のため、トップではサービスの状態と API の入口だけを示す。
+// ------------------------------------------------------------ ルート (入口ページ)
+// 未ログインの訪問者が最初に見る画面。内部情報 (ヘルスチェック・API パス・
+// 管理画面への直リンク) は出さず、アプリのデザイン言語で入口だけを示す。
+// ログイン自体は /app (Face ID / Google) と /auth/login が担う。
 app.get('/', (c) =>
   c.html(`<!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>在庫管理システム</title></head>
-<body style="font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.7;">
-<h1>在庫管理システム</h1>
-<p>サービスは稼働中です (Workers + D1 版)。</p>
-<ul>
-<li>ヘルスチェック: <a href="/api/v1/health">/api/v1/health</a></li>
-<li>API ベースパス: <code>/api/v1</code> (業務 API は認証が必要です)</li>
-</ul>
-<p><a href="/app">アプリを開く</a> (在庫管理の画面。ログインが必要です)</p>
-<p><a href="/login">Google でログイン</a> (業務 API の動作確認用ページ)</p>
-<p><a href="/admin/permissions">権限管理</a> (管理者用: ロールごとの権限とユーザーのロール付与)</p>
+<title>在庫管理システム</title>${PWA_HEAD}
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --fg: #1d1d1f; --muted: #86868b;
+  --line: rgba(0, 0, 0, 0.08); --accent: #0071e3; --accent-press: #0060c9;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #060608; --surface: #1c1c1e; --fg: #f5f5f7; --muted: #98989d;
+    --line: rgba(255, 255, 255, 0.12);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.35);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Hiragino Sans", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 560px; margin: 0 auto; padding: 56px 24px 40px; text-align: center; }
+.icon { width: 84px; height: 84px; border-radius: 20px; box-shadow: var(--shadow); }
+h1 { font-size: 32px; font-weight: 700; letter-spacing: 0.01em; margin: 20px 0 10px; }
+.lead { font-size: 16px; line-height: 1.7; color: var(--muted); margin: 0 0 28px; }
+.actions { display: grid; gap: 12px; max-width: 340px; margin: 0 auto; }
+.btn {
+  display: block; padding: 14px 20px; border-radius: 980px; font-size: 16px; font-weight: 600;
+  text-decoration: none; text-align: center;
+}
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.primary:active { background: var(--accent-press); }
+.btn.secondary { background: var(--surface); color: var(--fg); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.note { font-size: 13px; line-height: 1.7; color: var(--muted); margin: 18px 0 0; }
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 24px;
+  box-shadow: var(--shadow); margin: 36px 0 0; padding: 6px 22px; text-align: left;
+}
+.features { list-style: none; margin: 0; padding: 0; }
+.features li { font-size: 14.5px; line-height: 1.6; padding: 13px 0; border-bottom: 1px solid var(--line); }
+.features li:last-child { border-bottom: none; }
+.features b { font-weight: 600; }
+footer { margin-top: 32px; font-size: 12px; color: var(--muted); }
+</style></head>
+<body>
+<main class="wrap">
+  <img class="icon" src="/icons/icon-512.png" alt="">
+  <h1>在庫管理システム</h1>
+  <p class="lead">バーコードスキャンで入出庫。ロットと有効期限まで管理できる在庫管理アプリです。</p>
+  <div class="actions">
+    <a class="btn primary" href="/app">アプリを開く</a>
+    <a class="btn secondary" href="/auth/login">Google でログイン</a>
+  </div>
+  <p class="note">初めての方は、ログイン後にそのまま組織と店舗を作成して使い始められます。</p>
+  <section class="card">
+    <ul class="features">
+      <li><b>スキャンで記録</b> — バーコードを読み取って入出庫・棚卸し</li>
+      <li><b>ロット・有効期限</b> — 期限の早いものから出庫 (FEFO)、期限アラート</li>
+      <li><b>現場のフロー</b> — 引当・ピッキング検品・セット品に対応</li>
+      <li><b>複数店舗</b> — 店舗ごとにデータを分離し、ロールで権限を管理</li>
+      <li><b>セキュリティ</b> — Face ID (パスキー) ログインと監査ログ</li>
+    </ul>
+  </section>
+  <footer>在庫管理システム</footer>
+</main>
 </body>
 </html>`),
 );
