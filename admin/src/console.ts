@@ -95,6 +95,7 @@ export const CONSOLE_HTML = `<!doctype html>
 <p id="error" style="color: var(--danger); white-space: pre-wrap;"></p>
 <div id="loginGuide" class="section-box" style="display:none;">
   <p>ログインが必要です（セッションの有効期限は2時間です）。全体管理者だけがログインできます。</p>
+  <p class="small" id="passkeyOnlyNote" style="display:none; color: var(--danger);">パスキー必須モードが有効です。Google でログインしても、Face ID での本人確認が終わるまでコンソールは使えません。</p>
   <p><a class="btn" href="/auth/login">Google でログインする</a>
   <button class="btn secondary" id="passkeyLoginBtn" style="display:none;">Face IDでログイン</button></p>
   <p class="small" id="passkeyLoginMsg" style="display:none; color: var(--danger);"></p>
@@ -293,7 +294,7 @@ export const CONSOLE_HTML = `<!doctype html>
   <div id="backupList"><div class="skl skl-row"></div></div>
   <h3>操作</h3>
   <div class="group">
-    <div class="group-row"><span class="row-label">全データエクスポート (全店舗)</span><a class="btn small" href="/api/platform/export.json">ダウンロード</a></div>
+    <div class="group-row"><span class="row-label">全データエクスポート (全店舗)</span><button class="btn small" id="exportBtn">ダウンロード</button></div>
     <div class="group-row"><span class="row-label">全セッション失効 <small class="muted">自分のセッションは残ります</small></span><button class="btn small danger" id="revokeAllBtn">失効させる</button></div>
   </div>
   <h3>セキュリティ</h3>
@@ -313,9 +314,9 @@ export const CONSOLE_HTML = `<!doctype html>
 <div id="stepUpOverlay" class="stepup-overlay" style="display:none;">
   <div class="stepup-box">
     <h3>本人確認</h3>
-    <p class="small muted">この操作には再認証が必要です。</p>
+    <p class="small muted" id="stepUpDesc">この操作には再認証が必要です。</p>
     <p><button class="btn" id="stepUpPasskeyBtn" style="display:none;">Face IDで認証</button>
-    <a class="btn secondary" href="/auth/login?stepup=1">Google で再ログイン</a></p>
+    <a class="btn secondary" id="stepUpGoogleLink" href="/auth/login?stepup=1">Google で再ログイン</a></p>
     <p class="small" id="stepUpMsg" style="display:none; color: var(--danger);"></p>
     <p><button class="btn small secondary" id="stepUpCancelBtn">キャンセル</button></p>
   </div>
@@ -347,6 +348,11 @@ async function api(path, opts) {
     if (code === 'STEP_UP_REQUIRED') {
       // 重要操作の再認証: ダイアログで認証できたら元のリクエストを 1 回だけ再試行する
       await requestStepUp();
+      return api(path, { ...src, stepUpRetried: true });
+    }
+    if (code === 'PASSKEY_REQUIRED') {
+      // パスキー必須モード: Face ID で本人確認できたら元のリクエストを 1 回だけ再試行する
+      await requestStepUp({ passkeyOnly: true });
       return api(path, { ...src, stepUpRetried: true });
     }
   }
@@ -458,11 +464,16 @@ async function doPasskeyRegister() {
 }
 /* ---- 再認証 (ステップアップ) ダイアログ ---- */
 let stepUpWaiters = [];
-function requestStepUp() {
+function requestStepUp(opts) {
+  const passkeyOnly = !!(opts && opts.passkeyOnly);
   return new Promise((resolve, reject) => {
     stepUpWaiters.push({ resolve, reject });
     el('stepUpMsg').style.display = 'none';
     el('stepUpPasskeyBtn').style.display = passkeySupported() ? '' : 'none';
+    el('stepUpGoogleLink').style.display = passkeyOnly ? 'none' : '';
+    el('stepUpDesc').textContent = passkeyOnly
+      ? '全体管理コンソールは Face ID での本人確認が必要です。'
+      : 'この操作には再認証が必要です。';
     el('stepUpOverlay').style.display = '';
   });
 }
@@ -1781,6 +1792,13 @@ el('userSearchBtn').onclick = loadUsers;
 el('auditSearchBtn').onclick = loadAudit;
 el('mntStartBtn').onclick = startMaintenanceNow;
 el('mntAddBtn').onclick = addWindow;
+el('exportBtn').onclick = async () => {
+  try {
+    // ダウンロード前に再認証を通す (必要な場合はダイアログが出る)
+    await api('/api/platform/export/prepare', { method: 'POST', body: '{}' });
+    location.href = '/api/platform/export.json';
+  } catch (e) { setError(errText(e)); }
+};
 el('revokeAllBtn').onclick = revokeAllSessions;
 el('backupCreateBtn').onclick = createBackupNow;
 el('annCreateBtn').onclick = createAnnouncement;
@@ -1790,6 +1808,9 @@ el('stepUpPasskeyBtn').onclick = doPasskeyStepUp;
 el('stepUpCancelBtn').onclick = () => settleStepUp(false);
 el('passkeyLoginBtn').onclick = passkeyLogin;
 if (passkeySupported()) el('passkeyLoginBtn').style.display = '';
+fetch('/auth/config').then((r) => r.json()).then((cfg) => {
+  if (cfg && cfg.passkeyOnly) el('passkeyOnlyNote').style.display = '';
+}).catch(() => {});
 loadAll();
 </script>
 </body>

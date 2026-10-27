@@ -43,7 +43,14 @@ export interface LoginEventResult {
 export async function recordLoginEvent(
   db: D1Database,
   env: PushEnv,
-  input: { userId: number; method: LoginMethod; ip: string | null; userAgent: string | null },
+  input: {
+    userId: number;
+    method: LoginMethod;
+    ip: string | null;
+    userAgent: string | null;
+    /** 'platform' は全体管理コンソールへのログイン。新端末でなくても毎回通知する */
+    scope?: 'app' | 'platform';
+  },
   notify: LoginNotifyFn = sendPushToUsers,
 ): Promise<LoginEventResult> {
   const deviceLabel = deviceLabelFromUserAgent(input.userAgent);
@@ -65,15 +72,22 @@ export async function recordLoginEvent(
       )
       .bind(input.userId, input.method, input.ip, input.userAgent, deviceLabel, now)
       .run();
-    if (isNewDevice) {
+    const isPlatform = input.scope === 'platform';
+    if (isNewDevice || isPlatform) {
       try {
-        await notify(db, env, [input.userId], {
-          title: 'ログイン通知',
-          body: `新しい端末からログインがありました (${deviceLabel}、${new Date(now).toLocaleString('ja-JP')})`,
-          url: '/app',
-        });
+        await notify(db, env, [input.userId], isPlatform
+          ? {
+              title: '全体管理ログイン通知',
+              body: `全体管理コンソールにログインがありました (${input.method === 'passkey' ? 'Face ID' : 'Google'}、${deviceLabel}、${new Date(now).toLocaleString('ja-JP')})`,
+              url: '/app',
+            }
+          : {
+              title: 'ログイン通知',
+              body: `新しい端末からログインがありました (${deviceLabel}、${new Date(now).toLocaleString('ja-JP')})`,
+              url: '/app',
+            });
       } catch (e) {
-        console.error('new device push failed', e);
+        console.error('login push failed', e);
       }
     }
     return { recorded: true, isNewDevice, deviceLabel };

@@ -18,6 +18,7 @@ import practicalSql from '../../workers/migrations/0014_practical.sql?raw';
 import commercialSql from '../../workers/migrations/0015_commercial.sql?raw';
 import operationsSql from '../../workers/migrations/0016_operations.sql?raw';
 import securitySql from '../../workers/migrations/0017_security.sql?raw';
+import passkeyVerifiedSql from '../../workers/migrations/0019_session_passkey_verified.sql?raw';
 import { createSession, hashSessionToken } from '../../workers/src/lib/session';
 
 /**
@@ -380,6 +381,7 @@ beforeAll(async () => {
     ...statementsOf(commercialSql),
     ...statementsOf(operationsSql),
     ...statementsOf(securitySql),
+    ...statementsOf(passkeyVerifiedSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -770,4 +772,125 @@ describe('自分の platform セッション', () => {
     const list = await api('/api/platform/auth/sessions', { cookie: staff });
     expect(list.status).toBe(403);
   });
+});
+
+// --------------------------------------------- パスキー必須モード
+
+describe('全体管理コンソールのパスキー必須モード', () => {
+  async function setPasskeyOnly(on: boolean): Promise<void> {
+    await testEnv.DB.prepare(
+      `INSERT INTO platform_settings (key, value, updated_by, updated_at) VALUES ('platform_passkey_only', ?1, 1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+      .bind(on ? '1' : '0', new Date().toISOString())
+      .run();
+  }
+
+  it('有効時は未確認セッションを 403 にし、パスキーのステップアップで通る', async () => {
+    // 無効時は通常どおり使える
+    await setPasskeyOnly(false);
+    const token = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    const offRes = await api('/api/platform/overview', { cookie: token });
+    expect(offRes.status).toBe(200);
+
+    await setPasskeyOnly(true);
+    try {
+      const config = await api('/auth/config');
+      expect(config.status).toBe(200);
+      expect(config.body.passkeyOnly).toBe(true);
+
+      // /me は通り、状態が返る
+      const me = await api('/api/platform/me', { cookie: token });
+      expect(me.status).toBe(200);
+      expect(me.body.passkeyOnly).toBe(true);
+      expect(me.body.passkeyVerified).toBe(false);
+
+      // 通常 API は PASSKEY_REQUIRED で遮断される
+      const blocked = await api('/api/platform/overview', { cookie: token });
+      expect(blocked.status).toBe(403);
+      expect(blocked.body.error).toBe('PASSKEY_REQUIRED');
+
+      // パスキー確認済みセッションは最初から通る
+      const verified = await createSession(testEnv.DB, 1, { scope: 'platform', passkeyVerified: true });
+      const okRes = await api('/api/platform/overview', { cookie: verified });
+      expect(okRes.status).toBe(200);
+
+      // Google 発行セッションもパスキーのステップアップで確認済みになる
+      const options = await api('/api/platform/auth/passkey/step-up/options', {
+        cookie: token,
+        method: 'POST',
+        body: {},
+      });
+      expect(options.status).toBe(200);
+      const assertion = await authAdmin.assertion(options.body.challenge as string);
+      const stepUp = await api('/api/platform/auth/step-up/passkey', {
+        cookie: token,
+        method: 'POST',
+        body: assertion,
+      });
+      expect(stepUp.status).toBe(200);
+      const after = await api('/api/platform/overview', { cookie: token });
+      expect(after.status).toBe(200);
+      const meAfter = await api('/api/platform/me', { cookie: token });
+      expect(meAfter.body.passkeyVerified).toBe(true);
+    } finally {
+      await setPasskeyOnly(false);
+    }
+  });
+});
+
+// --------------------------------------------- ステップアップ範囲
+
+describe('ステップアップ必須の範囲拡大', () => {
+  async function rewindStepUp(token: string): Promise<void> {
+    const hash = await hashSessionToken(token);
+    await testEnv.DB.prepare('UPDATE sessions SET step_up_at = ?1 WHERE token_hash = ?2')
+      .bind(Date.now() - 11 * 60 * 1000, hash)
+      .run();
+  }
+
+  it('プラットフォームエクスポートは再認証が必要', async () => {
+    const token = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    const freshPrepare = await api('/api/platform/export/prepare', { cookie: token, method: 'POST', body: {} });
+    expect(freshPrepare.status).toBe(200);
+    const freshExport = await api('/api/platform/export.json', { cookie: token });
+    expect(freshExport.status).toBe(200);
+
+    await rewindStepUp(token);
+    const stalePrepare = await api('/api/platform/export/prepare', { cookie: token, method: 'POST', body: {} });
+    expect(stalePrepare.status).toBe(403);
+    expect(stalePrepare.body.error).toBe('STEP_UP_REQUIRED');
+    const staleExport = await api('/api/platform/export.json', { cookie: token });
+    expect(staleExport.status).toBe(403);
+    expect(staleExport.body.error).toBe('STEP_UP_REQUIRED');
+  });
+
+  it('緊急メンテナンスの作成は再認証が必要 (通常枠は不要)', async () => {
+    const now = Date.now();
+    const emergencyBody = {
+      kind: 'once',
+      startsAt: now + 60 * 60 * 1000,
+      endsAt: now + 2 * 60 * 60 * 1000,
+      level: 'full',
+      emergency: true,
+      reason: 'テスト緊急停止',
+    };
+    const token = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    await rewindStepUp(token);
+    const stale = await api('/api/platform/maintenance/windows', { cookie: token, method: 'POST', body: emergencyBody });
+    expect(stale.status).toBe(403);
+    expect(stale.body.error).toBe('STEP_UP_REQUIRED');
+
+    const normal = await api('/api/platform/maintenance/windows', {
+      cookie: token,
+      method: 'POST',
+      body: { kind: 'once', startsAt: now + 24 * 60 * 60 * 1000, endsAt: now + 25 * 60 * 60 * 1000, level: 'read_only' },
+    });
+    expect(normal.status).toBe(201);
+
+    const fresh = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    const okRes = await api('/api/platform/maintenance/windows', { cookie: fresh, method: 'POST', body: emergencyBody });
+    expect(okRes.status).toBe(201);
+  });
+
 });

@@ -18,8 +18,14 @@ import practicalSql from '../migrations/0014_practical.sql?raw';
 import commercialSql from '../migrations/0015_commercial.sql?raw';
 import operationsSql from '../migrations/0016_operations.sql?raw';
 import securitySql from '../migrations/0017_security.sql?raw';
+import passkeyVerifiedSql from '../migrations/0019_session_passkey_verified.sql?raw';
 import { recordLoginEvent } from '../src/lib/login-events';
-import { createSession, hashSessionToken } from '../src/lib/session';
+import {
+  createSession,
+  currentSessionRow,
+  hashSessionToken,
+  markSessionStepUp,
+} from '../src/lib/session';
 
 /**
  * セキュリティ強化 (0017) の結合テスト:
@@ -374,6 +380,7 @@ beforeAll(async () => {
     ...statementsOf(commercialSql),
     ...statementsOf(operationsSql),
     ...statementsOf(securitySql),
+    ...statementsOf(passkeyVerifiedSql),
   ]) {
     await testEnv.DB.prepare(stmt).run();
   }
@@ -659,6 +666,57 @@ describe('ログイン履歴と新しい端末の判定', () => {
     expect(events.status).toBe(200);
     expect(events.body.length).toBeGreaterThanOrEqual(3);
     expect(events.body[0].deviceLabel).toBe('iPhone Safari');
+  });
+});
+
+// ------------------------------------- 全体管理ログイン通知 / パスキー確認
+
+describe('全体管理ログインの毎回通知', () => {
+  it('platform スコープは同じ端末でも毎回通知し、店舗アプリは新端末だけ', async () => {
+    const calls: { title: string }[] = [];
+    const notify = (async (
+      _db: unknown,
+      _env: unknown,
+      _userIds: number[],
+      payload: { title: string },
+    ) => {
+      calls.push({ title: payload.title });
+    }) as unknown as Parameters<typeof recordLoginEvent>[3];
+    const pushEnv = testEnv as unknown as Parameters<typeof recordLoginEvent>[1];
+    const input = { userId: 3, method: 'google' as const, ip: '10.9.9.9', userAgent: IPHONE_UA };
+
+    const first = await recordLoginEvent(testEnv.DB, pushEnv, { ...input, scope: 'platform' }, notify);
+    expect(first.recorded).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.title).toBe('全体管理ログイン通知');
+
+    const second = await recordLoginEvent(testEnv.DB, pushEnv, { ...input, scope: 'platform' }, notify);
+    expect(second.isNewDevice).toBe(false);
+    expect(calls).toHaveLength(2);
+
+    const third = await recordLoginEvent(testEnv.DB, pushEnv, { ...input, scope: 'app' }, notify);
+    expect(third.isNewDevice).toBe(false);
+    expect(calls).toHaveLength(2);
+  });
+});
+
+describe('セッションのパスキー確認フラグ (0019)', () => {
+  it('Google 発行は false、パスキー発行は true、パスキーのステップアップで true になる', async () => {
+    const reqOf = (token: string) =>
+      new Request('https://example.com/', { headers: { Cookie: `session=${token}` } });
+
+    const googleToken = await createSession(testEnv.DB, 3, {});
+    const googleRow = await currentSessionRow(testEnv.DB, reqOf(googleToken));
+    expect(googleRow?.passkeyVerified).toBe(false);
+
+    const passkeyToken = await createSession(testEnv.DB, 3, { passkeyVerified: true });
+    const passkeyRow = await currentSessionRow(testEnv.DB, reqOf(passkeyToken));
+    expect(passkeyRow?.passkeyVerified).toBe(true);
+
+    const ok = await markSessionStepUp(testEnv.DB, reqOf(googleToken), undefined, { viaPasskey: true });
+    expect(ok).toBe(true);
+    const upgraded = await currentSessionRow(testEnv.DB, reqOf(googleToken));
+    expect(upgraded?.passkeyVerified).toBe(true);
   });
 });
 

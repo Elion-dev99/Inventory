@@ -18,7 +18,7 @@ import commercialSql from '../../workers/migrations/0015_commercial.sql?raw';
 import operationsSql from '../../workers/migrations/0016_operations.sql?raw';
 import securitySql from '../../workers/migrations/0017_security.sql?raw';
 import plansSql from '../../workers/migrations/0018_plans.sql?raw';
-import { createSession } from '../../workers/src/lib/session';
+import { createSession, hashSessionToken } from '../../workers/src/lib/session';
 
 /**
  * 組織・プラン管理 (0018) の結合テスト (全体管理 Worker)。
@@ -255,5 +255,38 @@ describe('組織・プラン管理', () => {
       body: { assignments: [{ roleCode: 'INVENTORY_MANAGER', warehouseId: null, storeId }] },
     });
     expect(change.status).toBe(200);
+  });
+
+  it('プラン変更にはステップアップ再認証が必要', async () => {
+    const created = await api('/api/platform/organizations', {
+      cookie: adminCookie,
+      method: 'POST',
+      body: { name: 'StepUpOrg', planKey: 'free' },
+    });
+    expect(created.status).toBe(201);
+    const orgId = created.body.id as number;
+
+    // step_up_at を 11 分前に巻き戻したセッションでは 403
+    const staleCookie = await createSession(testEnv.DB, 1, { scope: 'platform' });
+    const hash = await hashSessionToken(staleCookie);
+    await testEnv.DB.prepare('UPDATE sessions SET step_up_at = ?1 WHERE token_hash = ?2')
+      .bind(Date.now() - 11 * 60 * 1000, hash)
+      .run();
+    const stale = await api(`/api/platform/organizations/${orgId}/plan`, {
+      cookie: staleCookie,
+      method: 'PUT',
+      body: { planKey: 'pro' },
+    });
+    expect(stale.status).toBe(403);
+    expect(stale.body.error).toBe('STEP_UP_REQUIRED');
+
+    // ログイン直後のセッションでは通る
+    const changed = await api(`/api/platform/organizations/${orgId}/plan`, {
+      cookie: adminCookie,
+      method: 'PUT',
+      body: { planKey: 'pro' },
+    });
+    expect(changed.status).toBe(200);
+    expect(changed.body.planKey).toBe('pro');
   });
 });

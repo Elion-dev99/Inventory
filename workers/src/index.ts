@@ -2009,6 +2009,7 @@ app.post('/api/v1/auth/passkey/login/verify', async (c) => {
   const token = await createSession(c.env.DB, target.id, {
     userAgent: c.req.header('user-agent') ?? null,
     ip: clientIp(c.req.raw),
+    passkeyVerified: true,
   });
   return c.json({ ok: true }, 200, { 'Set-Cookie': sessionCookieHeader(token) });
 });
@@ -2089,7 +2090,7 @@ app.post('/api/v1/auth/step-up/passkey', async (c) => {
     .first<{ session_id: number | null }>();
   if (!challengeRow || challengeRow.session_id !== session.id) throw PASSKEY_FAILED();
   await verifyPasskeyAssertion(c, dto, 'step_up', me.userId);
-  await markSessionStepUp(c.env.DB, c.req.raw);
+  await markSessionStepUp(c.env.DB, c.req.raw, undefined, { viaPasskey: true });
   return c.json({ ok: true });
 });
 

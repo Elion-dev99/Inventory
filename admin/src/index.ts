@@ -213,6 +213,42 @@ async function requireStepUp(c: AppContext): Promise<void> {
   throw new ApiError(403, 'STEP_UP_REQUIRED', 'Step-up authentication is required');
 }
 
+/**
+ * 全体管理コンソールのパスキー必須モード (platform_settings の
+ * 'platform_passkey_only' = '1' で有効)。有効時は、パスキーで本人確認
+ * 済みでない platform セッションには API を一切使わせない (Google
+ * ログインだけではコンソールの中身に触れない)。緊急時は
+ * platform_settings の値を直接書き換えれば即時に解除できる。
+ */
+async function isPasskeyOnlyEnabled(db: D1Database): Promise<boolean> {
+  // コンソールは低トラフィックなため毎回読む (有効化・緊急解除とも即時反映)
+  try {
+    const row = await db
+      .prepare("SELECT value FROM platform_settings WHERE key = 'platform_passkey_only'")
+      .first<{ value: string }>();
+    return row?.value === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** パスキー必須モードのゲート。通過できない場合は 403 PASSKEY_REQUIRED */
+async function requirePasskeyVerified(c: AppContext): Promise<void> {
+  if (!(await isPasskeyOnlyEnabled(c.env.DB))) return;
+  // 本人確認のための経路だけは通す (me は状態表示、step-up は確認そのもの)
+  const path = c.req.path;
+  if (
+    path === '/api/platform/me' ||
+    path === '/api/platform/auth/passkey/step-up/options' ||
+    path === '/api/platform/auth/step-up/passkey'
+  ) {
+    return;
+  }
+  const session = await currentSessionRow(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  if (session && session.passkeyVerified) return;
+  throw new ApiError(403, 'PASSKEY_REQUIRED', 'Passkey verification is required');
+}
+
 /** workers 側 lib (verifyToken / syncUserFromPayload) は店舗アプリの Env 型を取るため変換する */
 function asWorkersEnv(env: AdminEnv): WorkersEnv {
   return env as unknown as WorkersEnv;
@@ -352,12 +388,14 @@ ${body}
     );
   }
 
-  // ログイン履歴と新しい端末の通知 (0017)。失敗してもログインは止めない。
+  // ログイン履歴と通知 (0017)。全体管理ログインは毎回通知する。
+  // 失敗してもログインは止めない。
   await recordLoginEvent(c.env.DB, c.env, {
     userId: authUser.userId,
     method: 'google',
     ip: clientIp(c.req.raw),
     userAgent: c.req.header('user-agent') ?? null,
+    scope: 'platform',
   });
 
   // ステップアップ再認証の往復: 既存の platform セッションが同じユーザーなら
@@ -435,6 +473,8 @@ app.use('/api/platform/*', async (c, next) => {
   }
   if (!sessionUser) throw unauthorized('Login required');
   c.set('user', sessionUser);
+  // パスキー必須モード: 未確認セッションは本人確認経路以外すべて 403
+  await requirePasskeyVerified(c);
   return next();
 });
 
@@ -449,14 +489,22 @@ function requirePlatformAdmin(c: AppContext): void {
 }
 
 /** 自分の情報。コンソール画面がログイン状態と全体管理者かどうかを判定するために使う */
-app.get('/api/platform/me', (c) => {
+app.get('/api/platform/me', async (c) => {
   const me = user(c);
+  const session = await currentSessionRow(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
   return c.json({
     id: me.userId,
     email: me.email,
     displayName: me.displayName,
     isPlatformAdmin: isPlatformAdmin(me.assignments),
+    passkeyOnly: await isPasskeyOnlyEnabled(c.env.DB),
+    passkeyVerified: session?.passkeyVerified ?? false,
   });
+});
+
+/** ログイン画面用: パスキー必須モードかどうか (未認証で取得できる) */
+app.get('/auth/config', async (c) => {
+  return c.json({ passkeyOnly: await isPasskeyOnlyEnabled(c.env.DB) });
 });
 
 /** ロール一覧 (割当編集 UI のセレクト用) */
@@ -703,6 +751,7 @@ const changePlanBodySchema = z.object({
 /** プラン変更。即時反映され、監査ログに変更前後を記録する */
 app.put('/api/platform/organizations/:id/plan', async (c) => {
   requirePlatformAdmin(c);
+  await requireStepUp(c);
   if (!(await hasOrganizationsTable(c.env.DB))) {
     throw new ApiError(503, 'ORGANIZATIONS_NOT_CONFIGURED', 'Organizations are not configured (migration 0018)');
   }
@@ -1883,6 +1932,8 @@ app.post('/api/platform/maintenance/windows', async (c) => {
     if (endsAt - startsAt > EMERGENCY_MAX_MS) {
       throw invalid('emergency windows are limited to 4 hours');
     }
+    // 緊急停止は影響が大きいため再認証を必須にする
+    await requireStepUp(c);
   }
 
   const features = featureMap ? JSON.stringify(featureMap) : null;
@@ -2588,11 +2639,13 @@ app.post('/api/platform/auth/passkey/login/verify', async (c) => {
     method: 'passkey',
     ip: clientIp(c.req.raw),
     userAgent: c.req.header('user-agent') ?? null,
+    scope: 'platform',
   });
   const token = await createSession(c.env.DB, target.id, {
     scope: 'platform',
     userAgent: c.req.header('user-agent') ?? null,
     ip: clientIp(c.req.raw),
+    passkeyVerified: true,
   });
   return c.json({ ok: true }, 200, {
     'Set-Cookie': sessionCookieHeader(token, { name: PLATFORM_SESSION_COOKIE_NAME }),
@@ -2640,7 +2693,7 @@ app.post('/api/platform/auth/step-up/passkey', async (c) => {
     .first<{ session_id: number | null }>();
   if (!challengeRow || challengeRow.session_id !== session.id) throw PASSKEY_FAILED();
   await verifyPasskeyAssertion(c, dto, 'step_up', me.userId);
-  await markSessionStepUp(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME);
+  await markSessionStepUp(c.env.DB, c.req.raw, PLATFORM_SESSION_COOKIE_NAME, { viaPasskey: true });
   return c.json({ ok: true });
 });
 
@@ -2731,8 +2784,16 @@ const PLATFORM_EXPORT_TABLES = [
   'announcement_reads',
 ] as const;
 
+/** エクスポート前の再認証チェック (コンソールがダウンロード前に叩く) */
+app.post('/api/platform/export/prepare', async (c) => {
+  requirePlatformAdmin(c);
+  await requireStepUp(c);
+  return c.json({ ok: true });
+});
+
 app.get('/api/platform/export.json', async (c) => {
   requirePlatformAdmin(c);
+  await requireStepUp(c);
   const tables: Record<string, unknown[]> = {};
   for (const table of PLATFORM_EXPORT_TABLES) {
     try {

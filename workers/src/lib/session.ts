@@ -49,6 +49,8 @@ export interface CreateSessionOptions {
   userAgent?: string | null;
   /** 発行時のクライアント IP (0017) */
   ip?: string | null;
+  /** パスキーでログインした場合に true (0019)。全体管理コンソールのパスキー必須モードの判定に使う */
+  passkeyVerified?: boolean;
 }
 
 interface SessionInsert {
@@ -58,6 +60,8 @@ interface SessionInsert {
   createdAt: number;
   /** null = 列自体を指定しない (店舗アプリ用。既定値 'app' が入る) */
   scope: SessionScope | null;
+  /** 0019 の passkey_verified 列に入れる値 */
+  passkeyVerified: boolean;
   userAgent: string | null;
   ip: string | null;
 }
@@ -69,6 +73,28 @@ interface SessionInsert {
  * step_up_at は発行時刻で打つ (重要操作の再認証はログイン直後なら不要)。
  */
 async function insertSessionRow(db: D1Database, row: SessionInsert): Promise<void> {
+  try {
+    if (row.scope !== null) {
+      await db
+        .prepare(
+          `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, scope, user_agent, ip, last_seen_at, step_up_at, passkey_verified)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)`,
+        )
+        .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt, row.scope, row.userAgent, row.ip, row.createdAt, row.passkeyVerified ? 1 : 0)
+        .run();
+    } else {
+      await db
+        .prepare(
+          `INSERT INTO sessions (token_hash, user_id, expires_at, created_at, user_agent, ip, last_seen_at, step_up_at, passkey_verified)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)`,
+        )
+        .bind(row.tokenHash, row.userId, row.expiresAt, row.createdAt, row.userAgent, row.ip, row.createdAt, row.passkeyVerified ? 1 : 0)
+        .run();
+    }
+    return;
+  } catch {
+    // 0019 未適用の環境では passkey_verified を除いた 0017 形で挿入する
+  }
   try {
     if (row.scope !== null) {
       await db
@@ -129,6 +155,7 @@ export async function createSession(
       scope,
       userAgent: options.userAgent ?? null,
       ip: options.ip ?? null,
+      passkeyVerified: options.passkeyVerified ?? false,
     });
     return token;
   }
@@ -140,6 +167,7 @@ export async function createSession(
     scope: null,
     userAgent: options.userAgent ?? null,
     ip: options.ip ?? null,
+    passkeyVerified: options.passkeyVerified ?? false,
   });
   // 入れる店舗が 1 つだけなら、その店舗を選択済みにして発行する
   // (複数店舗に所属する場合は未選択のままにし、/app が選択画面を出す)
@@ -338,6 +366,8 @@ export interface CurrentSessionRow {
   userId: number;
   createdAt: number;
   stepUpAt: number | null;
+  /** パスキーで本人確認済みか (0019)。列が無い環境では false */
+  passkeyVerified: boolean;
 }
 
 /**
@@ -356,19 +386,37 @@ export async function currentSessionRow(
   try {
     const row = await db
       .prepare(
+        'SELECT id, user_id, created_at, step_up_at, passkey_verified FROM sessions WHERE token_hash = ?1',
+      )
+      .bind(tokenHash)
+      .first<{ id: number; user_id: number; created_at: number; step_up_at: number | null; passkey_verified: number }>();
+    if (!row) return null;
+    return {
+      id: row.id,
+      userId: row.user_id,
+      createdAt: row.created_at,
+      stepUpAt: row.step_up_at,
+      passkeyVerified: row.passkey_verified === 1,
+    };
+  } catch {
+    // 0019 未適用の環境では passkey_verified を false として返す
+  }
+  try {
+    const row = await db
+      .prepare(
         'SELECT id, user_id, created_at, step_up_at FROM sessions WHERE token_hash = ?1',
       )
       .bind(tokenHash)
       .first<{ id: number; user_id: number; created_at: number; step_up_at: number | null }>();
     if (!row) return null;
-    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: row.step_up_at };
+    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: row.step_up_at, passkeyVerified: false };
   } catch {
     const row = await db
       .prepare('SELECT id, user_id, created_at FROM sessions WHERE token_hash = ?1')
       .bind(tokenHash)
       .first<{ id: number; user_id: number; created_at: number }>();
     if (!row) return null;
-    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: null };
+    return { id: row.id, userId: row.user_id, createdAt: row.created_at, stepUpAt: null, passkeyVerified: false };
   }
 }
 
@@ -377,13 +425,27 @@ export async function markSessionStepUp(
   db: D1Database,
   request: Request,
   cookieName: string = SESSION_COOKIE_NAME,
+  options: { viaPasskey?: boolean } = {},
 ): Promise<boolean> {
   const token = readSessionToken(request, cookieName);
   if (!token) return false;
+  const tokenHash = await hashSessionToken(token);
+  if (options.viaPasskey) {
+    try {
+      // パスキーでの再認証は passkey_verified も立てる (0019)
+      const res = await db
+        .prepare('UPDATE sessions SET step_up_at = ?1, passkey_verified = 1 WHERE token_hash = ?2')
+        .bind(Date.now(), tokenHash)
+        .run();
+      return res.meta.changes > 0;
+    } catch {
+      // 0019 未適用の環境では step_up_at だけ打つ
+    }
+  }
   try {
     const res = await db
       .prepare('UPDATE sessions SET step_up_at = ?1 WHERE token_hash = ?2')
-      .bind(Date.now(), await hashSessionToken(token))
+      .bind(Date.now(), tokenHash)
       .run();
     return res.meta.changes > 0;
   } catch {
