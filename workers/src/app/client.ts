@@ -4807,7 +4807,12 @@ function historyForecastHtml(hf) {
     if (v === null || v === undefined) return '—';
     return '約 ' + (v < 10 ? v : Math.round(v)) + ' 日';
   }
-  var h = '<p class="small muted">棚卸し記録 (' + fmtDay(cov.firstDate) + '〜' + fmtDay(cov.lastDate) + '・' + cov.snapshotDays + ' 回) の減り方から計算。期間中の入庫は記録されていないため、持ち日数は長めに出ます。</p>';
+  var seasonNote = '';
+  if (hf.seasons && (hf.seasons.busyMonths || hf.seasons.slowMonths)) {
+    seasonNote = ' 繁忙期は ' + (hf.seasons.busyMonths ? hf.seasons.busyMonths.join('・') + '月' : '未設定') +
+      '、閑散期は ' + (hf.seasons.slowMonths ? hf.seasons.slowMonths.join('・') + '月' : '未設定') + ' として計算。';
+  }
+  var h = '<p class="small muted">棚卸し記録 (' + fmtDay(cov.firstDate) + '〜' + fmtDay(cov.lastDate) + '・' + cov.snapshotDays + ' 回) の減り方から計算。期間中の入庫は記録されていないため、持ち日数は長めに出ます。' + seasonNote + '</p>';
   if (!items.length) return h + '<p class="muted">減り方から読める商品はまだありません。</p>';
   h += '<div class="group">';
   for (var j = 0; j < items.length; j++) {
@@ -5403,6 +5408,8 @@ function loadStoreSettings() {
       '<div><label>タイムゾーン</label><select id="ssTimezone"' + (canEdit ? '' : ' disabled') + '>' +
       STORE_TIMEZONES.map(function (tz) { return '<option value="' + tz + '"' + (settings.timezone === tz ? ' selected' : '') + '>' + tz + '</option>'; }).join('') +
       (STORE_TIMEZONES.indexOf(settings.timezone) < 0 ? '<option value="' + esc(settings.timezone) + '" selected>' + esc(settings.timezone) + '</option>' : '') + '</select></div>' +
+      '<div><label>繁忙期の月 (カンマ区切り)</label><input type="text" id="ssBusyMonths" inputmode="numeric" placeholder="例: 1,5,7,8,12" value="' + (settings.busyMonths ? settings.busyMonths.join(',') : '') + '"' + (canEdit ? '' : ' disabled') + '></div>' +
+      '<div><label>閑散期の月 (カンマ区切り)</label><input type="text" id="ssSlowMonths" inputmode="numeric" placeholder="例: 2,6,9" value="' + (settings.slowMonths ? settings.slowMonths.join(',') : '') + '"' + (canEdit ? '' : ' disabled') + '></div>' +
       (canEdit ? '<div><label>&nbsp;</label><button class="btn" type="submit">保存</button></div>' : '') +
       '</form>' + (canEdit ? '' : '<p class="small muted">編集にはマスタ編集の権限が必要です。</p>') + '</div>';
     h += namedMasterSectionHtml('商品カテゴリ', 'categories', r[4], canEdit, false);
@@ -5415,7 +5422,25 @@ function loadStoreSettings() {
     if (basic && canEdit) {
       basic.onsubmit = function (ev) {
         ev.preventDefault();
-        api('/api/v1/settings', { method: 'PUT', body: { currency: el('ssCurrency').value, timezone: el('ssTimezone').value } })
+        function monthList(id) {
+          var raw = (el(id).value || '').trim();
+          if (!raw) return null;
+          var parts = raw.split(',');
+          var out = [];
+          for (var i = 0; i < parts.length; i++) {
+            var n = Number(parts[i].trim());
+            if (!isFinite(n) || Math.floor(n) !== n || n < 1 || n > 12) return 'invalid';
+            if (out.indexOf(n) < 0) out.push(n);
+          }
+          return out;
+        }
+        var busyMonths = monthList('ssBusyMonths');
+        var slowMonths = monthList('ssSlowMonths');
+        if (busyMonths === 'invalid' || slowMonths === 'invalid') {
+          el('ssMsg').innerHTML = msgHtml('error', '月は1〜12の数字をカンマ区切りで入力してください。');
+          return;
+        }
+        api('/api/v1/settings', { method: 'PUT', body: { currency: el('ssCurrency').value, timezone: el('ssTimezone').value, busyMonths: busyMonths, slowMonths: slowMonths } })
           .then(function (s) {
             if (state.me) state.me.settings = s;
             state.flash = '店舗設定を保存しました。';

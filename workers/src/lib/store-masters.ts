@@ -10,12 +10,35 @@ import { ApiError } from './errors';
 export interface StoreSettings {
   currency: string;
   timezone: string;
+  /** 繁忙期の月 (1-12)。未設定なら null (履歴データ側の月別上位から推定) */
+  busyMonths: number[] | null;
+  /** 閑散期の月 (1-12)。未設定なら null */
+  slowMonths: number[] | null;
 }
 
 export const DEFAULT_STORE_SETTINGS: StoreSettings = {
   currency: 'JPY',
   timezone: 'Asia/Tokyo',
+  busyMonths: null,
+  slowMonths: null,
 };
+
+/** '1,5,7,8,12' 形式を検証して月の配列にする。不正・空は null */
+export function parseMonthList(value: string | null | undefined): number[] | null {
+  if (!value) return null;
+  const months: number[] = [];
+  for (const part of value.split(',')) {
+    const n = Number(part.trim());
+    if (!Number.isInteger(n) || n < 1 || n > 12) return null;
+    if (!months.includes(n)) months.push(n);
+  }
+  if (months.length === 0) return null;
+  return months.sort((a, b) => a - b);
+}
+
+export function formatMonthList(months: number[] | null): string {
+  return months && months.length ? months.join(',') : '';
+}
 
 export const SUPPORTED_CURRENCIES = [
   'JPY',
@@ -41,6 +64,8 @@ export async function getStoreSettings(db: D1Database, storeId: number): Promise
     for (const row of results) {
       if (row.key === 'currency' && row.value) out.currency = row.value;
       if (row.key === 'timezone' && row.value) out.timezone = row.value;
+      if (row.key === 'season_busy_months') out.busyMonths = parseMonthList(row.value);
+      if (row.key === 'season_slow_months') out.slowMonths = parseMonthList(row.value);
     }
   } catch {
     // store_settings 未適用の環境では既定値のまま
@@ -54,9 +79,12 @@ export async function setStoreSettings(
   patch: Partial<StoreSettings>,
 ): Promise<StoreSettings> {
   const now = Date.now();
-  for (const key of ['currency', 'timezone'] as const) {
-    const value = patch[key];
-    if (value === undefined) continue;
+  const entries: [string, string][] = [];
+  if (patch.currency !== undefined) entries.push(['currency', patch.currency]);
+  if (patch.timezone !== undefined) entries.push(['timezone', patch.timezone]);
+  if (patch.busyMonths !== undefined) entries.push(['season_busy_months', formatMonthList(patch.busyMonths)]);
+  if (patch.slowMonths !== undefined) entries.push(['season_slow_months', formatMonthList(patch.slowMonths)]);
+  for (const [key, value] of entries) {
     await db
       .prepare(
         `INSERT INTO store_settings (store_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)

@@ -200,7 +200,7 @@ describe('店舗設定', () => {
   it('既定値は JPY / Asia/Tokyo', async () => {
     const res = await api('/api/v1/settings', { token: tokenMgr });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ currency: 'JPY', timezone: 'Asia/Tokyo' });
+    expect(res.body).toEqual({ currency: 'JPY', timezone: 'Asia/Tokyo', busyMonths: null, slowMonths: null });
   });
 
   it('更新できて /me にも反映される', async () => {

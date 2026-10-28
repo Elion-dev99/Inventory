@@ -4033,6 +4033,14 @@ app.put('/api/v1/settings', async (c) => {
   if (dto.timezone !== undefined && !isValidTimezone(dto.timezone)) {
     throw badRequest('timezone must be a valid IANA timezone name');
   }
+  if (dto.busyMonths !== undefined || dto.slowMonths !== undefined) {
+    const current = await getStoreSettings(c.env.DB, ctx.store.id);
+    const busy = dto.busyMonths !== undefined ? dto.busyMonths : current.busyMonths;
+    const slow = dto.slowMonths !== undefined ? dto.slowMonths : current.slowMonths;
+    if (busy && slow && busy.some((m) => slow.includes(m))) {
+      throw badRequest('busyMonths and slowMonths must not overlap');
+    }
+  }
   return c.json(await setStoreSettings(c.env.DB, ctx.store.id, dto));
 });
 
@@ -6943,9 +6951,14 @@ app.get('/api/v1/history-forecast', async (c) => {
   const db = c.env.DB;
   const storeId = ctx.store.id;
   if (!(await hasTable(c, 'product_stock_history'))) {
-    return c.json({ items: [], coverage: { records: 0, snapshotDays: 0, firstDate: null, lastDate: null } });
+    return c.json({
+      items: [],
+      coverage: { records: 0, snapshotDays: 0, firstDate: null, lastDate: null },
+      seasons: { busyMonths: null, slowMonths: null },
+    });
   }
-  const [productRows, historyRows, coverageRow] = await Promise.all([
+  const [settings, productRows, historyRows, coverageRow] = await Promise.all([
+    getStoreSettings(db, storeId),
     db
       .prepare(
         `SELECT p.id AS productId, p.sku, p.name, p.unit, COALESCE(SUM(s.quantity), 0) AS qty
@@ -6986,7 +6999,10 @@ app.get('/api/v1/history-forecast', async (c) => {
     currentQuantity: p.qty,
     points: pointsByProduct.get(p.productId) ?? [],
   }));
-  const items = computeHistoryForecast(products);
+  const items = computeHistoryForecast(products, {
+    busyMonths: settings.busyMonths,
+    slowMonths: settings.slowMonths,
+  });
   return c.json({
     items,
     coverage: {
@@ -6995,6 +7011,7 @@ app.get('/api/v1/history-forecast', async (c) => {
       firstDate: coverageRow?.firstDate ?? null,
       lastDate: coverageRow?.lastDate ?? null,
     },
+    seasons: { busyMonths: settings.busyMonths, slowMonths: settings.slowMonths },
   });
 });
 

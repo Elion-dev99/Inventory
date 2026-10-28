@@ -227,10 +227,12 @@ export const decideApprovalSchema = z.object({
 
 /* ------------------------------------------------------------------ 0020 設定の汎用化 */
 
-/** 店舗設定 (通貨・タイムゾーン)。通貨コードの実在はハンドラ側で検証する */
+/** 店舗設定 (通貨・タイムゾーン・繁忙/閑散の月)。通貨コードの実在はハンドラ側で検証する */
 export const storeSettingsSchema = z.object({
   currency: z.string().min(1).max(8).optional(),
   timezone: z.string().min(1).max(64).optional(),
+  busyMonths: z.array(z.number().int().min(1).max(12)).max(12).nullable().optional(),
+  slowMonths: z.array(z.number().int().min(1).max(12)).max(12).nullable().optional(),
 });
 
 /** 理由コードの新規作成。code は URL や履歴で使う識別子 (英小文字・数字・_・-) */

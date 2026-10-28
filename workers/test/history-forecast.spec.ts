@@ -45,10 +45,17 @@ interface ApiResult {
 
 let cookieAdmin = '';
 
-async function api(path: string, opts: { cookie?: string } = {}): Promise<ApiResult> {
-  const headers: Record<string, string> = {};
+async function api(
+  path: string,
+  opts: { cookie?: string; method?: string; body?: unknown } = {},
+): Promise<ApiResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts.cookie) headers.Cookie = `session=${opts.cookie}`;
-  const res = await SELF.fetch(`https://example.com${path}`, { headers });
+  const res = await SELF.fetch(`https://example.com${path}`, {
+    method: opts.method ?? 'GET',
+    headers,
+    body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+  });
   const text = await res.text();
   return { status: res.status, body: text ? (JSON.parse(text) as Record<string, unknown>) : {} };
 }
@@ -149,6 +156,35 @@ describe('computeHistoryForecast', () => {
     // 残る区間: 10→8 (2個), 8→300 (0個), 6→4 (2個) / 30日
     expect(item.pace.typical).toBe(0.133);
     expect(item.daysLeft.typical).toBe(60);
+  });
+
+  it('設定された繁忙/閑散の月があればその月の区間だけで計算する', () => {
+    const items = computeHistoryForecast(
+      [
+        {
+          productId: 1,
+          sku: 'A',
+          name: '商品A',
+          unit: '個',
+          currentQuantity: 120,
+          points: pts([
+            ['2025-06-01', 200],
+            ['2025-06-11', 180],
+            ['2025-06-21', 160],
+            ['2025-07-01', 150],
+            ['2025-07-11', 140],
+            ['2025-07-21', 190],
+          ]),
+        },
+      ],
+      { busyMonths: [6], slowMonths: [7] },
+    );
+    const item = items[0]!;
+    expect(item.pace.typical).toBe(1.2);
+    expect(item.pace.busy).toBe(2); // 6月: 40個 / 20日
+    expect(item.pace.slow).toBe(0.667); // 7月: 20個 / 30日
+    expect(item.daysLeft.busy).toBe(60);
+    expect(item.daysLeft.slow).toBe(180);
   });
 
   it('月別カバーが疎でも繁忙/閑散が通常を逆転しない', () => {
@@ -283,6 +319,16 @@ beforeAll(async () => {
       .bind(now),
   ]);
 
+  // 店舗2の季節設定: 繁忙期=6月、閑散期=7月 (検証用の作り値)
+  await testEnv.DB.batch([
+    testEnv.DB
+      .prepare(
+        `INSERT INTO store_settings (store_id, key, value, updated_at)
+         VALUES (2, 'season_busy_months', '6', ?1), (2, 'season_slow_months', '7', ?1)`,
+      )
+      .bind(now),
+  ]);
+
   const history: [string, number][] = [
     ['2025-06-01', 200],
     ['2025-06-11', 180],
@@ -311,7 +357,7 @@ describe('GET /api/v1/history-forecast', () => {
     expect((await api('/api/v1/history-forecast')).status).toBe(401);
   });
 
-  it('履歴からペースと持ち日数を返す', async () => {
+  it('履歴からペースと持ち日数を返す (季節設定が効く)', async () => {
     const res = await api('/api/v1/history-forecast', { cookie: cookieAdmin });
     expect(res.status).toBe(200);
     const coverage = res.body.coverage as { records: number; snapshotDays: number; firstDate: string; lastDate: string };
@@ -319,13 +365,50 @@ describe('GET /api/v1/history-forecast', () => {
     expect(coverage.snapshotDays).toBe(7);
     expect(coverage.firstDate).toBe('2025-06-01');
     expect(coverage.lastDate).toBe('2025-12-01');
+    const seasons = res.body.seasons as { busyMonths: number[]; slowMonths: number[] };
+    expect(seasons.busyMonths).toEqual([6]);
+    expect(seasons.slowMonths).toEqual([7]);
     const items = res.body.items as Array<Record<string, unknown>>;
     const item = items.find((i) => i.productId === 10)!;
     expect(item.currentQuantity).toBe(120);
     const pace = item.pace as { typical: number; busy: number; slow: number };
     expect(pace.typical).toBe(1.2);
-    const daysLeft = item.daysLeft as { typical: number; busy: number };
+    expect(pace.busy).toBe(2);
+    expect(pace.slow).toBe(0.667);
+    const daysLeft = item.daysLeft as { typical: number; busy: number; slow: number };
     expect(daysLeft.typical).toBe(100);
-    expect(daysLeft.busy).toBe(90);
+    expect(daysLeft.busy).toBe(60);
+    expect(daysLeft.slow).toBe(180);
+  });
+});
+
+describe('季節設定の検証', () => {
+  it('範囲外の月は 400', async () => {
+    const res = await api('/api/v1/settings', {
+      cookie: cookieAdmin,
+      method: 'PUT',
+      body: { busyMonths: [13] },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('繁忙期と閑散期の重なりは 400 (保存済みの相手側とも照合)', async () => {
+    const res = await api('/api/v1/settings', {
+      cookie: cookieAdmin,
+      method: 'PUT',
+      body: { busyMonths: [7] }, // 閑散期に 7 が保存済み
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('正しい設定は保存できて読み戻せる', async () => {
+    const put = await api('/api/v1/settings', {
+      cookie: cookieAdmin,
+      method: 'PUT',
+      body: { slowMonths: [8, 9] },
+    });
+    expect(put.status).toBe(200);
+    expect(put.body.slowMonths).toEqual([8, 9]);
+    expect(put.body.busyMonths).toEqual([6]);
   });
 });

@@ -78,7 +78,17 @@ function daysLeftFor(qty: number, pace: number | null): number | null {
   return round(qty / pace, 1);
 }
 
-export function computeHistoryForecast(products: HistoryProductInput[]): HistoryForecastItem[] {
+export interface HistorySeasonOptions {
+  /** 繁忙期として扱う月 (店舗設定)。指定時はその月の区間だけでペースを出す */
+  busyMonths?: number[] | null;
+  /** 閑散期として扱う月 (店舗設定) */
+  slowMonths?: number[] | null;
+}
+
+export function computeHistoryForecast(
+  products: HistoryProductInput[],
+  seasonOpts: HistorySeasonOptions = {},
+): HistoryForecastItem[] {
   const items: HistoryForecastItem[] = [];
   for (const p of products) {
     const points = [...p.points].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
@@ -111,6 +121,19 @@ export function computeHistoryForecast(products: HistoryProductInput[]): History
       if (mp !== null) monthly.push(mp);
     }
     monthly.sort((a, b) => a - b);
+    // 設定された季節の月があれば、その月の区間だけでペースを出す。
+    // カバー不足・減少なしで読めない場合はデータ由来 (上下3ヶ月) に落とす。
+    const seasonPace = (months: number[] | null | undefined): number | null => {
+      if (!months || months.length === 0) return null;
+      let dec = 0;
+      let days = 0;
+      for (const m of months) {
+        dec += monthDecrease.get(m) ?? 0;
+        days += monthDays.get(m) ?? 0;
+      }
+      if (days < MIN_MONTH_DAYS) return null;
+      return paceOf(dec, days);
+    };
     let busy: number | null = null;
     let slow: number | null = null;
     if (monthly.length > 0) {
@@ -118,12 +141,14 @@ export function computeHistoryForecast(products: HistoryProductInput[]): History
       const high = monthly.slice(-Math.min(3, monthly.length));
       slow = low.reduce((a, b) => a + b, 0) / low.length;
       busy = high.reduce((a, b) => a + b, 0) / high.length;
+    }
+    busy = seasonPace(seasonOpts.busyMonths) ?? busy;
+    slow = seasonPace(seasonOpts.slowMonths) ?? slow;
+    if (typical !== null) {
       // 月別カバーが疎だと「閑散期なのに通常より速い」逆転が起きるため、
       // 繁忙期は通常以上・閑散期は通常以下に収める。
-      if (typical !== null) {
-        busy = Math.max(busy, typical);
-        slow = Math.min(slow, typical);
-      }
+      if (busy !== null) busy = Math.max(busy, typical);
+      if (slow !== null) slow = Math.min(slow, typical);
     }
     const pace: HistoryPace = {
       typical: typical !== null ? round(typical, 3) : null,
