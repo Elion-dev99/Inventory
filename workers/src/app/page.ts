@@ -79,6 +79,7 @@ export const APP_HTML = `<!doctype html>
 </div>
 
 <div id="appBox" style="display:none">
+  <div id="offlineBar" class="offline-bar" style="display:none"></div>
   <div id="subbar" class="subbar" style="display:none"></div>
   <main id="view"></main>
   <nav class="tabbar" id="tabbar"></nav>

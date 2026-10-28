@@ -405,6 +405,20 @@ form.grid input:focus, form.grid select:focus, form.grid textarea:focus,
   font-weight: 600;
   font-size: 0.9rem;
 }
+/* オフライン/未送信バー: アプリ内の先頭に置く事実表示 (情報色、要確認がある時だけ警告色) */
+.offline-bar {
+  background: var(--info-bg);
+  color: var(--info-fg);
+  border-bottom: 1px solid var(--line);
+  padding: 0.5rem 1rem;
+  text-align: center;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+.offline-bar.alert {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
 /* メンテナンス予定の事前告知は情報色で控えめに出す */
 .maintenance-banner.upcoming {
   background: var(--info-bg);

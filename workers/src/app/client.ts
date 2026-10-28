@@ -202,8 +202,16 @@ function api(path, opts) {
         return apiOnce(path, opts);
       });
     }
+    /* 通信自体が届かなかった書き込みは、送信キューに入れて成功扱いで返す。
+       サーバーが応答したエラー (在庫不足など) は従来どおり呼び出し側へ投げる */
+    if (isNetworkError(err) && queueableRequest(opts.method || 'GET', path, opts)) {
+      return enqueueRequest(path, opts);
+    }
     throw err;
   });
+}
+function isNetworkError(err) {
+  return !!err && (err instanceof TypeError || err.name === 'TypeError' || err.name === 'NetworkError');
 }
 function apiOnce(path, opts) {
   opts = opts || {};
@@ -212,6 +220,11 @@ function apiOnce(path, opts) {
   var init = { method: opts.method || 'GET', headers: headers, credentials: 'same-origin' };
   if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
   return fetch(path, init).then(function (res) {
+    /* Service Worker が前回分を返した読み取りは「古いデータ」と分かるよう印を立てる */
+    var wasStale = !!state.dataStale;
+    if (res.headers && res.headers.get('x-from-cache')) state.dataStale = true;
+    else if ((opts.method || 'GET') === 'GET' && res.ok) state.dataStale = false;
+    if (wasStale !== !!state.dataStale) renderOfflineBar();
     return res.text().then(function (text) {
       var data = null;
       if (text) { try { data = JSON.parse(text); } catch (e) { data = null; } }
@@ -239,6 +252,159 @@ function getJson(path) {
   return api(path).then(function (d) { dataCache[path] = { at: Date.now(), data: d }; return d; });
 }
 function invalidateCache() { dataCache = {}; }
+
+/* ---------------- オフライン送信キュー (outbox) ----------------
+   圏外で記録した書き込みを端末内に保持し、接続が戻ったら順番に送る。
+   移動系 POST は呼び出し側が付けた冪等キーをそのまま保持するので、
+   「届いたか分からない」再送でも二重適用にならない。PUT (棚卸しの実数・
+   予約件数) は絶対値の上書きなので、そのまま再送して安全。
+   サーバーが応答したエラーはキューに入れず、その場で利用者へ返す。 */
+var OUTBOX_KEY = 'offline-outbox-v1';
+var OUTBOX_MAX = 200;
+function outboxLoad() {
+  try {
+    var v = JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]');
+    return Object.prototype.toString.call(v) === '[object Array]' ? v : [];
+  } catch (e) { return []; }
+}
+function outboxSave(items) {
+  try { localStorage.setItem(OUTBOX_KEY, JSON.stringify(items)); } catch (e) {}
+  renderOfflineBar();
+}
+function currentUserId() { return state.me && state.me.id ? state.me.id : null; }
+function myOutboxItems() {
+  var meId = currentUserId();
+  return outboxLoad().filter(function (it) { return it.userId == null || meId == null || it.userId === meId; });
+}
+function queueableRequest(method, path, opts) {
+  if (method === 'POST' && path.indexOf('/api/v1/movements/') === 0) {
+    /* 移動系は冪等キーが前提 (全ての呼び出し側が付けている) */
+    return !!(opts.headers && opts.headers['Idempotency-Key']);
+  }
+  if (method === 'PUT' && path === '/api/v1/reservation-days') return true;
+  if (method === 'PUT') {
+    var parts = path.split('/');
+    /* /api/v1/stocktakes/:id/lines/:lineId */
+    return parts.length === 7 && parts[3] === 'stocktakes' && parts[5] === 'lines';
+  }
+  return false;
+}
+function outboxDedupKey(item) {
+  var key = item.method + ' ' + item.path;
+  if (item.path === '/api/v1/reservation-days' && item.body && item.body.date) key += ' ' + item.body.date;
+  return key;
+}
+function enqueueRequest(path, opts) {
+  var items = outboxLoad();
+  var item = {
+    id: uuid(),
+    at: Date.now(),
+    userId: currentUserId(),
+    method: opts.method || 'GET',
+    path: path,
+    headers: opts.headers || null,
+    body: opts.body !== undefined ? opts.body : null,
+    status: 'pending',
+    error: ''
+  };
+  /* PUT は絶対値なので、同じ対象の古い未送信分は最新で置き換える */
+  if (item.method === 'PUT') {
+    var dk = outboxDedupKey(item);
+    items = items.filter(function (it) { return it.status === 'failed' || outboxDedupKey(it) !== dk; });
+  }
+  if (items.length >= OUTBOX_MAX) {
+    var full = new Error('未送信の記録が上限に達しています。接続できる場所で送信してください。');
+    full.code = 'OUTBOX_FULL';
+    return Promise.reject(full);
+  }
+  items.push(item);
+  outboxSave(items);
+  return Promise.resolve({ __queued: true });
+}
+function outboxSend(item) {
+  var headers = { 'Content-Type': 'application/json' };
+  if (item.headers) { for (var k in item.headers) headers[k] = item.headers[k]; }
+  var init = { method: item.method, headers: headers, credentials: 'same-origin' };
+  if (item.body !== null && item.body !== undefined) init.body = JSON.stringify(item.body);
+  return fetch(item.path, init).then(function (res) {
+    return res.text().then(function (text) {
+      var data = null;
+      if (text) { try { data = JSON.parse(text); } catch (e) { data = null; } }
+      if (!res.ok) {
+        var err = new Error(data && data.message ? data.message : 'HTTP ' + res.status);
+        err.status = res.status;
+        err.code = data && data.error ? data.error : '';
+        throw err;
+      }
+      return data;
+    });
+  });
+}
+var outboxFlushing = false;
+function flushOutbox() {
+  if (outboxFlushing) return Promise.resolve();
+  var meId = currentUserId();
+  var items = outboxLoad();
+  var targets = items.filter(function (it) {
+    return it.status !== 'failed' && (it.userId == null || meId == null || it.userId === meId);
+  });
+  if (!targets.length) { renderOfflineBar(); return Promise.resolve(); }
+  outboxFlushing = true;
+  var sentAny = false;
+  var stopped = false;
+  var chain = Promise.resolve();
+  targets.forEach(function (target) {
+    chain = chain.then(function () {
+      if (stopped) return null;
+      return outboxSend(target).then(function () {
+        sentAny = true;
+        items = items.filter(function (it) { return it.id !== target.id; });
+      }).catch(function (err) {
+        if (isNetworkError(err) || (err && err.status === 401)) {
+          /* まだ圏外、またはセッション切れ。再送は次回 (再ログイン後) に回す */
+          stopped = true;
+          return;
+        }
+        /* サーバーが理由付きで拒否した分は「要確認」として残す (自動再送しない) */
+        for (var i = 0; i < items.length; i++) {
+          if (items[i].id === target.id) { items[i].status = 'failed'; items[i].error = err.message || '送信できませんでした'; }
+        }
+      });
+    });
+  });
+  return chain.then(function () {
+    outboxFlushing = false;
+    outboxSave(items);
+    if (sentAny) invalidateCache();
+    if (state.view === 'outbox') loadOutbox();
+  });
+}
+function renderOfflineBar() {
+  var bar = el('offlineBar');
+  if (!bar) return;
+  var items = myOutboxItems();
+  var pending = 0;
+  var failed = 0;
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].status === 'failed') failed++; else pending++;
+  }
+  var offline = (typeof navigator !== 'undefined' && navigator.onLine === false) || !!state.dataStale;
+  if (!offline && pending === 0 && failed === 0) { bar.style.display = 'none'; return; }
+  var parts = [];
+  if (offline) parts.push('オフライン: 前回表示したデータです');
+  if (pending > 0) parts.push('未送信 ' + pending + '件');
+  if (failed > 0) parts.push('要確認 ' + failed + '件');
+  bar.textContent = parts.join(' ・ ');
+  bar.className = failed > 0 ? 'offline-bar alert' : 'offline-bar';
+  bar.style.display = '';
+  if (pending + failed > 0) {
+    bar.style.cursor = 'pointer';
+    bar.onclick = function () { showView('outbox'); };
+  } else {
+    bar.style.cursor = '';
+    bar.onclick = null;
+  }
+}
 
 /* ---------------- 画像 (商品画像・検品写真) ---------------- */
 /* アップロード前に長辺 1280px・JPEG 品質 0.82 へ圧縮する (サーバー上限は 2MB) */
@@ -560,6 +726,7 @@ var VIEWS = [
   { id: 'picking', label: 'ピッキング', visible: function () { return can('movements.consume') || can('movements.transfer'); } },
   { id: 'setup', label: 'はじめに', visible: function () { return (can('admin.users') || can('master.write')) && can('master.read'); } },
   { id: 'security', label: 'セキュリティ', visible: function () { return true; } },
+  { id: 'outbox', label: '未送信の記録', visible: function () { return true; } },
 ];
 function viewDef(id) { for (var i = 0; i < VIEWS.length; i++) { if (VIEWS[i].id === id) return VIEWS[i]; } return null; }
 function viewVisible(id) { var v = viewDef(id); return v ? v.visible() : false; }
@@ -595,7 +762,7 @@ function icon(name, size) {
 
 /* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
 var RECORD_VIEWS = ['inbound', 'consume', 'transfer', 'returns', 'disposal'];
-var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup', 'security', 'storeSettings'];
+var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup', 'security', 'storeSettings', 'outbox'];
 function tabOf(view) {
   if (view === 'dashboard') return 'dashboard';
   if (view === 'stocks') return 'stocks';
@@ -982,6 +1149,7 @@ var MORE_ITEMS = [
   { view: 'audit', icon: 'doc', color: '#8e8e93', label: '監査ログ', maintKeys: [] },
   { view: 'security', icon: 'shield', color: '#636366', label: 'セキュリティ', maintKeys: [] },
   { view: 'storeSettings', icon: 'sliders', color: '#8e8e93', label: '店舗設定', maintKeys: ['master_products'] },
+  { view: 'outbox', icon: 'clock', color: '#636366', label: '未送信の記録', maintKeys: [] },
 ];
 function loadMore() {
   var h = '<h2>その他</h2>';
@@ -1060,6 +1228,8 @@ function editProfileName() {
   }).catch(function (e) { alert(errMsg(e)); });
 }
 function doLogout() {
+  /* 読み取りキャッシュは端末に残さない (未送信キューは本人の再ログイン後に送るため残す) */
+  if (window.caches) { try { caches.delete('api-data-v1'); } catch (e) {} }
   api('/api/v1/auth/logout', { method: 'POST' }).then(function () { location.href = '/'; })
     .catch(function () { location.href = '/'; });
 }
@@ -1092,6 +1262,7 @@ function showView(id) {
     setup: loadSetup,
     security: loadSecurity,
     storeSettings: loadStoreSettings,
+    outbox: loadOutbox,
     more: loadMore,
   };
   var fn = loaders[id];
@@ -2395,6 +2566,7 @@ function loadInbound() {
       if (exp) body.expiryDate = exp;
       api('/api/v1/movements/inbound', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
         .then(function (r) {
+          if (r && r.__queued) { el('inMsg').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); btn.disabled = false; return; }
           el('inMsg').innerHTML = msgHtml('success', '入庫を登録しました。在庫ID: ' + r.stockId + ' / 現在数量: ' + r.quantity);
           btn.disabled = false;
         })
@@ -2473,6 +2645,7 @@ function loadConsume() {
       if (selectedProduct && selectedProduct.isBundle) {
         api('/api/v1/movements/bundle-consumption', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
           .then(function (r) {
+            if (r && r.__queued) { el('coResult').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); btn.disabled = false; return; }
             var hh = msgHtml('success', 'セット品の消費を登録しました。') +
               '<div class="table-wrap"><table><thead><tr><th>構成品</th><th>ロット</th><th>保管場所</th><th>数量</th></tr></thead><tbody>';
             for (var bi = 0; bi < r.allocations.length; bi++) {
@@ -2493,6 +2666,7 @@ function loadConsume() {
       if (ap) body.negativeApprovalId = Number(ap);
       api('/api/v1/movements/consumption', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
         .then(function (r) {
+          if (r && r.__queued) { el('coResult').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); btn.disabled = false; return; }
           var hh = msgHtml('success', '消費を登録しました。') +
             '<div class="table-wrap"><table><thead><tr><th>ロット</th><th>保管場所</th><th>引当数量</th><th>備考</th></tr></thead><tbody>';
           for (var i = 0; i < r.allocations.length; i++) {
@@ -2569,6 +2743,7 @@ function loadTransfer() {
       if (lot) body.lotId = Number(lot);
       api('/api/v1/movements/transfer', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
         .then(function (r) {
+          if (r && r.__queued) { el('trResult').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); btn.disabled = false; return; }
           var hh = msgHtml('success', '移動を登録しました。') +
             '<div class="table-wrap"><table><thead><tr><th>ロット</th><th>移動元 在庫ID</th><th>移動先 在庫ID</th><th>数量</th></tr></thead><tbody>';
           for (var i = 0; i < r.allocations.length; i++) {
@@ -2662,6 +2837,7 @@ function loadReturns() {
       if (exp) body.expiryDate = exp;
       api('/api/v1/movements/return', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
         .then(function (r) {
+          if (r && r.__queued) { el('rtMsg').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); btn.disabled = false; return; }
           el('rtMsg').innerHTML = msgHtml('success', '返品を登録しました。在庫ID: ' + r.stockId + ' / 現在数量: ' + r.quantity);
           btn.disabled = false;
         })
@@ -2732,6 +2908,7 @@ function loadDisposal() {
         execBtn.disabled = true;
         api('/api/v1/movements/disposal', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
           .then(function (r) {
+            if (r && r.__queued) { el('dpResult').innerHTML = msgHtml('success', 'オフラインのため送信待ちに登録しました。接続が戻ると自動で送信されます。'); execBtn.disabled = false; return; }
             box.innerHTML = '';
             var hh = msgHtml('success', '廃棄を登録しました。') +
               '<div class="table-wrap"><table><thead><tr><th>ロット</th><th>保管場所</th><th>数量</th></tr></thead><tbody>';
@@ -3658,7 +3835,10 @@ function renderStocktakeDetail(t) {
         var v = el('cnt-' + lineId).value;
         if (v === '') { el('tkMsg').innerHTML = msgHtml('error', '実数を入力してください。'); return; }
         api('/api/v1/stocktakes/' + d.id + '/lines/' + lineId, { method: 'PUT', body: { countedQuantity: Number(v) } })
-          .then(function () { renderStocktakeDetail(t); })
+          .then(function (r) {
+            if (r && r.__queued) { el('tkMsg').innerHTML = msgHtml('ok', 'オフラインのため送信待ちに保存しました。接続が戻ると自動で送信されます。'); return; }
+            renderStocktakeDetail(t);
+          })
           .catch(function (e) { el('tkMsg').innerHTML = msgHtml('error', errMsg(e)); });
       };
     }
@@ -4656,7 +4836,11 @@ function loadForecast() {
           return;
         }
         var count = parseInt(raw, 10);
-        api('/api/v1/reservation-days', { method: 'PUT', body: { date: date, count: count } }).then(function () {
+        api('/api/v1/reservation-days', { method: 'PUT', body: { date: date, count: count } }).then(function (r) {
+          if (r && r.__queued) {
+            el('fcMsg').innerHTML = msgHtml('ok', labelOf(date) + ' の予約件数 ' + count + ' 件を送信待ちに保存しました。接続が戻ると自動で送信されます。');
+            return;
+          }
           el('fcMsg').innerHTML = msgHtml('ok', labelOf(date) + ' の予約件数を ' + count + ' 件で記録しました。');
           getJson('/api/v1/forecast').then(function (nf) {
             var body = el('fcBody');
@@ -5087,6 +5271,81 @@ function reasonSectionHtml(title, kind, rows, canEdit) {
   }
   return h + '</div>';
 }
+/* ---------------- 未送信の記録 (オフラインキュー) ---------------- */
+function outboxLabel(item) {
+  if (item.path === '/api/v1/reservation-days') return '予約件数';
+  if (item.path.indexOf('/api/v1/stocktakes/') === 0) return '棚卸しカウント';
+  if (item.path === '/api/v1/movements/inbound') return '入庫';
+  if (item.path === '/api/v1/movements/consumption') return '消費';
+  if (item.path === '/api/v1/movements/bundle-consumption') return 'セット消費';
+  if (item.path === '/api/v1/movements/transfer') return '移動';
+  if (item.path === '/api/v1/movements/return') return '返品';
+  if (item.path === '/api/v1/movements/disposal') return '廃棄';
+  if (item.path === '/api/v1/movements/bulk') return '一括入出庫';
+  return '記録';
+}
+function outboxSummary(item) {
+  var b = item.body || {};
+  if (item.path === '/api/v1/reservation-days') return (b.date || '') + ' / ' + (b.count != null ? b.count : '') + '件';
+  if (item.path.indexOf('/lines/') !== -1) return '実数 ' + (b.countedQuantity != null ? b.countedQuantity : '');
+  if (b.productId) {
+    var s = productLabel(b.productId);
+    if (b.quantity != null) s += ' × ' + b.quantity;
+    return s;
+  }
+  return '';
+}
+function loadOutbox() {
+  viewLoading('未送信の記録');
+  ensureMaster().then(function () {
+    var items = myOutboxItems();
+    var h = '<h2>未送信の記録</h2><div id="obMsg"></div>';
+    h += '<p class="small muted">オフラインで記録した内容は端末内に保存され、接続が戻ると自動で送信されます。サーバーが拒否した内容は「要確認」として残ります。</p>';
+    if (!items.length) {
+      h += msgHtml('ok', '未送信の記録はありません。');
+    } else {
+      h += '<div class="group">';
+      items.forEach(function (it) {
+        var status = it.status === 'failed'
+          ? '<span class="badge badge-danger">要確認</span> <span class="small danger">' + esc(it.error || '') + '</span>'
+          : '<span class="badge">送信待ち</span>';
+        h += '<div class="group-row static"><span class="row-label">' + esc(outboxLabel(it)) +
+          '<span class="small muted"> ' + esc(fmtDayTime(it.at)) + '</span>' +
+          (outboxSummary(it) ? '<br><span class="small">' + esc(outboxSummary(it)) + '</span>' : '') +
+          '<br>' + status + '</span>' +
+          (it.status === 'failed' ? '<button class="btn small" data-ob-retry="' + it.id + '">再送</button>' : '') +
+          '<button class="btn small secondary" data-ob-discard="' + it.id + '">破棄</button></div>';
+      });
+      h += '</div>';
+      h += '<p><button class="btn" id="obFlushBtn">今すぐ送信</button></p>';
+    }
+    el('view').innerHTML = h;
+    var flushBtn = el('obFlushBtn');
+    if (flushBtn) flushBtn.onclick = function () { flushOutbox(); };
+    var retries = el('view').querySelectorAll('button[data-ob-retry]');
+    for (var i = 0; i < retries.length; i++) {
+      retries[i].onclick = function () {
+        var id = this.getAttribute('data-ob-retry');
+        var all = outboxLoad();
+        for (var j = 0; j < all.length; j++) {
+          if (all[j].id === id) { all[j].status = 'pending'; all[j].error = ''; }
+        }
+        outboxSave(all);
+        flushOutbox().then(function () { loadOutbox(); });
+      };
+    }
+    var discards = el('view').querySelectorAll('button[data-ob-discard]');
+    for (var d = 0; d < discards.length; d++) {
+      discards[d].onclick = function () {
+        if (!window.confirm('この記録を破棄しますか? (サーバーには送信されません)')) return;
+        var id = this.getAttribute('data-ob-discard');
+        outboxSave(outboxLoad().filter(function (it) { return it.id !== id; }));
+        loadOutbox();
+      };
+    }
+  });
+}
+
 function loadStoreSettings() {
   viewLoading('店舗設定');
   var canEdit = can('master.write');
@@ -5433,6 +5692,12 @@ function boot() {
     buildNav();
     showView('dashboard');
     connectWs();
+    /* オフライン対応: 未送信キューが残っていれば送り、接続の変化でも再送する */
+    renderOfflineBar();
+    flushOutbox();
+    window.addEventListener('online', function () { renderOfflineBar(); flushOutbox(); });
+    window.addEventListener('offline', function () { renderOfflineBar(); });
+    setInterval(function () { flushOutbox(); }, 60000);
     /* Web Push 用 Service Worker を登録する (未対応ブラウザでは何もしない) */
     if ('serviceWorker' in navigator) {
       try { navigator.serviceWorker.register('/sw.js').catch(function () {}); } catch (e) {}
