@@ -4853,6 +4853,7 @@ function loadForecast() {
     var days = (r[0] && r[0].days) || [];
     for (var i = 0; i < days.length; i++) dayMap[days[i].date] = days[i].count;
     var h = '<h2>予約と消費予測</h2><div id="fcMsg"></div>';
+    h += '<h3>過去データから見た切れる時期</h3><div id="hfBody">' + historyForecastHtml(r[2]) + '</div>';
     h += '<h3>予約件数</h3>';
     h += '<p class="small muted">日ごとの予約件数を記録すると、下の消費予測に反映されます。</p>';
     h += '<div class="group">';
@@ -4866,8 +4867,7 @@ function loadForecast() {
         '</div>';
     }
     h += '</div>';
-    h += '<h3>切れる時期の予測</h3><div id="fcBody">' + forecastHtml(r[1]) + '</div>';
-    h += '<h3>過去の棚卸しからの目安</h3><div id="hfBody">' + historyForecastHtml(r[2]) + '</div>';
+    h += '<h3>切れる時期の予測 (予約ベース)</h3><div id="fcBody">' + forecastHtml(r[1]) + '</div>';
     el('view').innerHTML = h;
     var btns = document.querySelectorAll('[data-fcsave]');
     for (var b = 0; b < btns.length; b++) {
