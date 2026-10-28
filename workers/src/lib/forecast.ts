@@ -16,14 +16,21 @@
  *   それも無ければ直近28日の記録日の平均。どれも無ければ予測不能。
  */
 
+const dateFormatters = new Map<string, Intl.DateTimeFormat>();
+
 /** epoch ms をタイムゾーンの暦日キー ('YYYY-MM-DD') に変換する */
 export function dateKeyInTz(epochMs: number, timeZone: string): string {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(new Date(epochMs));
+  let fmt = dateFormatters.get(timeZone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    dateFormatters.set(timeZone, fmt);
+  }
+  const parts = fmt.formatToParts(new Date(epochMs));
   const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
   return `${get('year')}-${get('month')}-${get('day')}`;
 }

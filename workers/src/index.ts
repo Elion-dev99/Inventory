@@ -6843,10 +6843,58 @@ app.get('/api/v1/forecast', async (c) => {
   await requirePermission(c, Permission.STOCKS_READ);
   await requireFeature(c, 'analytics');
   const ctx = await storeContext(c);
-  const settings = await getStoreSettings(c.env.DB, ctx.store.id);
+  const db = c.env.DB;
+  const storeId = ctx.store.id;
   const now = Date.now();
+  // 設定・予約・商品・消費は互いに独立なので 1 波で並列に取る (逐次の往復が
+  // このエンドポイントの律速だった)。予約の取得範囲はタイムゾーン確定前に
+  // 決めるため UTC 基準で前後 1 日広げておき、余分は computeForecast 側の
+  // 窓フィルタで落ちるので結果は変わらない。
+  const utcToday = dateKeyInTz(now, 'UTC');
+  let reservationError: unknown = null;
+  const [settings, resRows, productRows, mvRows] = await Promise.all([
+    getStoreSettings(db, storeId),
+    db
+      .prepare(
+        'SELECT date, count FROM store_reservation_days WHERE store_id = ?1 AND date >= ?2 AND date <= ?3',
+      )
+      .bind(storeId, addDaysToKey(utcToday, -121), addDaysToKey(utcToday, 8))
+      .all<{ date: string; count: number }>()
+      .then((r) => r.results)
+      .catch((e: unknown) => {
+        reservationError = e;
+        return null;
+      }),
+    db
+      .prepare(
+        `SELECT p.id AS productId, p.sku, p.name, p.unit, COALESCE(SUM(s.quantity), 0) AS qty
+           FROM products p
+           LEFT JOIN lots l ON l.product_id = p.id
+           LEFT JOIN stocks s ON s.lot_id = l.id AND s.store_id = ?1
+          WHERE p.store_id = ?1 AND p.deleted_at IS NULL
+          GROUP BY p.id`,
+      )
+      .bind(storeId)
+      .all<{ productId: number; sku: string; name: string; unit: string; qty: number }>()
+      .then((r) => r.results),
+    // 直近100日の消費 (OUT) を店舗タイムゾーンの日別にバケットする
+    db
+      .prepare(
+        `SELECT mv.created_at AS createdAt, -mv.quantity_change AS qty, l.product_id AS productId
+           FROM stock_movements mv
+           JOIN stocks s ON s.id = mv.stock_id
+           JOIN lots l ON l.id = s.lot_id
+          WHERE mv.store_id = ?1 AND mv.type = 'OUT' AND mv.created_at >= ?2`,
+      )
+      .bind(storeId, now - 100 * 86_400_000)
+      .all<{ createdAt: number; qty: number; productId: number }>()
+      .then((r) => r.results),
+  ]);
   const today = dateKeyInTz(now, settings.timezone);
-  if (!(await hasTable(c, 'store_reservation_days'))) {
+  if (resRows === null) {
+    // 予約テーブル未適用の環境だけ insufficient_data に劣化させる。
+    // テーブルがあるのに失敗した場合は本物のエラーとして伝播させる。
+    if (await hasTable(c, 'store_reservation_days')) throw reservationError;
     return c.json({
       status: 'insufficient_data',
       timezone: settings.timezone,
@@ -6856,35 +6904,7 @@ app.get('/api/v1/forecast', async (c) => {
       items: [],
     });
   }
-  const { results: resRows } = await c.env.DB.prepare(
-    'SELECT date, count FROM store_reservation_days WHERE store_id = ?1 AND date >= ?2 AND date <= ?3',
-  )
-    .bind(ctx.store.id, addDaysToKey(today, -120), addDaysToKey(today, 7))
-    .all<{ date: string; count: number }>();
   const reservationDays = new Map(resRows.map((r) => [r.date, r.count]));
-
-  const { results: productRows } = await c.env.DB.prepare(
-    `SELECT p.id AS productId, p.sku, p.name, p.unit, COALESCE(SUM(s.quantity), 0) AS qty
-       FROM products p
-       LEFT JOIN lots l ON l.product_id = p.id
-       LEFT JOIN stocks s ON s.lot_id = l.id AND s.store_id = ?1
-      WHERE p.store_id = ?1 AND p.deleted_at IS NULL
-      GROUP BY p.id`,
-  )
-    .bind(ctx.store.id)
-    .all<{ productId: number; sku: string; name: string; unit: string; qty: number }>();
-
-  // 直近100日の消費 (OUT) を店舗タイムゾーンの日別にバケットする
-  const since = now - 100 * 86_400_000;
-  const { results: mvRows } = await c.env.DB.prepare(
-    `SELECT mv.created_at AS createdAt, -mv.quantity_change AS qty, l.product_id AS productId
-       FROM stock_movements mv
-       JOIN stocks s ON s.id = mv.stock_id
-       JOIN lots l ON l.id = s.lot_id
-      WHERE mv.store_id = ?1 AND mv.type = 'OUT' AND mv.created_at >= ?2`,
-  )
-    .bind(ctx.store.id, since)
-    .all<{ createdAt: number; qty: number; productId: number }>();
   const byProduct = new Map<number, Map<string, number>>();
   for (const r of mvRows) {
     let m = byProduct.get(r.productId);
