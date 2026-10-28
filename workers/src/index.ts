@@ -655,6 +655,10 @@ app.get('/admin/permissions', (c) =>
 .perm-seg button.sel { background: var(--surface); color: var(--fg); box-shadow: var(--shadow); }
 .perm-seg button.sel.on { background: var(--accent); color: #fff; }
 #matrix.saving .perm-seg button { pointer-events: none; opacity: 0.55; }
+.stepup-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 60; }
+.stepup-box { background: var(--surface); border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 1.25rem; width: 100%; max-width: 22rem; }
+.stepup-box h3 { margin: 0 0 0.5rem; }
+.stepup-box .btn { display: block; width: 100%; margin-top: 0.6rem; text-align: center; box-sizing: border-box; }
 </style></head>
 <body>
 <header class="app-header">
@@ -695,6 +699,18 @@ app.get('/admin/permissions', (c) =>
 <h2>参加リクエスト (保留中)</h2>
 <p class="small muted">招待を受けて参加リクエスト中のユーザーです。ロールを選んで付与すると、この店舗のメンバーになります。</p>
 <div id="pendingList"><div class="skl skl-row"></div></div>
+
+<div id="stepupOverlay" class="stepup-overlay" style="display:none;">
+  <div class="stepup-box">
+    <h3>本人確認</h3>
+    <p class="small muted">権限の変更には再認証が必要です。</p>
+    <button type="button" class="btn" id="stepupPasskeyBtn">Face IDで認証</button>
+    <a class="btn secondary" href="/auth/login?stepup=1">Google で再ログイン</a>
+    <p class="small muted">Google で再ログインした場合は、アプリからこのページを開き直して、操作をやり直してください。</p>
+    <p class="small" id="stepupMsg" style="color: var(--danger); display:none;"></p>
+    <button type="button" class="btn secondary" id="stepupCancelBtn">キャンセル</button>
+  </div>
+</div>
 </main>
 
 <script>
@@ -703,7 +719,18 @@ function getToken() {
 }
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 function setError(msg) { document.getElementById('error').textContent = msg; }
-async function api(path, opts) {
+const ERROR_MESSAGES = {
+  STEP_UP_REQUIRED: '再認証が必要です。',
+  STEP_UP_CANCELLED: '再認証がキャンセルされました。',
+  LOCKOUT_PREVENTION: '権限管理の権限を外すと、誰も権限を管理できなくなります。この変更はできません。',
+  UNKNOWN_PERMISSION: '不明な権限が含まれています。',
+  PLATFORM_PERMISSION: 'platform.admin は店舗のロールには付けられません。',
+  PLAN_LIMIT_REACHED: 'プランの上限に達しています。',
+  UNKNOWN_ROLE: '不明なロールです。',
+  VALIDATION: '入力内容に問題があります。',
+};
+
+async function apiOnce(path, opts) {
   const headers = { 'Content-Type': 'application/json', ...((opts && opts.headers) || {}) };
   const t = getToken();
   if (t) headers.Authorization = 'Bearer ' + t;
@@ -713,9 +740,104 @@ async function api(path, opts) {
     document.getElementById('loginGuide').style.display = '';
     throw new Error('未ログインです。下のボタンからログインしてください。');
   }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + text);
+  if (!res.ok) {
+    let code = '';
+    let serverMsg = '';
+    try { const j = JSON.parse(text); code = j.error || ''; serverMsg = j.message || ''; } catch (e) {}
+    const err = new Error(ERROR_MESSAGES[code] || serverMsg || ('エラーが発生しました (HTTP ' + res.status + ')'));
+    err.code = code;
+    err.status = res.status;
+    throw err;
+  }
   return text ? JSON.parse(text) : null;
 }
+
+/* 重要操作で 403 STEP_UP_REQUIRED が返ったら、本人確認ダイアログを挟んで1回だけ再試行する */
+async function api(path, opts) {
+  try {
+    return await apiOnce(path, opts);
+  } catch (e) {
+    if (e && e.code === 'STEP_UP_REQUIRED' && !(opts && opts.__stepUpRetried)) {
+      await requestStepUp();
+      return apiOnce(path, { ...(opts || {}), __stepUpRetried: true });
+    }
+    throw e;
+  }
+}
+
+/* ---- 再認証 (ステップアップ) ---- */
+function b64urlToBuf(s) {
+  let b = String(s).split('-').join('+').split('_').join('/');
+  while (b.length % 4) b += '=';
+  const bin = atob(b);
+  const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+function bufToB64url(buf) {
+  const u = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+  s = btoa(s).split('+').join('-').split('/').join('_');
+  while (s.charAt(s.length - 1) === '=') s = s.slice(0, -1);
+  return s;
+}
+function passkeySupported() {
+  return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.get);
+}
+let stepUpResolve = null;
+let stepUpReject = null;
+function requestStepUp() {
+  return new Promise((resolve, reject) => {
+    stepUpResolve = resolve;
+    stepUpReject = reject;
+    document.getElementById('stepupMsg').style.display = 'none';
+    document.getElementById('stepupPasskeyBtn').style.display = passkeySupported() ? '' : 'none';
+    document.getElementById('stepupOverlay').style.display = '';
+  });
+}
+function closeStepUp(ok) {
+  document.getElementById('stepupOverlay').style.display = 'none';
+  const res = stepUpResolve;
+  const rej = stepUpReject;
+  stepUpResolve = null;
+  stepUpReject = null;
+  if (ok) { if (res) res(); }
+  else if (rej) { const e = new Error(ERROR_MESSAGES.STEP_UP_CANCELLED); e.code = 'STEP_UP_CANCELLED'; rej(e); }
+}
+async function doPasskeyStepUp() {
+  const msg = document.getElementById('stepupMsg');
+  msg.style.display = 'none';
+  try {
+    const opts = await apiOnce('/api/v1/auth/passkey/step-up/options', { method: 'POST', body: JSON.stringify({}) });
+    const cred = await navigator.credentials.get({
+      publicKey: {
+        challenge: b64urlToBuf(opts.challenge),
+        rpId: opts.rpId,
+        userVerification: opts.userVerification || 'required',
+        timeout: opts.timeout,
+      },
+    });
+    if (!cred) return;
+    const r = cred.response;
+    await apiOnce('/api/v1/auth/step-up/passkey', {
+      method: 'POST',
+      body: JSON.stringify({
+        credentialId: cred.id,
+        authenticatorData: bufToB64url(r.authenticatorData),
+        clientDataJSON: bufToB64url(r.clientDataJSON),
+        signature: bufToB64url(r.signature),
+      }),
+    });
+    closeStepUp(true);
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') return;
+    msg.textContent = '認証できませんでした。もう一度お試しください。';
+    msg.style.display = '';
+  }
+}
+document.getElementById('stepupPasskeyBtn').onclick = doPasskeyStepUp;
+document.getElementById('stepupCancelBtn').onclick = () => closeStepUp(false);
 
 let catalog = [];
 let roleList = [];
