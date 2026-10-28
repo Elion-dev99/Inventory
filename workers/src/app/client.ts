@@ -4787,6 +4787,42 @@ function forecastHtml(fc) {
   h += '</div>';
   return h;
 }
+/* ---- 棚卸し履歴ベースの目安 (0023) ---- */
+function historyForecastHtml(hf) {
+  if (!hf) return '<p class="muted">履歴データを取得できませんでした。</p>';
+  var cov = hf.coverage || { records: 0, snapshotDays: 0, firstDate: null, lastDate: null };
+  if (!cov.records) return '<p class="muted">過去の棚卸しデータはまだ取り込まれていません。</p>';
+  var items = [];
+  var noPace = 0;
+  for (var i = 0; i < hf.items.length; i++) {
+    if (hf.items[i].pace && hf.items[i].pace.typical !== null) items.push(hf.items[i]);
+    else if (hf.items[i].snapshots > 0) noPace++;
+  }
+  function fmtDay(key) {
+    if (!key) return '';
+    var p = key.split('-');
+    return Number(p[0]) + '年' + Number(p[1]) + '月';
+  }
+  function daysText(v) {
+    if (v === null || v === undefined) return '—';
+    return '約 ' + (v < 10 ? v : Math.round(v)) + ' 日';
+  }
+  var h = '<p class="small muted">棚卸し記録 (' + fmtDay(cov.firstDate) + '〜' + fmtDay(cov.lastDate) + '・' + cov.snapshotDays + ' 回) の減り方から計算。期間中の入庫は記録されていないため、持ち日数は長めに出ます。</p>';
+  if (!items.length) return h + '<p class="muted">減り方から読める商品はまだありません。</p>';
+  h += '<div class="group">';
+  for (var j = 0; j < items.length; j++) {
+    var it = items[j];
+    var busy = it.daysLeft.busy;
+    var busyStyle = busy !== null && busy <= 30 ? ' style="color:#ff3b30;font-weight:600"' : (busy !== null && busy <= 90 ? ' style="color:#ff9500;font-weight:600"' : '');
+    h += '<div class="group-row static"><span style="flex:1"><span>' + esc(it.name) + '</span>' +
+      '<span class="small muted" style="display:block">現在庫 ' + it.currentQuantity + ' ' + esc(it.unit) + ' / 通常 ' + it.pace.typical + ' ' + esc(it.unit) + '/日</span></span>' +
+      '<span class="small" style="flex:none;text-align:right;line-height:1.5">繁忙期 <span' + busyStyle + '>' + daysText(it.daysLeft.busy) + '</span><br>通常 ' + daysText(it.daysLeft.typical) + ' / 閑散期 ' + daysText(it.daysLeft.slow) + '</span></div>';
+  }
+  h += '</div>';
+  if (noPace > 0) h += '<p class="small muted">履歴はあるが減りが見られない商品 (' + noPace + ' 品) は除いています。</p>';
+  return h;
+}
+
 function loadForecast() {
   viewLoading('予約と消費予測', 'list');
   var canWrite = can('movements.consume');
@@ -4805,7 +4841,8 @@ function loadForecast() {
   }
   Promise.all([
     getJson('/api/v1/reservation-days?from=' + keyOf(-30) + '&to=' + keyOf(7)),
-    getJson('/api/v1/forecast').catch(function () { return null; })
+    getJson('/api/v1/forecast').catch(function () { return null; }),
+    getJson('/api/v1/history-forecast').catch(function () { return null; })
   ]).then(function (r) {
     var dayMap = {};
     var days = (r[0] && r[0].days) || [];
@@ -4825,6 +4862,7 @@ function loadForecast() {
     }
     h += '</div>';
     h += '<h3>切れる時期の予測</h3><div id="fcBody">' + forecastHtml(r[1]) + '</div>';
+    h += '<h3>過去の棚卸しからの目安</h3><div id="hfBody">' + historyForecastHtml(r[2]) + '</div>';
     el('view').innerHTML = h;
     var btns = document.querySelectorAll('[data-fcsave]');
     for (var b = 0; b < btns.length; b++) {

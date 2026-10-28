@@ -158,6 +158,11 @@ import {
   isValidDateKey,
   type ForecastProductInput,
 } from './lib/forecast';
+import {
+  computeHistoryForecast,
+  type HistoryPoint,
+  type HistoryProductInput,
+} from './lib/history-forecast';
 import { maybeAutoBackup } from './lib/backup';
 import {
   defaultFeatures,
@@ -6925,6 +6930,72 @@ app.get('/api/v1/forecast', async (c) => {
   }));
   const result = computeForecast({ todayKey: today, reservationDays, products });
   return c.json({ ...result, timezone: settings.timezone, today });
+});
+
+/**
+ * 棚卸し履歴ベースの持ち日数 (0023)。過去の棚卸しスナップショットの減り方から
+ * 通常/繁忙期/閑散期のペースを出す。計算は lib/history-forecast.ts。
+ */
+app.get('/api/v1/history-forecast', async (c) => {
+  await requirePermission(c, Permission.STOCKS_READ);
+  await requireFeature(c, 'analytics');
+  const ctx = await storeContext(c);
+  const db = c.env.DB;
+  const storeId = ctx.store.id;
+  if (!(await hasTable(c, 'product_stock_history'))) {
+    return c.json({ items: [], coverage: { records: 0, snapshotDays: 0, firstDate: null, lastDate: null } });
+  }
+  const [productRows, historyRows, coverageRow] = await Promise.all([
+    db
+      .prepare(
+        `SELECT p.id AS productId, p.sku, p.name, p.unit, COALESCE(SUM(s.quantity), 0) AS qty
+           FROM products p
+           LEFT JOIN lots l ON l.product_id = p.id
+           LEFT JOIN stocks s ON s.lot_id = l.id AND s.store_id = ?1
+          WHERE p.store_id = ?1 AND p.deleted_at IS NULL
+          GROUP BY p.id`,
+      )
+      .bind(storeId)
+      .all<{ productId: number; sku: string; name: string; unit: string; qty: number }>()
+      .then((r) => r.results),
+    db
+      .prepare(
+        'SELECT product_id AS productId, date, quantity FROM product_stock_history WHERE store_id = ?1 ORDER BY product_id, date',
+      )
+      .bind(storeId)
+      .all<{ productId: number; date: string; quantity: number }>()
+      .then((r) => r.results),
+    db
+      .prepare(
+        'SELECT COUNT(*) AS records, COUNT(DISTINCT date) AS snapshotDays, MIN(date) AS firstDate, MAX(date) AS lastDate FROM product_stock_history WHERE store_id = ?1',
+      )
+      .bind(storeId)
+      .first<{ records: number; snapshotDays: number; firstDate: string | null; lastDate: string | null }>(),
+  ]);
+  const pointsByProduct = new Map<number, HistoryPoint[]>();
+  for (const r of historyRows) {
+    const arr = pointsByProduct.get(r.productId) ?? [];
+    arr.push({ date: r.date, quantity: r.quantity });
+    pointsByProduct.set(r.productId, arr);
+  }
+  const products: HistoryProductInput[] = productRows.map((p) => ({
+    productId: p.productId,
+    sku: p.sku,
+    name: p.name,
+    unit: p.unit,
+    currentQuantity: p.qty,
+    points: pointsByProduct.get(p.productId) ?? [],
+  }));
+  const items = computeHistoryForecast(products);
+  return c.json({
+    items,
+    coverage: {
+      records: coverageRow?.records ?? 0,
+      snapshotDays: coverageRow?.snapshotDays ?? 0,
+      firstDate: coverageRow?.firstDate ?? null,
+      lastDate: coverageRow?.lastDate ?? null,
+    },
+  });
 });
 
 app.get('/api/v1/analytics', async (c) => {
