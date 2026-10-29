@@ -843,6 +843,30 @@ form.grid .stepper input { margin-top: 0; flex: 1; min-width: 0; text-align: cen
 .scan-recent-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scan-recent-qty { font-weight: 700; font-variant-numeric: tabular-nums; }
 .scan-recent-time { color: #8e8e93; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+.dash-search-row { display: flex; gap: 0.5rem; align-items: stretch; margin-bottom: 1rem; }
+.dash-search-row .search-entry { flex: 1; margin-bottom: 0; }
+.dash-search-row .btn { white-space: nowrap; }
+.scan-check {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+  padding: 0.65rem 0.75rem;
+  margin-bottom: 0.6rem;
+}
+.scan-check-name { font-weight: 700; font-size: 1.02rem; }
+.scan-check-sku { color: #aeaeb2; font-size: 0.8rem; margin-top: 0.1rem; }
+.scan-check-total { font-size: 1rem; margin-top: 0.4rem; }
+.scan-check-total b { font-size: 1.55rem; font-variant-numeric: tabular-nums; }
+.scan-check-sub { color: #aeaeb2; font-size: 0.85rem; margin-top: 0.1rem; }
+.scan-check-loc {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.34rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  font-size: 0.92rem;
+}
+.scan-check-loc b { font-variant-numeric: tabular-nums; }
+.scan-check .btn { margin-top: 0.55rem; }
 .scan-empty { color: #8e8e93; font-size: 0.88rem; padding: 0.3rem 0.1rem; }
 .scan-toast {
   margin-bottom: 0.55rem;

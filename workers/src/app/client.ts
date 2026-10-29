@@ -1321,7 +1321,8 @@ function loadDashboard() {
     var forecastData = r[8];
     var h = '<h2>ダッシュボード</h2>';
     if (can('stocks.read')) {
-      h += '<button type="button" class="search-entry" id="dashSearch">商品・保管場所・履歴を検索</button>';
+      h += '<div class="dash-search-row"><button type="button" class="search-entry" id="dashSearch">商品・保管場所・履歴を検索</button>' +
+        (scanSupported() ? '<button type="button" class="btn secondary" id="dashScan">在庫チェック</button>' : '') + '</div>';
     }
     var active = null;
     for (var i = 0; i < stocktakes.length; i++) {
@@ -1458,6 +1459,8 @@ function loadDashboard() {
     el('view').innerHTML = h;
     var dsch = el('dashSearch');
     if (dsch) dsch.onclick = function () { showView('search'); };
+    var dscan = el('dashScan');
+    if (dscan) dscan.onclick = function () { openStockCheckScanner('dashboard'); };
     var da = el('dashAnnounce');
     if (da) da.onclick = function () { showView('announcements'); };
     var dsu = el('dashSetup');
@@ -2061,6 +2064,104 @@ function closeScanner() {
   return session.closingPromise;
 }
 
+/* ---- 在庫チェック用スキャン ----
+   読み取るたびに、その商品の現在庫 (場所ごと) をパネルに表示する。
+   閉じずに次々と読み取れるので、棚を見て回る確認作業向け。 */
+function stockCheckCardHtml(a) {
+  var p = a.product;
+  var byLoc = {};
+  var order = [];
+  for (var i = 0; i < a.stocks.length; i++) {
+    var s = a.stocks[i];
+    var key = String(s.locationId);
+    if (!byLoc[key]) {
+      byLoc[key] = { label: s.warehouseName + ' ' + s.locationName, quantity: 0 };
+      order.push(key);
+    }
+    byLoc[key].quantity += s.quantity;
+  }
+  var h = '<div class="scan-check">';
+  h += '<div class="scan-check-name">' + esc(p.name) + '</div>';
+  h += '<div class="scan-check-sku">' + esc(p.sku) + (p.barcode ? ' ・ ' + esc(p.barcode) : '') + '</div>';
+  h += '<div class="scan-check-total">現在庫 <b>' + a.totals.quantity + '</b> ' + esc(p.unit) + '</div>';
+  var sub = '';
+  if (a.totals.reserved > 0) sub = 'フリー ' + a.totals.free + ' ・ 引当中 ' + a.totals.reserved;
+  if (a.onOrderQuantity > 0) sub += (sub ? ' ・ ' : '') + '発注中 ' + a.onOrderQuantity;
+  if (p.safetyStock > 0 && a.totals.quantity <= p.safetyStock) sub += (sub ? ' ・ ' : '') + '安全在庫 (' + p.safetyStock + ') 以下';
+  if (sub) h += '<div class="scan-check-sub">' + esc(sub) + '</div>';
+  if (order.length === 0) {
+    h += '<div class="scan-check-loc"><span>在庫なし</span><b>0</b></div>';
+  } else {
+    for (var j = 0; j < order.length; j++) {
+      var L = byLoc[order[j]];
+      h += '<div class="scan-check-loc"><span>' + esc(L.label) + '</span><b>' + L.quantity + '</b></div>';
+    }
+  }
+  h += '<button type="button" class="btn secondary small" data-check-sku="' + esc(p.sku) + '">在庫一覧で見る</button>';
+  h += '</div>';
+  return h;
+}
+function openStockCheckScanner(returnView) {
+  /* onCode の引数 api (セッションAPI) に隠蔽されるため、通信用 api を別名で捕捉する */
+  var apiFetch = api;
+  ensureMaster().then(function () {
+    var last = null;
+    var recents = [];
+    var seq = 0;
+    openScanner({
+      title: '在庫チェック',
+      continuous: true,
+      registerReturn: returnView ? { view: returnView } : null,
+      panelTitle: '読み取った商品の在庫',
+      renderPanel: function (sess) {
+        if (!last && recents.length === 0) return scanEmptyHtml(sess);
+        var h = '';
+        if (last) h += stockCheckCardHtml(last);
+        var shown = 0;
+        for (var i = 0; i < recents.length && shown < 5; i++) {
+          if (last && recents[i].id === last.product.id) continue;
+          if (shown === 0) h += '<div class="scan-recent">';
+          h += '<div class="scan-recent-row"><span class="scan-recent-name">' + esc(recents[i].label) + '</span>' +
+            '<span class="scan-recent-qty">' + esc(recents[i].qty) + '</span></div>';
+          shown++;
+        }
+        if (shown > 0) h += '</div>';
+        return h;
+      },
+      onCode: function (code, format, api) {
+        var p = productByBarcode(code);
+        if (!p) return 'unknown';
+        seq++;
+        var mySeq = seq;
+        api.setStatus('在庫を確認しています…');
+        apiFetch('/api/v1/products/' + p.id + '/availability').then(function (a) {
+          if (mySeq !== seq) return;
+          last = a;
+          recents = recents.filter(function (r) { return r.id !== p.id; });
+          recents.unshift({ id: p.id, label: p.sku + ' ' + p.name, qty: String(a.totals.quantity) + ' ' + p.unit });
+          api.setStatus('バーコードを枠内に入れてください');
+          api.refreshPanel();
+        }).catch(function () {
+          if (mySeq !== seq) return;
+          api.setStatus('バーコードを枠内に入れてください');
+          api.toast('在庫を取得できませんでした');
+        });
+        return 'ok';
+      },
+    });
+    var body = el('scanPanelBody');
+    if (body) {
+      body.addEventListener('click', function (ev) {
+        var t = ev.target;
+        while (t && t !== body && !(t.getAttribute && t.getAttribute('data-check-sku'))) t = t.parentNode;
+        if (!t || t === body) return;
+        try { sessionStorage.setItem('pendingStockQuery', t.getAttribute('data-check-sku') || ''); } catch (e) {}
+        closeScanner().then(function () { showView('stocks'); });
+      });
+    }
+  });
+}
+
 /* ---- 記録シート (入庫・消費・移動) 用の連続スキャン ----
    同じ商品の連続スキャンで数量 +1、別の商品を読んだらその商品へ切り替え、
    その商品のセッション数量をフォームへ反映する。 */
@@ -2430,31 +2531,7 @@ function loadStocks() {
     el('stQ').oninput = fetchStocks;
     el('stReload').onclick = fetchStocks;
     var scanBtn = el('stScan');
-    if (scanBtn) scanBtn.onclick = function () {
-      var unknownCode = '';
-      openScanner({
-        title: 'バーコードスキャン',
-        continuous: false,
-        registerReturn: { view: 'stocks' },
-        onCode: function (code) {
-          var p = productByBarcode(code);
-          if (!p) {
-            unknownCode = code;
-            return 'unknown';
-          }
-          el('stQ').value = p.sku;
-          fetchStocks();
-          return 'ok';
-        },
-        onClose: function () {
-          if (unknownCode && el('stQ')) {
-            el('stQ').value = unknownCode;
-            fetchStocks();
-            el('stMsg').innerHTML = msgHtml('warn', 'バーコード ' + unknownCode + ' の商品が見つかりませんでした。');
-          }
-        },
-      });
-    };
+    if (scanBtn) scanBtn.onclick = function () { openStockCheckScanner('stocks'); };
     try {
       var pl = sessionStorage.getItem('pendingStockLocation');
       if (pl) {

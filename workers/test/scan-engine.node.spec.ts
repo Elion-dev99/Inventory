@@ -275,7 +275,9 @@ describe('APP_JS (スキャナー作り替えの確認)', () => {
   it('登録ボタンが復帰文脈を保存し、各文脈が registerReturn を渡す', () => {
     expect(APP_JS).toContain('pendingProductReturn = session.opts.registerReturn || null');
     expect(APP_JS).toContain("registerReturn: viewName ? { view: viewName } : null");
-    expect(APP_JS).toContain("registerReturn: { view: 'stocks' }");
+    expect(APP_JS).toContain("registerReturn: returnView ? { view: returnView } : null");
+    expect(APP_JS).toContain("openStockCheckScanner('stocks')");
+    expect(APP_JS).toContain("openStockCheckScanner('dashboard')");
     expect(APP_JS).toContain("registerReturn: { view: 'stocktakes' }");
     expect(APP_JS).toContain("openSheetScanner('inProduct', 'inQty', 'inbound')");
     expect(APP_JS).toContain("openSheetScanner('coProduct', 'coQty', 'consume')");
