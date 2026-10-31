@@ -713,6 +713,7 @@ var VIEWS = [
   { id: 'master', label: 'マスタ管理', visible: function () { return can('master.read'); } },
   { id: 'negative', label: 'マイナス在庫', visible: function () { return (can('negative.request') || can('negative.decide')) && feat('negative_stock'); } },
   { id: 'stocktakes', label: '棚卸し', visible: function () { return feat('stocktakes'); } },
+  { id: 'countAdjust', label: '個数記録', visible: function () { return can('stocktakes.manage'); } },
   { id: 'alerts', label: 'アラート', visible: function () { return can('alerts.read') && feat('alerts'); } },
   { id: 'purchases', label: '発注', visible: function () { return can('purchases.read') && feat('purchase_orders'); } },
   { id: 'analytics', label: '分析', visible: function () { return can('stocks.read') && feat('analytics'); } },
@@ -761,7 +762,7 @@ function icon(name, size) {
 }
 
 /* ビューの所属グループ: record=記録シート配下 / more=その他リスト配下 */
-var RECORD_VIEWS = ['inbound', 'consume', 'transfer', 'returns', 'disposal'];
+var RECORD_VIEWS = ['inbound', 'consume', 'transfer', 'returns', 'disposal', 'countAdjust'];
 var MORE_VIEWS = ['master', 'negative', 'stocktakes', 'alerts', 'purchases', 'analytics', 'audit', 'announcements', 'announceAdmin', 'reservations', 'picking', 'setup', 'security', 'storeSettings', 'outbox'];
 function tabOf(view) {
   if (view === 'dashboard') return 'dashboard';
@@ -820,6 +821,7 @@ var SHEET_ITEMS = [
   { view: 'returns', icon: 'in', color: '#30b0c7', label: '返品する', maintKeys: ['inbound'] },
   { view: 'disposal', icon: 'out', color: '#ff3b30', label: '廃棄する', maintKeys: ['outbound'] },
   { view: 'negative', icon: 'minus', color: '#af52de', label: 'マイナス在庫 (申請・承認)', maintKeys: ['outbound'] },
+  { view: 'countAdjust', icon: 'clip', color: '#5856d6', label: '個数記録 (実数に合わせる)', maintKeys: ['stocktakes'] },
 ];
 function openSheet() {
   var h = '<div class="sheet-title">記録する</div>';
@@ -1242,6 +1244,7 @@ function showView(id) {
     search: loadSearch,
     stocks: loadStocks,
     inbound: loadInbound,
+    countAdjust: loadCountAdjust,
     consume: loadConsume,
     transfer: loadTransfer,
     history: loadHistory,
@@ -2075,7 +2078,7 @@ function stockCheckCardHtml(a) {
     var s = a.stocks[i];
     var key = String(s.locationId);
     if (!byLoc[key]) {
-      byLoc[key] = { label: s.warehouseName + ' ' + s.locationName, quantity: 0 };
+      byLoc[key] = { id: s.locationId, label: s.warehouseName + ' ' + s.locationName, quantity: 0 };
       order.push(key);
     }
     byLoc[key].quantity += s.quantity;
@@ -2094,10 +2097,27 @@ function stockCheckCardHtml(a) {
   } else {
     for (var j = 0; j < order.length; j++) {
       var L = byLoc[order[j]];
-      h += '<div class="scan-check-loc"><span>' + esc(L.label) + '</span><b>' + L.quantity + '</b></div>';
+      h += '<div class="scan-check-loc"><span>' + esc(L.label) + '</span><b>' + L.quantity + '</b>' +
+        (can('stocktakes.manage')
+          ? '<button type="button" class="btn small secondary" data-count-loc="' + L.id + '" data-count-cur="' + L.quantity + '" data-count-label="' + esc(L.label) + '">記録</button>'
+          : '') + '</div>';
     }
   }
   h += '<button type="button" class="btn secondary small" data-check-sku="' + esc(p.sku) + '">在庫一覧で見る</button>';
+  h += '</div>';
+  return h;
+}
+function stockCheckEditorHtml(a, editing) {
+  var p = a.product;
+  var h = '<div class="scan-check">';
+  h += '<div class="scan-check-name">' + esc(p.name) + '</div>';
+  h += '<div class="scan-check-sku">' + esc(editing.label) + ' ・ 現在庫 ' + editing.current + ' ' + esc(p.unit) + '</div>';
+  h += '<div class="scan-count-edit"><button type="button" class="scan-step" data-count-step="-1">−</button>' +
+    '<input id="scanCountQty" type="number" inputmode="numeric" min="0" step="1" value="' + editing.current + '">' +
+    '<button type="button" class="scan-step" data-count-step="1">＋</button></div>';
+  h += '<div class="scan-count-actions"><button type="button" class="btn" data-count-save>実数を記録</button>' +
+    '<button type="button" class="btn secondary" data-count-cancel>やめる</button></div>';
+  h += '<div class="scan-check-sub" id="scanCountMsg"></div>';
   h += '</div>';
   return h;
 }
@@ -2108,12 +2128,14 @@ function openStockCheckScanner(returnView) {
     var last = null;
     var recents = [];
     var seq = 0;
-    openScanner({
+    var editing = null;
+    var session = openScanner({
       title: '在庫チェック',
       continuous: true,
       registerReturn: returnView ? { view: returnView } : null,
       panelTitle: '読み取った商品の在庫',
       renderPanel: function (sess) {
+        if (editing && last && editing.productId === last.product.id) return stockCheckEditorHtml(last, editing);
         if (!last && recents.length === 0) return scanEmptyHtml(sess);
         var h = '';
         if (last) h += stockCheckCardHtml(last);
@@ -2131,6 +2153,11 @@ function openStockCheckScanner(returnView) {
       onCode: function (code, format, api) {
         var p = productByBarcode(code);
         if (!p) return 'unknown';
+        if (editing) {
+          /* 編集中に同じ商品を読み直しても編集を壊さない。別商品なら編集を破棄して切り替える */
+          if (editing.productId === p.id) return 'ok';
+          editing = null;
+        }
         seq++;
         var mySeq = seq;
         api.setStatus('在庫を確認しています…');
@@ -2149,14 +2176,90 @@ function openStockCheckScanner(returnView) {
         return 'ok';
       },
     });
+    var sapi = scanSessionApi(session);
     var body = el('scanPanelBody');
     if (body) {
       body.addEventListener('click', function (ev) {
         var t = ev.target;
-        while (t && t !== body && !(t.getAttribute && t.getAttribute('data-check-sku'))) t = t.parentNode;
-        if (!t || t === body) return;
-        try { sessionStorage.setItem('pendingStockQuery', t.getAttribute('data-check-sku') || ''); } catch (e) {}
-        closeScanner().then(function () { showView('stocks'); });
+        var attr = null;
+        while (t && t !== body) {
+          if (t.getAttribute) {
+            if (t.getAttribute('data-count-save') !== null) { attr = 'save'; break; }
+            if (t.getAttribute('data-count-cancel') !== null) { attr = 'cancel'; break; }
+            if (t.getAttribute('data-count-step') !== null) { attr = 'step'; break; }
+            if (t.getAttribute('data-count-loc') !== null) { attr = 'loc'; break; }
+            if (t.getAttribute('data-check-sku') !== null) { attr = 'list'; break; }
+          }
+          t = t.parentNode;
+        }
+        if (!attr) return;
+        if (attr === 'list') {
+          try { sessionStorage.setItem('pendingStockQuery', t.getAttribute('data-check-sku') || ''); } catch (e) {}
+          closeScanner().then(function () { showView('stocks'); });
+          return;
+        }
+        if (attr === 'loc') {
+          if (!last) return;
+          editing = {
+            productId: last.product.id,
+            locationId: Number(t.getAttribute('data-count-loc')),
+            label: t.getAttribute('data-count-label') || '',
+            current: Number(t.getAttribute('data-count-cur')),
+          };
+          sapi.refreshPanel();
+          setTimeout(function () {
+            var inp = el('scanCountQty');
+            if (inp) { inp.focus(); inp.select(); }
+          }, 60);
+          return;
+        }
+        if (attr === 'step') {
+          var inp2 = el('scanCountQty');
+          if (!inp2) return;
+          var v2 = parseInt(inp2.value, 10);
+          if (isNaN(v2)) v2 = 0;
+          v2 += Number(t.getAttribute('data-count-step'));
+          if (v2 < 0) v2 = 0;
+          inp2.value = v2;
+          return;
+        }
+        if (attr === 'cancel') {
+          editing = null;
+          sapi.refreshPanel();
+          return;
+        }
+        if (attr === 'save') {
+          if (!editing) return;
+          var inp3 = el('scanCountQty');
+          var msg = el('scanCountMsg');
+          var v3 = inp3 ? Number(inp3.value) : NaN;
+          if (!isFinite(v3) || v3 < 0 || Math.floor(v3) !== v3) {
+            if (msg) msg.textContent = '0以上の整数を入力してください';
+            return;
+          }
+          var target = editing;
+          t.disabled = true;
+          apiFetch('/api/v1/stocks/count', {
+            method: 'POST',
+            headers: { 'Idempotency-Key': uuid() },
+            body: { productId: target.productId, locationId: target.locationId, countedQuantity: v3 },
+          }).then(function (r) {
+            editing = null;
+            sapi.toast('記録しました: ' + r.previousQuantity + ' → ' + r.countedQuantity);
+            return apiFetch('/api/v1/products/' + target.productId + '/availability').then(function (a) {
+              last = a;
+              var p = productOf(target.productId);
+              recents = recents.filter(function (x) { return x.id !== target.productId; });
+              recents.unshift({ id: target.productId, label: p ? p.sku + ' ' + p.name : '', qty: String(a.totals.quantity) + (p ? ' ' + p.unit : '') });
+              sapi.refreshPanel();
+            });
+          }).catch(function (e) {
+            t.disabled = false;
+            var m2 = el('scanCountMsg');
+            if (m2) m2.textContent = errMsg(e);
+          });
+          return;
+        }
       });
     }
   });
@@ -2293,6 +2396,7 @@ function openStockSheet(s) {
   if (viewVisible('transfer')) items.push({ view: 'transfer', icon: 'swap', color: '#0071e3', label: '移動する' });
   if (viewVisible('returns')) items.push({ view: 'returns', icon: 'in', color: '#30b0c7', label: '返品する' });
   if (viewVisible('disposal')) items.push({ view: 'disposal', icon: 'out', color: '#ff3b30', label: '廃棄する' });
+  if (viewVisible('countAdjust')) items.push({ view: 'countAdjust', icon: 'clip', color: '#5856d6', label: '個数を記録する' });
   for (var i = 0; i < items.length; i++) {
     var it = items[i];
     h += '<button class="sheet-row" data-view="' + it.view + '"><span class="row-icon" style="background:' + it.color + '">' + icon(it.icon, 18) + '</span><span class="row-label">' + esc(it.label) + '</span><span class="chev">' + icon('chevR', 18) + '</span></button>';
@@ -2583,6 +2687,113 @@ function loadStocks() {
 }
 
 /* ---------------- inbound ---------------- */
+/* ---------------- 個数記録 (実数調整) ---------------- */
+function loadCountAdjust() {
+  viewLoading('個数記録', 'form');
+  ensureMaster().then(function (m) {
+    if (state.masterError) {
+      el('view').innerHTML = '<h2>個数記録</h2>' + msgHtml('error', 'マスタの読み込みに失敗しました: ' + state.masterError);
+      return;
+    }
+    var products = m.products.filter(function (p) { return !p.isBundle; });
+    var h = '<h2>個数記録</h2><div class="mnt-form-note" id="mntNoteCount" style="display:none"></div><div id="cntMsg"></div>' +
+      '<p class="muted">数えた実数に、その場所の在庫を合わせます。履歴には「調整」として残ります。</p>' +
+      '<form class="grid" id="cntForm">' +
+      '<div><label>商品</label><select id="cntProduct" required>' +
+      optionsHtml(products, function (p) { return p.id; }, function (p) { return p.sku + ' ' + p.name; }, '') + '</select></div>' +
+      '<div><label>保管場所</label><select id="cntLocation" required>' +
+      optionsHtml(m.locations, function (l) { return l.id; }, function (l) { return locationLabel(l.id); }, '') + '</select></div>' +
+      '<div><label>現在の在庫 (この場所)</label><div class="count-current" id="cntCurrent">確認中…</div></div>' +
+      '<div><label>実数</label><div class="count-stepper"><button type="button" class="scan-step" data-cnt-step="-1">−</button>' +
+      '<input id="cntQty" type="number" inputmode="numeric" min="0" step="1" value="0">' +
+      '<button type="button" class="scan-step" data-cnt-step="1">＋</button></div>' +
+      '<div class="small muted" id="cntDiff"></div></div>' +
+      '<div class="sticky-actions"><button class="btn" type="submit" id="cntSubmit">実数を記録</button></div>' +
+      '</form>';
+    el('view').innerHTML = h;
+    if (state.flash) { el('cntMsg').innerHTML = msgHtml('success', state.flash); state.flash = ''; }
+    setMaintFormNote('mntNoteCount', ['stocktakes'], ['#cntSubmit']);
+    var preset = takeFormPreset('countAdjust');
+    if (preset) {
+      if (preset.productId) el('cntProduct').value = String(preset.productId);
+      if (preset.locationId) el('cntLocation').value = String(preset.locationId);
+    }
+    var currentQty = null;
+    var loadSeq = 0;
+    function refreshDiff() {
+      var d = el('cntDiff');
+      if (!d) return;
+      if (currentQty === null) { d.textContent = ''; return; }
+      var v = Number(el('cntQty').value);
+      if (!isFinite(v)) { d.textContent = ''; return; }
+      var diff = v - currentQty;
+      d.textContent = diff === 0 ? '現在と一致します' : (diff > 0 ? '現在より ' + diff + ' 増えます' : '現在より ' + (-diff) + ' 減ります');
+    }
+    function refreshCurrent() {
+      var pid = Number(el('cntProduct').value);
+      var lid = Number(el('cntLocation').value);
+      var box = el('cntCurrent');
+      if (!pid || !lid) { box.textContent = '商品と場所を選んでください'; return; }
+      loadSeq++;
+      var seq = loadSeq;
+      box.textContent = '確認中…';
+      api('/api/v1/products/' + pid + '/availability').then(function (a) {
+        if (seq !== loadSeq) return;
+        var total = 0;
+        for (var i = 0; i < a.stocks.length; i++) {
+          if (a.stocks[i].locationId === lid) total += a.stocks[i].quantity;
+        }
+        currentQty = total;
+        var p = productOf(pid);
+        box.textContent = total + (p ? ' ' + p.unit : '');
+        el('cntQty').value = total;
+        refreshDiff();
+      }).catch(function () {
+        if (seq !== loadSeq) return;
+        currentQty = null;
+        box.textContent = '取得できませんでした';
+      });
+    }
+    el('cntProduct').onchange = refreshCurrent;
+    el('cntLocation').onchange = refreshCurrent;
+    el('cntQty').addEventListener('input', refreshDiff);
+    var steps = el('view').querySelectorAll('button[data-cnt-step]');
+    for (var si = 0; si < steps.length; si++) {
+      steps[si].onclick = function () {
+        var v = parseInt(el('cntQty').value, 10);
+        if (isNaN(v)) v = 0;
+        v += Number(this.getAttribute('data-cnt-step'));
+        if (v < 0) v = 0;
+        el('cntQty').value = v;
+        refreshDiff();
+      };
+    }
+    refreshCurrent();
+    el('cntForm').onsubmit = function (ev) {
+      ev.preventDefault();
+      var btn = el('cntSubmit');
+      btn.disabled = true;
+      el('cntMsg').innerHTML = '';
+      var body = {
+        productId: Number(el('cntProduct').value),
+        locationId: Number(el('cntLocation').value),
+        countedQuantity: Number(el('cntQty').value),
+      };
+      api('/api/v1/stocks/count', { method: 'POST', headers: { 'Idempotency-Key': uuid() }, body: body })
+        .then(function (r) {
+          var diffText = r.delta === 0 ? '差分なし' : (r.delta > 0 ? '+' + r.delta : String(r.delta));
+          el('cntMsg').innerHTML = msgHtml('success', '記録しました。前回 ' + r.previousQuantity + ' → 実数 ' + r.countedQuantity + ' (差分 ' + diffText + ')');
+          btn.disabled = false;
+          refreshCurrent();
+        })
+        .catch(function (e) {
+          el('cntMsg').innerHTML = msgHtml('error', errMsg(e));
+          btn.disabled = false;
+        });
+    };
+  });
+}
+
 function loadInbound() {
   viewLoading('入庫', 'form');
   ensureMaster().then(function (m) {

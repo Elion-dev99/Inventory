@@ -7,6 +7,7 @@ import {
   type BulkLineInput,
   type BundleConsumeInput,
   type ConsumeInput,
+  type CountAdjustInput,
   type Envelope,
   type InboundInput,
   type PickConfirmInput,
@@ -104,6 +105,7 @@ import {
   createLocationSchema,
   createLotSchema,
   createProductSchema,
+  countAdjustSchema,
   createPurchaseOrderSchema,
   createSupplierSchema,
   createWarehouseSchema,
@@ -1429,6 +1431,7 @@ function maintenanceFeatureFor(method: string, path: string): string | null {
     return 'master_products';
   }
   if (p === '/negative-approvals' || p.startsWith('/negative-approvals/')) return 'outbound';
+  if (p === '/stocks/count') return 'stocktakes';
   if (p === '/stocktakes' || p.startsWith('/stocktakes/')) return 'stocktakes';
   if (p === '/purchase-orders' || p.startsWith('/purchase-orders/')) return 'purchase_orders';
   if (
@@ -1926,6 +1929,7 @@ async function sha256Hex(text: string): Promise<string> {
 /** Coordinator (単一インスタンス 'global') へのスタブ (RPC メソッドを型付け) */
 interface CoordinatorStub {
   inbound: (input: InboundInput) => Promise<Envelope>;
+  countAdjust: (input: CountAdjustInput) => Promise<Envelope>;
   consume: (input: ConsumeInput) => Promise<Envelope>;
   bulkMovements: (input: BulkInput) => Promise<Envelope>;
   consumeBundle: (input: BundleConsumeInput) => Promise<Envelope>;
@@ -4722,6 +4726,32 @@ app.get('/api/v1/stocks/:id', async (c) => {
   }
   const freeMap = await freeQuantitiesForStocks(c, ctx.store.id, [row]);
   return c.json(stockJson(row, freeMap ? (freeMap.get(row.id) ?? null) : null));
+});
+
+/**
+ * 個数記録 (実数調整)。在庫チェックで数えた実数に、その場所の合計在庫を
+ * 合わせる。棚卸し管理権限が必要。台帳には ADJUST として残る。
+ */
+app.post('/api/v1/stocks/count', async (c) => {
+  const rp = await requirePermission(c, Permission.STOCKTAKES_MANAGE);
+  const ctx = await storeContext(c);
+  const raw = (await parseJson(c)) as Record<string, unknown>;
+  const dto = parseWith(countAdjustSchema, raw);
+  const warehouseId = await warehouseIdOfLocation(c, dto.locationId);
+  if (!canPerformInStore(ctx, rp, warehouseId, Permission.STOCKTAKES_MANAGE)) {
+    throw forbidden('Out of warehouse scope');
+  }
+  const envelope = await coordinator(c).countAdjust({
+    actorId: user(c).userId,
+    endpoint: 'POST /api/v1/stocks/count',
+    idempotencyKey: requireIdempotencyKey(c),
+    requestHash: await sha256Hex(JSON.stringify(raw)),
+    storeId: ctx.store.id,
+    productId: dto.productId,
+    locationId: dto.locationId,
+    countedQuantity: dto.countedQuantity,
+  });
+  return respond(c, envelope);
 });
 
 /** 在庫一覧の CSV エクスポート (stocks.read、倉庫スコープ適用) */

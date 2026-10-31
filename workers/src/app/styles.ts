@@ -867,6 +867,51 @@ form.grid .stepper input { margin-top: 0; flex: 1; min-width: 0; text-align: cen
 }
 .scan-check-loc b { font-variant-numeric: tabular-nums; }
 .scan-check .btn { margin-top: 0.55rem; }
+.scan-check-loc .btn { margin-top: 0; flex: none; }
+.scan-count-edit { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.6rem; }
+.scan-count-edit input {
+  flex: 1;
+  min-width: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  padding: 0.45rem 0.4rem;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+}
+.scan-step {
+  flex: none;
+  width: 2.6rem;
+  height: 2.6rem;
+  border-radius: 50%;
+  border: 1px solid rgba(128, 128, 138, 0.45);
+  background: transparent;
+  color: inherit;
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.scan-count-actions { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
+.scan-count-actions .btn { margin-top: 0; }
+.count-current { font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; padding: 0.35rem 0; }
+.count-stepper { display: flex; align-items: center; gap: 0.5rem; }
+.count-stepper input {
+  flex: 1;
+  min-width: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  padding: 0.5rem 0.4rem;
+  border-radius: 10px;
+  border: 1px solid var(--glass-border);
+  background: var(--surface-2);
+  color: inherit;
+}
+.count-stepper .scan-step { color: inherit; }
 .scan-empty { color: #8e8e93; font-size: 0.88rem; padding: 0.3rem 0.1rem; }
 .scan-toast {
   margin-bottom: 0.55rem;

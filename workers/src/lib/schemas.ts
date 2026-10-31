@@ -60,6 +60,14 @@ export const inboundSchema = z.object({
   quantity: z.number().int().min(1),
 });
 
+/** 個数記録 (実数調整): 指定場所の合計在庫を、数えた実数に合わせる */
+export const countAdjustSchema = z.object({
+  productId: idValue,
+  locationId: idValue,
+  /** 実数。0 も可 (その場所に無かった) */
+  countedQuantity: z.number().int().min(0),
+});
+
 export const consumptionSchema = z.object({
   productId: idValue,
   locationId: idValue.optional(),

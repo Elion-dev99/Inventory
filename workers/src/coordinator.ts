@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './env';
 import { planConsumption, type CandidateRow, type NegativeApprovalInfo } from './allocation';
-import { proposeFefoAllocation, type FefoCandidate } from './fefo';
+import { compareFefo, proposeFefoAllocation, type FefoCandidate } from './fefo';
 import {
   ApiError,
   badRequest,
@@ -59,6 +59,14 @@ export interface InboundInput extends MovementContext {
   reasonCode?: string | null;
   /** 理由の自由メモ (返品では必須、台帳の reason に入る) */
   reason?: string | null;
+}
+
+/** 個数記録 (実数調整): 指定場所の合計在庫を実数に合わせる */
+export interface CountAdjustInput extends MovementContext {
+  productId: number;
+  locationId: number;
+  /** 実数 (その場所の合計をこの数に合わせる)。0 以上 */
+  countedQuantity: number;
 }
 
 export interface TransferInput extends MovementContext {
@@ -728,6 +736,234 @@ export class InventoryCoordinator extends DurableObject<Env> {
     await this.idempotencyStmt(input, 201, body).run();
     this.broadcast({ type: 'stock.changed', stockIds: [created.id], documentId, storeId: input.storeId, at: now });
     return this.envelope(201, body);
+  }
+
+  // ------------------------------------------------------ 個数記録 (実数調整)
+
+  async countAdjust(input: CountAdjustInput): Promise<Envelope> {
+    return this.runExclusive(async () => {
+      try {
+        return await this.countAdjustInternal(input);
+      } catch (e) {
+        return this.errorEnvelope(e);
+      }
+    });
+  }
+
+  /**
+   * 在庫チェックで数えた実数に、その場所の合計在庫を合わせる。
+   * 減分は FEFO 順 (期限切れロットも含む) に引き、増分は FEFO で最後に
+   * 消費されるロット (期限が最も遅いもの) に寄せる。台帳は棚卸し調整と
+   * 同じ ADJUST 種別で、理由は 'count-adjustment'。差分ゼロでも
+   * 「数えて一致した」事実を 0 変化の ADJUST として残す。
+   */
+  private async countAdjustInternal(input: CountAdjustInput): Promise<Envelope> {
+    const stored = await this.findStoredResponse(input);
+    if (stored) return stored;
+    await this.assertLocationsUnlocked(input.storeId, [input.locationId]);
+
+    const db = this.env.DB;
+    const now = Date.now();
+    const documentId = crypto.randomUUID();
+    const batchId = crypto.randomUUID();
+
+    const withBundle = await this.hasColumn('products', 'is_bundle');
+    const product = await db
+      .prepare(
+        `SELECT id${withBundle ? ', is_bundle' : ''} FROM products
+          WHERE id = ?1 AND store_id = ?2 AND deleted_at IS NULL`,
+      )
+      .bind(input.productId, input.storeId)
+      .first<{ id: number; is_bundle?: number }>();
+    if (!product) throw badRequest('Product not found');
+    if (product.is_bundle === 1) {
+      throw new ApiError(422, 'BUNDLE_NO_STOCK', 'Bundle products do not hold stock');
+    }
+    const location = await db
+      .prepare(
+        `SELECT loc.id FROM locations loc JOIN warehouses w ON w.id = loc.warehouse_id
+          WHERE loc.id = ?1 AND loc.deleted_at IS NULL AND w.store_id = ?2`,
+      )
+      .bind(input.locationId, input.storeId)
+      .first<{ id: number }>();
+    if (!location) throw badRequest('Location not found');
+
+    type CountRow = {
+      stockId: number;
+      lotId: number;
+      quantity: number;
+      version: number;
+      expiryDate: number | null;
+      receivedAt: number;
+    };
+    const rows = (
+      await db
+        .prepare(
+          `SELECT s.id AS stockId, s.lot_id AS lotId, s.quantity, s.version,
+                  l.expiry_date AS expiryDate, l.received_at AS receivedAt
+             FROM stocks s JOIN lots l ON l.id = s.lot_id
+            WHERE s.store_id = ?1 AND s.location_id = ?2 AND l.product_id = ?3
+            ORDER BY s.id ASC`,
+        )
+        .bind(input.storeId, input.locationId, input.productId)
+        .all<CountRow>()
+    ).results;
+
+    const previous = rows.reduce((a, r) => a + r.quantity, 0);
+    const delta = input.countedQuantity - previous;
+    const fefo = rows.slice().sort((a, b) => compareFefo(a, b));
+
+    const statements: D1PreparedStatement[] = [];
+    const expected = new Map<number, number>();
+    const affected: { stockId: number; quantity: number }[] = [];
+    let createLotCode: string | null = null;
+
+    const pushAdjust = (row: CountRow, change: number): void => {
+      const after = row.quantity + change;
+      const idx = statements.length;
+      statements.push(
+        db
+          .prepare(
+            'UPDATE stocks SET quantity = quantity + ?1, version = version + 1, updated_at = ?2 WHERE id = ?3 AND version = ?4',
+          )
+          .bind(change, now, row.stockId, row.version),
+      );
+      expected.set(idx, 1);
+      statements.push(
+        this.guardStmt(
+          batchId,
+          `count-${row.stockId}`,
+          'EXISTS (SELECT 1 FROM stocks WHERE id = ? AND version = ? AND quantity = ?)',
+          [row.stockId, row.version + 1, after],
+        ),
+      );
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, reason, store_id, created_at)
+             VALUES (?1, ?2, 'ADJUST', ?3, ?4, ?5, ?6, 'count-adjustment', ?7, ?8)`,
+          )
+          .bind(documentId, row.stockId, change, row.quantity, after, input.actorId, input.storeId, now),
+      );
+      affected.push({ stockId: row.stockId, quantity: after });
+    };
+
+    if (delta < 0) {
+      let remaining = -delta;
+      for (const row of fefo) {
+        if (remaining <= 0) break;
+        if (row.quantity <= 0) continue;
+        const take = Math.min(row.quantity, remaining);
+        pushAdjust(row, -take);
+        remaining -= take;
+      }
+      if (remaining > 0) throw stockConflict();
+    } else if (delta > 0) {
+      if (fefo.length > 0) {
+        const target = fefo[fefo.length - 1];
+        if (target) pushAdjust(target, delta);
+      } else {
+        // その場所に在庫行が無い: 実数分のロットと在庫行を作る (入庫と同じ作法)
+        const d = new Date(now);
+        const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+        createLotCode = `実数調整-${ymd}`;
+        const existingLot = await db
+          .prepare('SELECT id FROM lots WHERE product_id = ?1 AND lot_code = ?2 AND store_id = ?3')
+          .bind(input.productId, createLotCode, input.storeId)
+          .first<{ id: number }>();
+        if (!existingLot) {
+          statements.push(
+            db
+              .prepare(
+                `INSERT INTO lots (product_id, lot_code, expiry_date, received_at, store_id, created_at, updated_at)
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?3, ?3)`,
+              )
+              .bind(input.productId, createLotCode, now, input.storeId),
+          );
+        }
+        statements.push(
+          db
+            .prepare(
+              `INSERT INTO stocks (location_id, lot_id, quantity, version, store_id, created_at, updated_at)
+               SELECT ?1, id, ?2, 1, ?3, ?4, ?4 FROM lots WHERE product_id = ?5 AND lot_code = ?6 AND store_id = ?3`,
+            )
+            .bind(input.locationId, input.countedQuantity, input.storeId, now, input.productId, createLotCode),
+        );
+        statements.push(
+          this.guardStmt(
+            batchId,
+            'count-new',
+            `EXISTS (SELECT 1 FROM stocks s JOIN lots l ON l.id = s.lot_id
+                     WHERE s.location_id = ? AND l.product_id = ? AND l.lot_code = ? AND s.quantity = ? AND s.version = 1)`,
+            [input.locationId, input.productId, createLotCode, input.countedQuantity],
+          ),
+        );
+        statements.push(
+          db
+            .prepare(
+              `INSERT INTO stock_movements (document_id, stock_id, type, quantity_change, quantity_before, quantity_after, actor_id, reason, store_id, created_at)
+               SELECT ?1, s.id, 'ADJUST', ?2, 0, ?2, ?3, 'count-adjustment', ?4, ?5
+                 FROM stocks s JOIN lots l ON l.id = s.lot_id
+                WHERE s.location_id = ?6 AND l.product_id = ?7 AND l.lot_code = ?8`,
+            )
+            .bind(documentId, input.countedQuantity, input.actorId, input.storeId, now, input.locationId, input.productId, createLotCode),
+        );
+      }
+    } else if (fefo.length > 0) {
+      // 差分ゼロ: 数えて一致した記録を残す
+      const first = fefo[0];
+      if (first) pushAdjust(first, 0);
+    }
+
+    statements.push(
+      await this.auditStmt(input.actorId, 'stock.count_adjust', 'product', String(input.productId), {
+        documentId,
+        locationId: input.locationId,
+        previousQuantity: previous,
+        countedQuantity: input.countedQuantity,
+        delta,
+      }, input.storeId),
+    );
+
+    const buildBody = (): Record<string, unknown> => ({
+      documentId,
+      productId: input.productId,
+      locationId: input.locationId,
+      previousQuantity: previous,
+      countedQuantity: input.countedQuantity,
+      delta,
+      stocks: affected,
+    });
+
+    if (createLotCode === null) {
+      statements.push(this.idempotencyStmt(input, 200, buildBody()));
+    }
+    statements.push(this.cleanupGuardsStmt(batchId));
+    await this.runBatch(statements, expected);
+
+    if (createLotCode !== null) {
+      const created = await db
+        .prepare(
+          `SELECT s.id AS stockId, s.quantity FROM stocks s JOIN lots l ON l.id = s.lot_id
+            WHERE s.location_id = ?1 AND l.product_id = ?2 AND l.lot_code = ?3 AND s.store_id = ?4`,
+        )
+        .bind(input.locationId, input.productId, createLotCode, input.storeId)
+        .first<{ stockId: number; quantity: number }>();
+      if (!created) throw stockConflict();
+      affected.push({ stockId: created.stockId, quantity: created.quantity });
+      await this.idempotencyStmt(input, 200, buildBody()).run();
+    }
+
+    if (affected.length > 0) {
+      this.broadcast({
+        type: 'stock.changed',
+        stockIds: affected.map((a) => a.stockId),
+        documentId,
+        storeId: input.storeId,
+        at: now,
+      });
+    }
+    return this.envelope(200, buildBody());
   }
 
   // ------------------------------------------------------------------ 消費
